@@ -39,3 +39,22 @@ See `01-design.md`.
 **Decided**: First commit is design docs only (this directory). Chunk 1 code lands as second commit.
 **Decider**: Kyle.
 **Why**: Auditable "this is what we agreed to" reference. Subsequent commits diff-able against the design.
+
+## 2026-05-05 — Chunk 1 deployed to Spark
+**Status**: Live at `tracker.kyleconway.ai`, fronted by Cloudflare Access (Google + email PIN), backed by `action_tracker` DB on the existing Spark Postgres container, daily backup timer active.
+
+**Deploy notes**:
+- Existing Spark Postgres is `pgvector/pgvector:pg17` running as superuser `openbrain`. OpsMemory uses two new roles: `opsmemory_owner` (DDL) + `opsmemory_app` (runtime, narrow grants).
+- Spark Docker network is named `infrastructure_backend` (not `spark_internal` as the design assumed). `.env` SPARK_NETWORK_NAME set accordingly.
+- pwsh installed via `snap install powershell --classic` (path: `/snap/bin/pwsh`).
+- pg_dump/pg_restore/psql NOT installed on the host — backup scripts use `docker exec -i postgres ...` instead. PG17 client wasn't in Ubuntu Noble's default repo and PGDG add-via-`echo|tee` got mangled by terminal paste-wrapping.
+- Cloudflare Access team domain: `https://opsmemorytracker.cloudflareaccess.com`.
+- Cloudflare tunnel UUID: `b510e94c-8eab-40dd-ae8d-5c933a3896da` (shared with Conway/auto.kyleconway.ai/mcp.kyleconway.ai).
+- Repo went public on GitHub during deploy because PAT auth in chat is brittle. Acceptable: no secrets in repo.
+- PATs pasted in chat were rotated after use.
+
+**Production state at chunk-1-deployed**:
+- Phone login (Kyle, agbusiness.kyle@gmail.com) verified end-to-end
+- /readyz returns 200 with `backup_check: enabled`, `backup_age_hours: 0.12`, `restore_age_hours: 0.05`
+- Daily backup timer enabled, next firing 02:17 America/Phoenix
+- All other tenants (n8n / openbrain / family_*) untouched and still serving
