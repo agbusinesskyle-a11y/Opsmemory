@@ -52,6 +52,11 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=$ENV_FILE
+# Preflight: validate .env before doing any work. ExecStartPre exits non-zero
+# if env is invalid, which prevents the backup from running with a broken
+# config (e.g. placeholder DSN, missing CF_ACCESS_AUD, dev-mode flags in
+# production).
+ExecStartPre=/usr/bin/python3 ${REPO_DIR}/scripts/validate_env.py --quiet
 # run_backup.sh acquires flock on /var/lib/opsmemory/backup/.lock before
 # invoking pwsh, preventing concurrent backups or backup/restore-check
 # overlap (which could otherwise grab a half-written dump).
