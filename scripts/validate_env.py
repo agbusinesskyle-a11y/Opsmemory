@@ -20,9 +20,9 @@ Behavior:
   - Logs variable NAMES on failure. Never logs values.
 
 Exit codes:
-  0   all checks pass
+  0   all required checks pass (warnings, if any, are still printed)
   1   one or more fatal errors
-  2   warnings only (ok to proceed, but worth noting)
+  2   --strict was passed AND warnings were present (CI mode)
   3   --env-file path missing or unreadable
 """
 
@@ -294,6 +294,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="Read os.environ instead of an .env file")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Only emit failures (no success message)")
+    parser.add_argument("--strict", action="store_true",
+                        help="Exit 2 on warnings (CI mode). Default: exit 0 on"
+                             " warnings (still printed; systemd-friendly).")
     args = parser.parse_args(argv)
 
     if args.use_environ:
@@ -326,10 +329,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if res.fatal:
         return 1
-    if res.warn:
+    if res.warn and args.strict:
         return 2
     if not args.quiet:
-        print(f"OK ({source}): all required vars present, no production fail-closed violations")
+        if res.warn:
+            print(f"OK with {len(res.warn)} warning(s) ({source}): no fatal violations")
+        else:
+            print(f"OK ({source}): all required vars present, no production fail-closed violations")
     return 0
 
 
