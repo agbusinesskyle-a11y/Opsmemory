@@ -19,6 +19,12 @@ services:
     ports:
       # Host loopback only — cloudflared connects locally, no public port.
       - "127.0.0.1:8010:8000"
+    volumes:
+      # Backup/restore status files written by host scripts, read read-only
+      # by /readyz inside the container. Path inside container matches
+      # host path so BACKUP_STATUS_FILE / RESTORE_STATUS_FILE env vars
+      # work in both contexts without translation.
+      - /var/lib/opsmemory/backup:/var/lib/opsmemory/backup:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"]

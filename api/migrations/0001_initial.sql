@@ -257,45 +257,32 @@ BEGIN
 END;
 $$;
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_businesses_updated_at') THEN
-    CREATE TRIGGER trg_businesses_updated_at
-    BEFORE UPDATE ON businesses
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-  END IF;
-END $$;
+-- DROP-then-CREATE pattern guarantees per-table idempotency (the previous
+-- pg_trigger lookup by name alone could collide across tables).
+DROP TRIGGER IF EXISTS trg_businesses_updated_at ON businesses;
+CREATE TRIGGER trg_businesses_updated_at
+BEFORE UPDATE ON businesses
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_users_updated_at') THEN
-    CREATE TRIGGER trg_users_updated_at
-    BEFORE UPDATE ON users
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-  END IF;
-END $$;
+DROP TRIGGER IF EXISTS trg_users_updated_at ON users;
+CREATE TRIGGER trg_users_updated_at
+BEFORE UPDATE ON users
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_user_identities_updated_at') THEN
-    CREATE TRIGGER trg_user_identities_updated_at
-    BEFORE UPDATE ON user_identities
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-  END IF;
-END $$;
+DROP TRIGGER IF EXISTS trg_user_identities_updated_at ON user_identities;
+CREATE TRIGGER trg_user_identities_updated_at
+BEFORE UPDATE ON user_identities
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_business_memberships_updated_at') THEN
-    CREATE TRIGGER trg_business_memberships_updated_at
-    BEFORE UPDATE ON business_memberships
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-  END IF;
-END $$;
+DROP TRIGGER IF EXISTS trg_business_memberships_updated_at ON business_memberships;
+CREATE TRIGGER trg_business_memberships_updated_at
+BEFORE UPDATE ON business_memberships
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_service_accounts_updated_at') THEN
-    CREATE TRIGGER trg_service_accounts_updated_at
-    BEFORE UPDATE ON service_accounts
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-  END IF;
-END $$;
+DROP TRIGGER IF EXISTS trg_service_accounts_updated_at ON service_accounts;
+CREATE TRIGGER trg_service_accounts_updated_at
+BEFORE UPDATE ON service_accounts
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- =========================================================================
 -- Seed data (idempotent — uses ON CONFLICT)
@@ -361,18 +348,42 @@ SET description = EXCLUDED.description,
     dirty = false;
 
 -- =========================================================================
--- Grant runtime privileges to opsmemory_app (if role exists)
+-- Grant narrow runtime privileges to opsmemory_app (if role exists).
+-- Chunk 1 runtime never DELETEs from any table — every "deletion" is a
+-- soft-delete UPDATE setting deleted_at. schema_migrations is read-only
+-- to the runtime; the migration script (run as opsmemory_owner) is the
+-- only writer.
 -- =========================================================================
 
 DO $$ BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'opsmemory_app') THEN
     GRANT USAGE ON SCHEMA public TO opsmemory_app;
-    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO opsmemory_app;
-    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO opsmemory_app;
+
+    -- schema_migrations: read-only.
+    GRANT SELECT ON schema_migrations TO opsmemory_app;
+
+    -- Identity + business tables: SELECT + UPDATE only (last_seen_at,
+    -- last_authenticated_at, claims, provider_subject upgrade). No INSERT
+    -- because seeding happens via migrations; no DELETE because soft-delete
+    -- is via UPDATE of deletion_state + deleted_at.
+    GRANT SELECT, UPDATE ON users TO opsmemory_app;
+    GRANT SELECT, UPDATE ON user_identities TO opsmemory_app;
+    GRANT SELECT, UPDATE ON businesses TO opsmemory_app;
+    GRANT SELECT, UPDATE ON business_memberships TO opsmemory_app;
+    GRANT SELECT, UPDATE ON service_accounts TO opsmemory_app;
+
+    -- Audit log: SELECT + INSERT only. Never UPDATE/DELETE.
+    GRANT SELECT, INSERT ON task_state_transitions TO opsmemory_app;
+
+    -- Sequences (used by uuid PKs are gen_random_uuid() — no sequences yet,
+    -- but ALTER DEFAULT PRIVILEGES sets up future tables to inherit a sane
+    -- default). Restricting future tables to SELECT/INSERT/UPDATE — DELETE
+    -- on new tables must be granted explicitly per table when added.
+    GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO opsmemory_app;
     ALTER DEFAULT PRIVILEGES IN SCHEMA public
-      GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO opsmemory_app;
+      GRANT SELECT, INSERT, UPDATE ON TABLES TO opsmemory_app;
     ALTER DEFAULT PRIVILEGES IN SCHEMA public
-      GRANT USAGE, SELECT ON SEQUENCES TO opsmemory_app;
+      GRANT USAGE ON SEQUENCES TO opsmemory_app;
   END IF;
 END $$;
 

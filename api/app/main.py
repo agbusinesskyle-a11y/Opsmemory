@@ -2,8 +2,10 @@
 
 Wires:
 - DB pool lifecycle (init on startup, close on shutdown)
-- Request-ID + structured logging middleware
-- Security response headers (CSP, X-Content-Type-Options, X-Frame-Options, Referrer-Policy)
+- Production fail-closed guard (refuses to boot with AUTH_MODE=local in production)
+- Request-ID + structured JSON logging middleware
+- Security response headers (CSP, HSTS, X-Content-Type-Options, X-Frame-Options,
+  Referrer-Policy, form-action via CSP)
 - Health/whoami routes
 - PWA static file serving (explicit routes — no catch-all mount that would shadow API)
 """
@@ -12,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import uuid
 from contextlib import asynccontextmanager
 
@@ -22,15 +23,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from .db import close_pool, init_pool
 from .health import router as health_router
+from .logging_config import configure_logging
 
 # ---------------------------------------------------------------------------
-# Logging — JSON-shaped lines on stdout. Docker handles rotation.
+# Logging — proper JSON formatter (escapes quotes/newlines correctly).
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format='{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}',
-    stream=sys.stdout,
-)
+configure_logging()
 log = logging.getLogger("opsmemory.main")
 
 CSP_HEADER = (
@@ -43,15 +41,9 @@ CSP_HEADER = (
     "worker-src 'self'; "
     "object-src 'none'; "
     "base-uri 'self'; "
+    "form-action 'none'; "
     "frame-ancestors 'none'"
 )
-
-SENSITIVE_HEADER_NAMES = {
-    "cookie",
-    "authorization",
-    "cf-access-jwt-assertion",
-    "x-opsmemory-service-key",
-}
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -62,7 +54,8 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         request.state.request_id = request_id
 
         log.info(
-            f"req_start id={request_id} method={request.method} path={request.url.path}"
+            "req_start",
+            extra={"request_id": request_id, "method": request.method, "path": request.url.path},
         )
 
         try:
@@ -70,7 +63,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         except HTTPException:
             raise
         except Exception:
-            log.exception(f"req_error id={request_id}")
+            log.exception("req_error", extra={"request_id": request_id})
             response = JSONResponse(
                 status_code=500,
                 content={"error": "internal_error", "request_id": request_id},
@@ -83,8 +76,31 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
 
-        log.info(f"req_end id={request_id} status={response.status_code}")
+        log.info(
+            "req_end",
+            extra={"request_id": request_id, "status": response.status_code},
+        )
         return response
+
+
+# ---------------------------------------------------------------------------
+# Production fail-closed guard
+# ---------------------------------------------------------------------------
+def _enforce_production_safety() -> None:
+    env = os.environ.get("ENVIRONMENT", "").lower()
+    if env != "production":
+        return
+    auth_mode = os.environ.get("AUTH_MODE", "cloudflare").lower()
+    allow_switch = os.environ.get("ALLOW_DEV_USER_SWITCH", "false").lower()
+    problems: list[str] = []
+    if auth_mode == "local":
+        problems.append("AUTH_MODE=local is forbidden when ENVIRONMENT=production")
+    if allow_switch == "true":
+        problems.append("ALLOW_DEV_USER_SWITCH=true is forbidden when ENVIRONMENT=production")
+    if problems:
+        for p in problems:
+            log.error("production_safety_violation", extra={"detail": p})
+        raise RuntimeError("; ".join(problems))
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +108,10 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _enforce_production_safety()
     pool = await init_pool()
     app.state.db = pool
-    log.info("opsmemory_started")
+    log.info("opsmemory_started", extra={"version": os.environ.get("APP_VERSION", "chunk1")})
     try:
         yield
     finally:
@@ -106,7 +123,7 @@ app = FastAPI(
     title="OpsMemory API",
     version=os.environ.get("APP_VERSION", "chunk1"),
     lifespan=lifespan,
-    docs_url=None,  # No /docs in production. Available in chunk-2+ behind admin auth.
+    docs_url=None,
     redoc_url=None,
     openapi_url=None,
 )
@@ -117,7 +134,6 @@ app.include_router(health_router)
 
 # ---------------------------------------------------------------------------
 # PWA static file serving — explicit routes, no catch-all mount.
-# Catch-all mount at "/" would shadow API routes; explicit routes won't.
 # ---------------------------------------------------------------------------
 WEB_ROOT = os.environ.get("WEB_ROOT", "/app/web")
 
@@ -161,14 +177,12 @@ async def serve_sw() -> FileResponse:
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="not found")
     response = FileResponse(path, media_type="application/javascript")
-    # Allow the SW to control the entire origin from any path.
     response.headers["Service-Worker-Allowed"] = "/"
     return response
 
 
 @app.get("/icons/{filename}")
 async def serve_icon(filename: str) -> FileResponse:
-    # Whitelist: alnum + hyphen + underscore + dot, ending in .png or .ico.
     if not filename or len(filename) > 64:
         raise HTTPException(status_code=400, detail="invalid filename")
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")

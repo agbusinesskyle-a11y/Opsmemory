@@ -80,8 +80,8 @@ if (-not $LatestDump) {
     exit 2
 }
 
-$Now = Get-Date
-$DumpAgeHours = [math]::Round(($Now - $LatestDump.LastWriteTime).TotalHours, 2)
+$StartedAt = Get-Date
+$DumpAgeHours = [math]::Round(($StartedAt - $LatestDump.LastWriteTime).TotalHours, 2)
 Write-Host "[$(Get-Date -Format o)] using dump $($LatestDump.FullName) (age $DumpAgeHours h)"
 
 # ---- Drop & create restore DB ------------------------------------------
@@ -102,8 +102,22 @@ try {
 }
 
 # Build restore connection URL by swapping the DB name.
-# Matches /<dbname> at end-of-URL or /<dbname>? followed by query string.
-$RestoreUrl = $AdminUrl -replace '/[^/?]+($|\?)', "/$RestoreDb`$1"
+# Use [System.UriBuilder] for robust DSN parsing — the previous regex broke
+# on edge cases (no path component, trailing slash, query containing slashes).
+function Build-RestoreUrl([string]$AdminUrl, [string]$RestoreDbName) {
+    try {
+        $Builder = [System.UriBuilder]::new($AdminUrl)
+    } catch {
+        throw "RESTORE_TEST_ADMIN_URL is not a valid URI: $AdminUrl"
+    }
+    if ($RestoreDbName -notmatch '^[a-zA-Z][a-zA-Z0-9_]+$') {
+        throw "RestoreDbName failed identifier check: $RestoreDbName"
+    }
+    $Builder.Path = "/$RestoreDbName"
+    return $Builder.Uri.AbsoluteUri
+}
+
+$RestoreUrl = Build-RestoreUrl $AdminUrl $RestoreDb
 
 # ---- pg_restore ---------------------------------------------------------
 Write-Host "[$(Get-Date -Format o)] pg_restore -> $RestoreDb"
@@ -180,8 +194,12 @@ if (-not $KeepDb) {
 $StatusDir = Split-Path -Parent $StatusFile
 New-Item -ItemType Directory -Path $StatusDir -Force | Out-Null
 
+# completed_at captured AFTER all checks pass and cleanup runs.
+$CompletedAt = Get-Date
 $Status = [ordered]@{
-    completed_at      = $Now.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    started_at        = $StartedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    completed_at      = $CompletedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    duration_seconds  = [int]($CompletedAt - $StartedAt).TotalSeconds
     ok                = $true
     dump_path         = $LatestDump.FullName
     dump_age_hours    = $DumpAgeHours

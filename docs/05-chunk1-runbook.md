@@ -8,9 +8,30 @@ Step-by-step from "git push lands on GitHub" to "Joanna logs in from her phone."
 - Docker + docker-compose (already there for n8n)
 - Postgres reachable on the existing `spark_internal` Docker network at `postgres:5432`
 - `pg_dump`, `pg_restore`, `psql` ≥ 13 (`apt install postgresql-client-15` or similar)
-- `pwsh` 7 installed (`apt install -y wget && wget https://github.com/PowerShell/PowerShell/releases/...` — see Microsoft docs)
+- `pwsh` 7 installed (Microsoft repo; `apt install -y powershell`)
 - `rsync` and `ssh` for Spark #2 backup leg
 - `cloudflared` already running and authenticated (the existing tunnel)
+
+## How to reach Postgres from the host
+
+The existing Postgres container's hostname `postgres` is only resolvable inside the `spark_internal` Docker network. Steps 2-5 below need to talk to Postgres from the host. Pick whichever option matches your existing setup:
+
+- **Option A — `docker exec` into the existing Postgres container** (works regardless of port exposure). Find the container name with `docker ps --format '{{.Names}}' | grep -i postgres`, then prefix every `psql` invocation:
+  ```bash
+  docker exec -i <postgres-container> psql -U postgres -d postgres
+  ```
+  For commands that take SQL on stdin (`<<'SQL'`), use `docker exec -i` (the `-i` keeps stdin open).
+
+- **Option B — host-loopback port mapping**. If your existing Postgres compose maps `127.0.0.1:5432:5432`, you can use `psql "postgres://postgres@127.0.0.1:5432/postgres"` directly from the host. Confirm with `ss -ltnp | grep 5432`.
+
+- **Option C — run psql in a temporary container on the existing network**:
+  ```bash
+  docker run --rm -i --network spark_internal postgres:15 psql -h postgres -U postgres -d postgres
+  ```
+
+Examples below use Option A's form. Translate to B or C as appropriate.
+
+> Critical: **never expose Postgres on a public port to make this easier**. The whole architecture depends on it staying on the internal Docker network or host loopback.
 
 ---
 
@@ -25,35 +46,49 @@ cd /opt/opsmemory
 
 ## 2. Create Postgres roles + database
 
-Run as a Postgres superuser (e.g. `postgres` or your existing admin):
+Generate strong, distinct passwords (no `@`, `:`, `/`, `?`, `#`, `&`, or whitespace — those characters break URL-encoded DSNs across docker env-file, bash `source`, and systemd `EnvironmentFile`):
 
 ```bash
-psql "postgres://postgres@postgres:5432/postgres" <<'SQL'
-CREATE ROLE opsmemory_owner LOGIN PASSWORD '<owner-password>';
-CREATE ROLE opsmemory_app   LOGIN PASSWORD '<app-password>';
+OWNER_PW=$(python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(32)))")
+APP_PW=$(python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(32)))")
+echo "OWNER_PW=$OWNER_PW"
+echo "APP_PW=$APP_PW"
+```
+
+Save those — they go in `.env` in step 6. Then create the roles + database (using Option A's `docker exec` form):
+
+```bash
+docker exec -i <postgres-container> psql -U postgres -d postgres <<SQL
+CREATE ROLE opsmemory_owner LOGIN PASSWORD '$OWNER_PW';
+CREATE ROLE opsmemory_app   LOGIN PASSWORD '$APP_PW';
 CREATE DATABASE action_tracker OWNER opsmemory_owner;
 GRANT CONNECT ON DATABASE action_tracker TO opsmemory_app;
 SQL
 ```
 
-Replace `<owner-password>` and `<app-password>` with strong, distinct passwords. Save them — they go in `.env`.
-
-**Why two roles**: `opsmemory_owner` runs migrations (DDL); `opsmemory_app` is the runtime principal and cannot DROP TABLE. Lower blast radius if the API is compromised.
+**Why two roles**: `opsmemory_owner` runs migrations (DDL); `opsmemory_app` is the runtime principal with narrow grants (SELECT/UPDATE on identity tables, SELECT/INSERT on audit log, SELECT-only on `schema_migrations`, no DELETE anywhere). Lower blast radius if the API is compromised.
 
 ## 3. Run the migration
 
+The `opsmemory_app` role must already exist before this step (step 2 created it) — otherwise the conditional GRANT block at the end of the migration silently skips, and the runtime app will fail with permission errors. The migration is idempotent, so if you forget, re-run it after creating the role.
+
+Copy the migration file into the existing Postgres container and apply it:
+
 ```bash
-psql "postgres://opsmemory_owner:<owner-password>@postgres:5432/action_tracker" \
-     -v ON_ERROR_STOP=1 \
-     -f api/migrations/0001_initial.sql
+docker cp api/migrations/0001_initial.sql <postgres-container>:/tmp/0001_initial.sql
+docker exec -i <postgres-container> \
+  psql -U opsmemory_owner -d action_tracker \
+       -v ON_ERROR_STOP=1 \
+       -f /tmp/0001_initial.sql
+docker exec <postgres-container> rm /tmp/0001_initial.sql
 ```
 
-You should see `BEGIN ... COMMIT` and no errors. Migration is idempotent — re-running is safe.
+Expected: `BEGIN ... COMMIT` and no errors. Migration is idempotent — re-running is safe.
 
 ## 4. Verify seeds and enums
 
 ```bash
-psql "postgres://opsmemory_owner:<owner-password>@postgres:5432/action_tracker" <<'SQL'
+docker exec -i <postgres-container> psql -U opsmemory_owner -d action_tracker <<'SQL'
 SELECT count(*) AS users        FROM users;        -- expect 4
 SELECT count(*) AS businesses   FROM businesses;   -- expect 2
 SELECT count(*) AS memberships  FROM business_memberships; -- expect 6
@@ -74,7 +109,7 @@ All five enums should appear. Counts should be 4 / 2 / 6.
 ## 5. Verify other databases are untouched
 
 ```bash
-psql "postgres://postgres@postgres:5432/postgres" -c "\l"
+docker exec <postgres-container> psql -U postgres -c "\l"
 ```
 
 Confirm `n8n`, `openbrain`, `family_docs`, `family_health`, `litellm` databases still exist with original sizes.
@@ -195,34 +230,81 @@ If you get **401** repeatedly: `CF_ACCESS_TEAM_DOMAIN` or `CF_ACCESS_AUD` is wro
 
 If the page never reaches Cloudflare: DNS hasn't propagated. Wait 1-5 minutes.
 
-## 12. Run the first backup manually
+## 12. Create `opsmemory` system user, dirs, and SSH key for Spark #2
+
+The systemd backup timer (step 15) runs as a dedicated unprivileged user. Create it now and grant access to the dirs the script needs.
 
 ```bash
-sudo mkdir -p /var/backups/opsmemory/action_tracker
-sudo chown $USER:$USER /var/backups/opsmemory/action_tracker
-sudo mkdir -p /var/lib/opsmemory/backup
-sudo chown $USER:$USER /var/lib/opsmemory/backup
+# System user, no shell, home dir under /var/lib so backup state lives there.
+sudo useradd --system --shell /bin/false --home-dir /var/lib/opsmemory --create-home opsmemory
 
+# Backup directories.
+sudo mkdir -p /var/backups/opsmemory/action_tracker
+sudo mkdir -p /var/lib/opsmemory/backup
+sudo chown -R opsmemory:opsmemory /var/backups/opsmemory /var/lib/opsmemory
+
+# .env readable by the opsmemory user.
+sudo chown root:opsmemory /opt/opsmemory/.env
+sudo chmod 0640 /opt/opsmemory/.env
+
+# Repo readable by the opsmemory user (for the .ps1 scripts).
+sudo chgrp -R opsmemory /opt/opsmemory
+sudo chmod -R g+rX /opt/opsmemory
+```
+
+If `BACKUP_SPARK2_TARGET` is set, generate an SSH key for the opsmemory user and install the public key on Spark #2. Use a separate key — do not reuse Kyle's user SSH key:
+
+```bash
+sudo -u opsmemory ssh-keygen -t ed25519 -N '' -f /var/lib/opsmemory/.ssh/spark2_id_ed25519 -C 'opsmemory@spark1'
+
+# Print public key to stdout — install it on Spark #2 as ~opsbackup/.ssh/authorized_keys.
+sudo cat /var/lib/opsmemory/.ssh/spark2_id_ed25519.pub
+```
+
+On Spark #2, create the receiver user (or use an existing low-privilege user), append the public key to `~/.ssh/authorized_keys` (mode 0600), and confirm `mkdir -p /srv/backups/opsmemory/action_tracker` exists with `opsbackup:opsbackup` ownership.
+
+Configure SSH for opsmemory to use the dedicated key when reaching Spark #2. Append to `/var/lib/opsmemory/.ssh/config` (owned by opsmemory):
+
+```
+Host spark2
+  HostName <spark2-hostname-or-ip>
+  User opsbackup
+  IdentityFile /var/lib/opsmemory/.ssh/spark2_id_ed25519
+  StrictHostKeyChecking accept-new
+```
+
+Verify:
+
+```bash
+sudo -u opsmemory ssh spark2 'echo ok'
+```
+
+## 13. Run the first backup manually
+
+```bash
 # Source .env so the script picks up envs.
 set -a && source /opt/opsmemory/.env && set +a
 
-pwsh /opt/opsmemory/scripts/backup_action_tracker.ps1
+# Run as opsmemory user so file ownership matches the systemd timer.
+sudo -u opsmemory --preserve-env=ACTION_TRACKER_DATABASE_URL,BACKUP_ROOT,BACKUP_SPARK2_TARGET,BACKUP_RETENTION_DAYS,BACKUP_STATUS_FILE \
+     pwsh /opt/opsmemory/scripts/backup_action_tracker.ps1
 ```
 
 Expected output: `pg_dump complete`, `rsync -> opsbackup@spark2:...`, `backup complete`. Check `/var/lib/opsmemory/backup/status.json` for the result row.
 
-## 13. Run the restore check manually
+## 14. Run the restore check manually
 
 ```bash
 set -a && source /opt/opsmemory/.env && set +a
-pwsh /opt/opsmemory/scripts/restore_check.ps1
+sudo -u opsmemory --preserve-env=BACKUP_ROOT,RESTORE_TEST_ADMIN_URL,RESTORE_TEST_DB,KEEP_RESTORE_DB,RESTORE_STATUS_FILE \
+     pwsh /opt/opsmemory/scripts/restore_check.ps1
 ```
 
 Expected output: `using dump ...`, `pg_restore -> action_tracker_restore_test`, `all smoke checks passed`, `restore-check complete`. Check `/var/lib/opsmemory/backup/restore_status.json`.
 
 If smoke checks fail, the dump is bad — do not proceed. Investigate.
 
-## 14. Enable the daily backup systemd timer
+## 15. Enable the daily backup systemd timer
 
 Create `/etc/systemd/system/opsmemory-backup.service`:
 
@@ -265,24 +347,25 @@ systemctl list-timers opsmemory-backup.timer
 
 (Weekly automated restore-check timer is **deferred to Chunk 1.5**. Run `restore_check.ps1` manually for now whenever you want to verify.)
 
-## 15. Flip readyz to require backup
+## 16. Flip readyz to require backup
 
-After step 13 succeeds, edit `.env`:
+After step 14 succeeds, edit `.env`:
 
 ```
 READYZ_REQUIRE_BACKUP=true
 ```
 
-Restart:
+Restart with `--force-recreate` so docker re-reads the env file (plain `up -d` may keep the old container running):
 
 ```bash
-docker compose up -d
+cd /opt/opsmemory
+docker compose up -d --force-recreate
 curl -s http://127.0.0.1:8010/readyz | jq
 ```
 
-`/readyz` should still return `{"ok": true, "backup_check": "enabled"}`. If `backup_stale`, the status file is older than `READYZ_BACKUP_MAX_AGE_HOURS`.
+`/readyz` should return HTTP 200 with `{"ok": true, "backup_check": "enabled", "backup_age_hours": <small number>}`. If `backup_stale`, the status file is older than `READYZ_BACKUP_MAX_AGE_HOURS`. If you get 503 with `reason: backup_missing`, the backup status file isn't visible inside the container — check that the bind mount in `docker-compose.yml` (`/var/lib/opsmemory/backup:/var/lib/opsmemory/backup:ro`) is actually present and the host directory exists.
 
-## 16. Final smoke test (acceptance)
+## 17. Final smoke test (acceptance)
 
 | Check | Command | Expected |
 |---|---|---|
@@ -303,7 +386,7 @@ When all rows pass, Chunk 1 is **done**.
 
 ## Rollback
 
-If something breaks badly during steps 1-13:
+If something breaks badly during steps 1-15:
 
 1. `docker compose down` (stops the API)
 2. Remove the cloudflared ingress rule for `tracker.kyleconway.ai` and restart cloudflared (existing services keep working)

@@ -63,10 +63,10 @@ $StatusFile = $env:BACKUP_STATUS_FILE
 if (-not $StatusFile) { $StatusFile = "/var/lib/opsmemory/backup/status.json" }
 
 # ---- Compute paths ------------------------------------------------------
-$Now      = Get-Date
-$Year     = $Now.ToString("yyyy")
-$Month    = $Now.ToString("MM")
-$Stamp    = $Now.ToString("yyyyMMdd-HHmmss")
+$StartedAt = Get-Date
+$Year     = $StartedAt.ToString("yyyy")
+$Month    = $StartedAt.ToString("MM")
+$Stamp    = $StartedAt.ToString("yyyyMMdd-HHmmss")
 $BackupDir = Join-Path -Path $BackupRoot -ChildPath "$Year/$Month"
 $DumpFile  = Join-Path -Path $BackupDir -ChildPath "action_tracker-$Stamp.dump"
 
@@ -102,10 +102,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ---- Optional: rsync to Spark #2 ---------------------------------------
+# rsync default behavior writes to a hidden temp name and renames after
+# successful transfer. Removing --partial avoids leaving incomplete remote
+# files on connection drops, so the receiver only ever sees complete dumps.
 $Rsynced = $false
 if ($Spark2Target) {
     Write-Host "[$(Get-Date -Format o)] rsync -> $Spark2Target"
-    & rsync -av --partial $DumpFile "${Spark2Target}/"
+    & rsync -av $DumpFile "${Spark2Target}/"
     if ($LASTEXITCODE -ne 0) {
         Send-FailureAlert "rsync_failed" "target=$Spark2Target exit=$LASTEXITCODE"
         Write-Error "rsync to Spark #2 failed (exit $LASTEXITCODE)"
@@ -117,7 +120,7 @@ if ($Spark2Target) {
 }
 
 # ---- Retention prune (local only) --------------------------------------
-$CutoffDate = $Now.AddDays(-$RetentionDays)
+$CutoffDate = $StartedAt.AddDays(-$RetentionDays)
 $Pruned = 0
 Get-ChildItem -Path $BackupRoot -Recurse -Filter "*.dump" -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -lt $CutoffDate } |
@@ -134,8 +137,13 @@ Get-ChildItem -Path $BackupRoot -Directory -Recurse -ErrorAction SilentlyContinu
     ForEach-Object { Remove-Item $_.FullName -Force }
 
 # ---- Write status JSON --------------------------------------------------
+# completed_at is captured AFTER all work succeeds so /readyz freshness
+# reflects actual completion, not start time.
+$CompletedAt = Get-Date
 $Status = [ordered]@{
-    completed_at      = $Now.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    started_at        = $StartedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    completed_at      = $CompletedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    duration_seconds  = [int]($CompletedAt - $StartedAt).TotalSeconds
     dump_path         = $DumpFile
     dump_bytes        = $DumpSize
     spark2_target     = $Spark2Target

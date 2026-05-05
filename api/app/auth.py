@@ -180,15 +180,20 @@ async def _load_user(
             "exp": claims.get("exp"),
         }
 
+        # Persist provider_subject on first authentication (COALESCE keeps any
+        # already-set value to prevent silent re-binding if the IdP rotates `sub`).
+        sub = claims.get("sub")
         await conn.execute(
             """
             UPDATE user_identities
             SET last_authenticated_at = now(),
-                claims = $2::jsonb
+                claims = $2::jsonb,
+                provider_subject = COALESCE(provider_subject, $3)
             WHERE id = $1
             """,
             row["identity_id"],
             json.dumps(claim_subset),
+            sub,
         )
 
         await conn.execute(
