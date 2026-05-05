@@ -75,14 +75,21 @@ New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
 $StatusDir = Split-Path -Parent $StatusFile
 New-Item -ItemType Directory -Path $StatusDir -Force | Out-Null
 
-# ---- pg_dump ------------------------------------------------------------
-Write-Host "[$(Get-Date -Format o)] pg_dump -> $DumpFile"
-& pg_dump --dbname $DatabaseUrl `
-          --format custom `
-          --compress 9 `
-          --no-owner `
-          --no-acl `
-          --file $DumpFile
+# ---- pg_dump (via docker exec — no host postgres-client needed) ---------
+# We connect to the existing postgres container via Unix socket inside the
+# container (peer auth, no password). bash handles the binary stdout
+# redirect since PowerShell's pipeline mangles binary streams.
+$ContainerName = $env:POSTGRES_CONTAINER
+if (-not $ContainerName) { $ContainerName = "postgres" }
+
+$DbRole = $env:ACTION_TRACKER_DB_ROLE
+if (-not $DbRole) { $DbRole = "opsmemory_owner" }
+
+$DbName = $env:ACTION_TRACKER_DB_NAME
+if (-not $DbName) { $DbName = "action_tracker" }
+
+Write-Host "[$(Get-Date -Format o)] pg_dump (docker exec $ContainerName) -> $DumpFile"
+& bash -c "docker exec -i $ContainerName pg_dump -U $DbRole -d $DbName --format custom --compress 9 --no-owner --no-acl > '$DumpFile'"
 
 if ($LASTEXITCODE -ne 0) {
     Send-FailureAlert "pg_dump_failed" "exit=$LASTEXITCODE file=$DumpFile"
@@ -93,8 +100,8 @@ if ($LASTEXITCODE -ne 0) {
 $DumpSize = (Get-Item $DumpFile).Length
 Write-Host "[$(Get-Date -Format o)] pg_dump complete: $([math]::Round($DumpSize/1MB, 2)) MB"
 
-# ---- Verify dump is parseable ------------------------------------------
-& pg_restore --list $DumpFile *> $null
+# ---- Verify dump is parseable (via docker exec, stream stdin) ----------
+& bash -c "docker exec -i $ContainerName pg_restore --list - < '$DumpFile' > /dev/null"
 if ($LASTEXITCODE -ne 0) {
     Send-FailureAlert "pg_restore_list_failed" "dump may be corrupt: $DumpFile"
     Write-Error "pg_restore --list failed — dump may be corrupt"

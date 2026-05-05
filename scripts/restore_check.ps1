@@ -84,9 +84,18 @@ $StartedAt = Get-Date
 $DumpAgeHours = [math]::Round(($StartedAt - $LatestDump.LastWriteTime).TotalHours, 2)
 Write-Host "[$(Get-Date -Format o)] using dump $($LatestDump.FullName) (age $DumpAgeHours h)"
 
-# ---- Drop & create restore DB ------------------------------------------
+# ---- Drop & create restore DB (via docker exec — no host psql needed) --
+$ContainerName = $env:POSTGRES_CONTAINER
+if (-not $ContainerName) { $ContainerName = "postgres" }
+
+$AdminUser = $env:RESTORE_TEST_ADMIN_USER
+if (-not $AdminUser) { $AdminUser = "openbrain" }
+
+$AdminDb = $env:RESTORE_TEST_ADMIN_DB
+if (-not $AdminDb) { $AdminDb = "openbrain" }
+
 function Run-AdminSql($Sql) {
-    & psql $AdminUrl -v ON_ERROR_STOP=1 -c $Sql 2>&1 | Out-Null
+    & docker exec -i $ContainerName psql -U $AdminUser -d $AdminDb -v ON_ERROR_STOP=1 -c $Sql 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "admin psql failed: $Sql"
     }
@@ -101,27 +110,10 @@ try {
     exit 3
 }
 
-# Build restore connection URL by swapping the DB name.
-# Use [System.UriBuilder] for robust DSN parsing — the previous regex broke
-# on edge cases (no path component, trailing slash, query containing slashes).
-function Build-RestoreUrl([string]$AdminUrl, [string]$RestoreDbName) {
-    try {
-        $Builder = [System.UriBuilder]::new($AdminUrl)
-    } catch {
-        throw "RESTORE_TEST_ADMIN_URL is not a valid URI: $AdminUrl"
-    }
-    if ($RestoreDbName -notmatch '^[a-zA-Z][a-zA-Z0-9_]+$') {
-        throw "RestoreDbName failed identifier check: $RestoreDbName"
-    }
-    $Builder.Path = "/$RestoreDbName"
-    return $Builder.Uri.AbsoluteUri
-}
-
-$RestoreUrl = Build-RestoreUrl $AdminUrl $RestoreDb
-
-# ---- pg_restore ---------------------------------------------------------
-Write-Host "[$(Get-Date -Format o)] pg_restore -> $RestoreDb"
-& pg_restore --no-owner --no-acl --dbname $RestoreUrl $LatestDump.FullName
+# ---- pg_restore (via docker exec, dump streamed in via stdin) ----------
+# RestoreDb identifier was already validated above (^[a-zA-Z][a-zA-Z0-9_]+$).
+Write-Host "[$(Get-Date -Format o)] pg_restore (docker exec $ContainerName) -> $RestoreDb"
+& bash -c "docker exec -i $ContainerName pg_restore --no-owner --no-acl -U $AdminUser -d $RestoreDb < '$($LatestDump.FullName)'"
 
 if ($LASTEXITCODE -ne 0) {
     Send-FailureAlert "pg_restore_failed" "exit=$LASTEXITCODE dump=$($LatestDump.FullName)"
@@ -130,11 +122,11 @@ if ($LASTEXITCODE -ne 0) {
     exit 4
 }
 
-# ---- Smoke checks -------------------------------------------------------
+# ---- Smoke checks (via docker exec into the restored DB) ----------------
 function Run-Sql($Sql) {
     # 0x1f = ASCII Unit Separator. Avoids '|' colliding with JSON pipe content.
     $sep = [char]0x1F
-    $output = & psql $RestoreUrl -v ON_ERROR_STOP=1 -At -F $sep -c $Sql 2>&1
+    $output = & docker exec -i $ContainerName psql -U $AdminUser -d $RestoreDb -v ON_ERROR_STOP=1 -At -F $sep -c $Sql 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "smoke psql failed: $Sql -- $($output -join '; ')"
     }
