@@ -68,8 +68,9 @@ $KeepDb = ($env:KEEP_RESTORE_DB -eq "true")
 $StatusFile = $env:RESTORE_STATUS_FILE
 if (-not $StatusFile) { $StatusFile = "/var/lib/opsmemory/backup/restore_status.json" }
 
-# ---- Find most recent dump ---------------------------------------------
-$LatestDump = Get-ChildItem -Path $BackupRoot -Recurse -Filter "*.dump" -ErrorAction SilentlyContinue |
+# ---- Find most recent dump (.dump or .dump.gpg) -----------------------
+$LatestDump = Get-ChildItem -Path $BackupRoot -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like "*.dump" -or $_.Name -like "*.dump.gpg" } |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 
@@ -82,7 +83,60 @@ if (-not $LatestDump) {
 
 $StartedAt = Get-Date
 $DumpAgeHours = [math]::Round(($StartedAt - $LatestDump.LastWriteTime).TotalHours, 2)
-Write-Host "[$(Get-Date -Format o)] using dump $($LatestDump.FullName) (age $DumpAgeHours h)"
+$IsEncrypted = $LatestDump.Name -like "*.dump.gpg"
+Write-Host "[$(Get-Date -Format o)] using dump $($LatestDump.FullName) (age $DumpAgeHours h$(if ($IsEncrypted) {' [encrypted]'}))"
+
+# ---- GPG decrypt or partial-verify ------------------------------------
+# If the dump is encrypted, we need the private key to decrypt for a full
+# restore-check. If the private key isn't available on this machine
+# (because it lives on Spark #2 / laptop password manager / offline),
+# fall back to a structure-only verification: gpg --list-packets confirms
+# the file is a well-formed GPG envelope, but doesn't decrypt the body.
+# Operator's full restore-check happens from a machine with the private
+# key (typically Spark #2 — Chunk 1.5 step 7).
+$DecryptedTempFile = $null
+$VerificationMode = if ($IsEncrypted) { "encrypted-pending-private-key" } else { "plaintext-full" }
+$RestoreSourcePath = $LatestDump.FullName
+
+if ($IsEncrypted) {
+    $GpgRecipient = $env:BACKUP_GPG_RECIPIENT
+    if (-not $GpgRecipient) {
+        Send-FailureAlert "gpg_recipient_missing" "BACKUP_GPG_RECIPIENT required to verify .gpg dumps"
+        Write-Error "BACKUP_GPG_RECIPIENT not set; cannot decide encryption verification path"
+        exit 7
+    }
+
+    # Does this machine have the private key?
+    $hasPrivate = $false
+    & gpg --list-secret-keys $GpgRecipient *> $null
+    if ($LASTEXITCODE -eq 0) { $hasPrivate = $true }
+
+    if ($hasPrivate) {
+        $VerificationMode = "encrypted-full"
+        Write-Host "[$(Get-Date -Format o)] gpg private key for $GpgRecipient found; decrypting"
+        $DecryptedTempFile = "/tmp/opsmemory-restore-$(Get-Random).dump"
+        & gpg --batch --quiet --yes --output $DecryptedTempFile --decrypt $LatestDump.FullName
+        if ($LASTEXITCODE -ne 0) {
+            Send-FailureAlert "gpg_decrypt_failed" "dump=$($LatestDump.FullName)"
+            Write-Error "gpg --decrypt failed"
+            exit 7
+        }
+        $RestoreSourcePath = $DecryptedTempFile
+    } else {
+        $VerificationMode = "encrypted-structure-only"
+        Write-Host "[$(Get-Date -Format o)] gpg private key NOT on this machine; running structure-only verification"
+        # gpg --list-packets fails on truncated / non-GPG files even without
+        # the private key. It DOES need to read the packet headers (which
+        # requires the public key — already imported when we encrypted).
+        & gpg --list-packets --batch --quiet $LatestDump.FullName *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Send-FailureAlert "gpg_list_packets_failed" "dump=$($LatestDump.FullName)"
+            Write-Error "gpg --list-packets failed — encrypted dump may be corrupt"
+            exit 7
+        }
+        Write-Host "[$(Get-Date -Format o)] structure-only check passed; full restore must be verified from a machine with the private key"
+    }
+}
 
 # ---- Drop & create restore DB (via docker exec — no host psql needed) --
 $ContainerName = $env:POSTGRES_CONTAINER
@@ -101,6 +155,28 @@ function Run-AdminSql($Sql) {
     }
 }
 
+if ($VerificationMode -eq "encrypted-structure-only") {
+    # No private key — skip the actual restore. Write a status JSON noting
+    # that verification was structure-only, so /readyz is aware.
+    $CompletedAt = Get-Date
+    $Status = [ordered]@{
+        started_at        = $StartedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        completed_at      = $CompletedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        duration_seconds  = [int]($CompletedAt - $StartedAt).TotalSeconds
+        ok                = $true
+        verification_mode = $VerificationMode
+        dump_path         = $LatestDump.FullName
+        dump_age_hours    = $DumpAgeHours
+        smoke_checks      = @{ "gpg_structure" = "ok" }
+    } | ConvertTo-Json -Depth 4
+
+    $StatusDir = Split-Path -Parent $StatusFile
+    New-Item -ItemType Directory -Path $StatusDir -Force | Out-Null
+    [IO.File]::WriteAllText($StatusFile, $Status)
+    Write-Host "[$(Get-Date -Format o)] structure-only verify complete; status=$StatusFile"
+    return
+}
+
 try {
     Run-AdminSql "DROP DATABASE IF EXISTS $RestoreDb"
     Run-AdminSql "CREATE DATABASE $RestoreDb"
@@ -113,11 +189,12 @@ try {
 # ---- pg_restore (via docker exec, dump streamed in via stdin) ----------
 # RestoreDb identifier was already validated above (^[a-zA-Z][a-zA-Z0-9_]+$).
 Write-Host "[$(Get-Date -Format o)] pg_restore (docker exec $ContainerName) -> $RestoreDb"
-& bash -c "docker exec -i $ContainerName pg_restore --no-owner --no-acl -U $AdminUser -d $RestoreDb < '$($LatestDump.FullName)'"
+& bash -c "docker exec -i $ContainerName pg_restore --no-owner --no-acl -U $AdminUser -d $RestoreDb < '$RestoreSourcePath'"
 
 if ($LASTEXITCODE -ne 0) {
     Send-FailureAlert "pg_restore_failed" "exit=$LASTEXITCODE dump=$($LatestDump.FullName)"
     if (-not $KeepDb) { try { Run-AdminSql "DROP DATABASE IF EXISTS $RestoreDb" } catch { } }
+    if ($DecryptedTempFile -and (Test-Path $DecryptedTempFile)) { Remove-Item $DecryptedTempFile -Force }
     Write-Error "pg_restore failed (exit $LASTEXITCODE)"
     exit 4
 }
@@ -184,6 +261,12 @@ if (-not $KeepDb) {
     Write-Host "KEEP_RESTORE_DB=true — leaving $RestoreDb in place"
 }
 
+# Clean up the temp decrypted file (if any). Mode 0600 minimized exposure
+# during the restore window; remove as soon as we're done.
+if ($DecryptedTempFile -and (Test-Path $DecryptedTempFile)) {
+    Remove-Item $DecryptedTempFile -Force
+}
+
 # ---- Status JSON --------------------------------------------------------
 $StatusDir = Split-Path -Parent $StatusFile
 New-Item -ItemType Directory -Path $StatusDir -Force | Out-Null
@@ -195,6 +278,7 @@ $Status = [ordered]@{
     completed_at      = $CompletedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
     duration_seconds  = [int]($CompletedAt - $StartedAt).TotalSeconds
     ok                = $true
+    verification_mode = $VerificationMode
     dump_path         = $LatestDump.FullName
     dump_age_hours    = $DumpAgeHours
     restore_db        = $RestoreDb

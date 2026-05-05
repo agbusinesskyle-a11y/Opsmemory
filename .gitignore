@@ -6,6 +6,8 @@
 *.key
 *.gpg
 *.asc
+# Public GPG keys are safe to commit (they're public by design).
+!infra/keys/*.asc
 
 # Python
 __pycache__/

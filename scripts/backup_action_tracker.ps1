@@ -88,10 +88,29 @@ if (-not $DbRole) { $DbRole = "opsmemory_owner" }
 $DbName = $env:ACTION_TRACKER_DB_NAME
 if (-not $DbName) { $DbName = "action_tracker" }
 
+# GPG encryption settings (chunk1.5 step 5).
+$GpgEnabled = ($env:GPG_ENABLED -eq "true")
+$GpgRecipient = $env:BACKUP_GPG_RECIPIENT
+$GpgPublicKeyFile = $env:BACKUP_GPG_PUBLIC_KEY_FILE
+if (-not $GpgPublicKeyFile) {
+    $GpgPublicKeyFile = "/opt/opsmemory/infra/keys/backup-public.asc"
+}
+
+if ($GpgEnabled -and -not $GpgRecipient) {
+    Write-Error "GPG_ENABLED=true but BACKUP_GPG_RECIPIENT not set"
+    exit 1
+}
+
+# Final filename depends on whether we encrypt.
+$FinalFile = if ($GpgEnabled) { "$DumpFile.gpg" } else { $DumpFile }
+
 # Atomic publish pattern: write to <name>.partial first, verify with
-# pg_restore --list, then rename to the final filename. Means restore-check
-# never picks up a half-written dump, and crash recovery is `rm *.partial`.
+# pg_restore --list, then optionally GPG-encrypt, then rename to the final
+# filename. Means restore-check never picks up a half-written or
+# half-encrypted dump.
 $PartialFile = "$DumpFile.partial"
+$EncryptedPartial = "$FinalFile.partial"
+
 Write-Host "[$(Get-Date -Format o)] pg_dump (docker exec $ContainerName) -> $PartialFile"
 
 try {
@@ -107,8 +126,6 @@ try {
     Write-Host "[$(Get-Date -Format o)] pg_dump produced $([math]::Round($PartialSize/1MB, 2)) MB; verifying"
 
     # ---- Verify dump is parseable -----------------------------------------
-    # pg_restore reads stdin when no filename is given; '-' is NOT a valid
-    # placeholder (postgres rejects it as "No such file").
     & bash -c "docker exec -i $ContainerName pg_restore --list < '$PartialFile' > /dev/null"
     if ($LASTEXITCODE -ne 0) {
         Send-FailureAlert "pg_restore_list_failed" "partial dump corrupt: $PartialFile"
@@ -116,19 +133,54 @@ try {
         exit 3
     }
 
+    if ($GpgEnabled) {
+        # ---- GPG encrypt before publishing ---------------------------------
+        # Use a temp GNUPGHOME so we don't mutate the operator's main keyring
+        # and so encryption only sees the OpsMemory backup public key.
+        Write-Host "[$(Get-Date -Format o)] gpg --encrypt (recipient $GpgRecipient)"
+        if (-not (Test-Path $GpgPublicKeyFile)) {
+            Send-FailureAlert "gpg_pubkey_missing" "expected at $GpgPublicKeyFile"
+            Write-Error "GPG public key file not found: $GpgPublicKeyFile"
+            exit 6
+        }
+        $TmpGpgHome = "/tmp/opsmemory-gpg-$(Get-Random)"
+        New-Item -ItemType Directory -Path $TmpGpgHome -Force | Out-Null
+        try {
+            $env:GNUPGHOME = $TmpGpgHome
+            & gpg --batch --quiet --import $GpgPublicKeyFile
+            if ($LASTEXITCODE -ne 0) { throw "gpg --import failed" }
+
+            & gpg --batch --yes --quiet --trust-model always `
+                  --recipient $GpgRecipient `
+                  --output $EncryptedPartial `
+                  --encrypt $PartialFile
+            if ($LASTEXITCODE -ne 0) { throw "gpg --encrypt failed" }
+        } finally {
+            Remove-Item Env:GNUPGHOME -ErrorAction SilentlyContinue
+            if (Test-Path $TmpGpgHome) { Remove-Item -Recurse -Force $TmpGpgHome }
+        }
+        Remove-Item -Path $PartialFile -Force
+        $PartialFile = $EncryptedPartial
+        $EncryptedSize = (Get-Item $PartialFile).Length
+        Write-Host "[$(Get-Date -Format o)] gpg encrypted: $([math]::Round($EncryptedSize/1MB, 2)) MB"
+    }
+
     # ---- Atomic rename: .partial → final filename ------------------------
     # Move-Item on the same filesystem is atomic on Linux (rename(2)).
-    Move-Item -Path $PartialFile -Destination $DumpFile
+    Move-Item -Path $PartialFile -Destination $FinalFile
 } finally {
-    # Clean up partial file if anything failed before the atomic rename.
-    if (Test-Path $PartialFile) {
-        Write-Host "Cleaning up incomplete partial: $PartialFile"
-        Remove-Item -Path $PartialFile -Force -ErrorAction SilentlyContinue
+    # Clean up any partial files if anything failed before the atomic rename.
+    foreach ($p in @($PartialFile, $EncryptedPartial)) {
+        if (Test-Path $p) {
+            Write-Host "Cleaning up incomplete partial: $p"
+            Remove-Item -Path $p -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
-$DumpSize = (Get-Item $DumpFile).Length
-Write-Host "[$(Get-Date -Format o)] pg_dump complete + verified: $([math]::Round($DumpSize/1MB, 2)) MB"
+$DumpSize = (Get-Item $FinalFile).Length
+$DumpFile = $FinalFile  # downstream code (rsync, status, retention) uses $DumpFile
+Write-Host "[$(Get-Date -Format o)] backup file ready: $FinalFile ($([math]::Round($DumpSize/1MB, 2)) MB)$(if ($GpgEnabled) { ' [encrypted]' })"
 
 # ---- Optional: rsync to Spark #2 ---------------------------------------
 # rsync default behavior writes to a hidden temp name and renames after
@@ -149,10 +201,15 @@ if ($Spark2Target) {
 }
 
 # ---- Retention prune (local only) --------------------------------------
+# Match both .dump (plaintext) and .dump.gpg (encrypted) so retention works
+# regardless of GPG_ENABLED toggling between runs.
 $CutoffDate = $StartedAt.AddDays(-$RetentionDays)
 $Pruned = 0
-Get-ChildItem -Path $BackupRoot -Recurse -Filter "*.dump" -ErrorAction SilentlyContinue |
-    Where-Object { $_.LastWriteTime -lt $CutoffDate } |
+Get-ChildItem -Path $BackupRoot -Recurse -ErrorAction SilentlyContinue |
+    Where-Object {
+        ($_.Name -like "*.dump" -or $_.Name -like "*.dump.gpg") -and
+        $_.LastWriteTime -lt $CutoffDate
+    } |
     ForEach-Object {
         Write-Host "Pruning $($_.FullName)"
         Remove-Item $_.FullName -Force
@@ -179,7 +236,8 @@ $Status = [ordered]@{
     spark2_synced     = $Rsynced
     retention_days    = $RetentionDays
     pruned_count      = $Pruned
-    encrypted         = $false
+    encrypted         = [bool]$GpgEnabled
+    gpg_recipient     = if ($GpgEnabled) { $GpgRecipient } else { "" }
     offsite           = $false
     schema_version    = "0001_initial"
 } | ConvertTo-Json
