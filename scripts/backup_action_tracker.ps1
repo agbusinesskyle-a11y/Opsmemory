@@ -46,11 +46,11 @@ function Send-FailureAlert($Reason, $Detail) {
 }
 
 # ---- Validate config ----------------------------------------------------
-$DatabaseUrl = $env:ACTION_TRACKER_DATABASE_URL
-if (-not $DatabaseUrl) {
-    Write-Error "ACTION_TRACKER_DATABASE_URL is required"
-    exit 1
-}
+# Container/role/db come via the docker exec block below (POSTGRES_CONTAINER,
+# ACTION_TRACKER_DB_ROLE, ACTION_TRACKER_DB_NAME). The pre-1.5 script also
+# read ACTION_TRACKER_DATABASE_URL; that variable is no longer used since
+# pg_dump now connects via Unix socket inside the container with peer auth.
+# Left intentionally absent to avoid confusion.
 
 $BackupRoot = $env:BACKUP_ROOT
 if (-not $BackupRoot) { $BackupRoot = "/var/backups/opsmemory/action_tracker" }

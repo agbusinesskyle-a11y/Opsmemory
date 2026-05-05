@@ -53,7 +53,9 @@ htmlcov/
 .pytest_cache/
 
 # Operator-only references (real tunnel UUIDs, team domains, owner emails, etc.)
-.local/
+# Use `.local/*` (not `.local/`) so the `!` negation can re-include the example.
+.local/*
+!.local/owners.example.json
 docs/secrets-references.md
 seeds.users.json
 seeds.users.local.json

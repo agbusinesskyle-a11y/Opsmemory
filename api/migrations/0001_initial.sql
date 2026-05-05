@@ -287,6 +287,18 @@ FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 -- =========================================================================
 -- Seed data (idempotent — uses ON CONFLICT)
 -- =========================================================================
+--
+-- Note (2026-05-05, Chunk 1.5 step 1): user-identifying seed data
+-- (users, user_identities, business_memberships) was extracted from this
+-- migration into scripts/seed_initial.py so committed SQL doesn't broadcast
+-- the OpsMemory Access allowlist on a public github repo.
+--
+-- Businesses (RedHot, Borderline) remain inline because they're public
+-- business identifiers, not credentials/PII. New tenants can fork this
+-- file and replace the businesses block.
+--
+-- Existing deploys: schema unchanged; this migration is still idempotent.
+-- The original users/memberships rows persist in the deployed DB.
 
 -- Businesses
 INSERT INTO businesses (id, slug, name)
@@ -298,43 +310,7 @@ SET slug = EXCLUDED.slug,
     name = EXCLUDED.name,
     updated_at = now();
 
--- Users (real Google emails — Kyle, Joanna, Caleb, Sarah)
-INSERT INTO users (id, email, display_name, role)
-VALUES
-  ('00000000-0000-0000-0000-000000000101', 'agbusiness.kyle@gmail.com', 'Kyle Conway', 'admin'),
-  ('00000000-0000-0000-0000-000000000102', 'joanna@borderlinefireworksoutlet.com', 'Joanna Noriega', 'admin'),
-  ('00000000-0000-0000-0000-000000000103', 'noriega3636@gmail.com', 'Caleb Noriega', 'owner'),
-  ('00000000-0000-0000-0000-000000000104', 'sarahjconway@gmail.com', 'Sarah Conway', 'owner')
-ON CONFLICT (id) DO UPDATE
-SET email = EXCLUDED.email,
-    display_name = EXCLUDED.display_name,
-    role = EXCLUDED.role,
-    updated_at = now();
-
--- User identities (Cloudflare Access provider, email-only — provider_subject filled at first login)
-INSERT INTO user_identities (user_id, provider, provider_subject, email)
-SELECT id, 'cloudflare_access', NULL, email
-FROM users
-ON CONFLICT (provider, email) DO UPDATE
-SET user_id = EXCLUDED.user_id,
-    updated_at = now();
-
--- Business memberships
--- Kyle: admin on both businesses
--- Joanna: admin on both businesses
--- Caleb: owner of RedHot only
--- Sarah: owner of Borderline only
-INSERT INTO business_memberships (business_id, user_id, role)
-VALUES
-  ('00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000101', 'admin'),
-  ('00000000-0000-0000-0000-000000000202', '00000000-0000-0000-0000-000000000101', 'admin'),
-  ('00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000102', 'admin'),
-  ('00000000-0000-0000-0000-000000000202', '00000000-0000-0000-0000-000000000102', 'admin'),
-  ('00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000103', 'owner'),
-  ('00000000-0000-0000-0000-000000000202', '00000000-0000-0000-0000-000000000104', 'owner')
-ON CONFLICT (business_id, user_id) DO UPDATE
-SET role = EXCLUDED.role,
-    updated_at = now();
+-- Users / user_identities / business_memberships: see scripts/seed_initial.py.
 
 -- =========================================================================
 -- Migration bookkeeping

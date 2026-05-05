@@ -278,7 +278,12 @@ async def require_principal(request: Request) -> Principal:
         return await _load_service(request, service_key)
 
     if auth_mode == "local":
-        email = os.environ.get("LOCAL_DEV_EMAIL", "agbusiness.kyle@gmail.com")
+        email = os.environ.get("LOCAL_DEV_EMAIL")
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="LOCAL_DEV_EMAIL must be set when AUTH_MODE=local",
+            )
         if os.environ.get("ALLOW_DEV_USER_SWITCH") == "true":
             email = request.headers.get("X-Dev-User-Email", email)
         return await _load_user(request, email, {"email": email}, "local_dev")

@@ -1,0 +1,33 @@
+{
+  "_comment": "Template for .local/owners.json — used by scripts/seed_initial.py to populate the users/user_identities/business_memberships tables. Copy this file to .local/owners.json (gitignored) and replace the placeholder values with real owner emails. The 'id' field is a stable UUID — generate one per owner and don't change it (it's the foreign key target across the system). Admin users can manage other users; owners can only manage their own tasks. Businesses are RedHot or Borderline (or both for shared admins).",
+  "owners": [
+    {
+      "id": "00000000-0000-0000-0000-000000000101",
+      "email": "REPLACE@example.invalid",
+      "display_name": "Owner One",
+      "role": "admin",
+      "businesses": ["redhot", "borderline"]
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000102",
+      "email": "REPLACE@example.invalid",
+      "display_name": "Owner Two",
+      "role": "admin",
+      "businesses": ["redhot", "borderline"]
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000103",
+      "email": "REPLACE@example.invalid",
+      "display_name": "Owner Three",
+      "role": "owner",
+      "businesses": ["redhot"]
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000104",
+      "email": "REPLACE@example.invalid",
+      "display_name": "Owner Four",
+      "role": "owner",
+      "businesses": ["borderline"]
+    }
+  ]
+}

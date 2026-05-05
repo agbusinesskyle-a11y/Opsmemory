@@ -85,13 +85,33 @@ docker exec <postgres-container> rm /tmp/0001_initial.sql
 
 Expected: `BEGIN ... COMMIT` and no errors. Migration is idempotent — re-running is safe.
 
-## 4. Verify seeds and enums
+## 4. Seed owners and verify enums
+
+The migration creates the schema and seeds the two businesses (RedHot,
+Borderline). Owner-identifying seed data (users, identities, memberships)
+is loaded by `scripts/seed_initial.py` from a gitignored config file so
+the public migration doesn't broadcast the Cloudflare Access allowlist.
+
+Create `.local/owners.json` from the example template, then run the
+seed script:
+
+```bash
+mkdir -p .local
+cp .local/owners.example.json .local/owners.json
+# Edit .local/owners.json — replace the four 'REPLACE@example.invalid'
+# placeholders with the real owner emails from docs/secrets-references.md
+nano .local/owners.json
+
+python3 scripts/seed_initial.py
+```
+
+Verify:
 
 ```bash
 docker exec -i <postgres-container> psql -U opsmemory_owner -d action_tracker <<'SQL'
-SELECT count(*) AS users        FROM users;        -- expect 4
-SELECT count(*) AS businesses   FROM businesses;   -- expect 2
-SELECT count(*) AS memberships  FROM business_memberships; -- expect 6
+SELECT count(*) AS users        FROM users;
+SELECT count(*) AS businesses   FROM businesses;
+SELECT count(*) AS memberships  FROM business_memberships;
 SELECT version FROM schema_migrations WHERE version='0001_initial';
 SELECT typname FROM pg_type
 WHERE typname IN (
@@ -104,7 +124,9 @@ WHERE typname IN (
 SQL
 ```
 
-All five enums should appear. Counts should be 4 / 2 / 6.
+For Kyle's deploy: 4 / 2 / 6. For new tenants: matches the count of
+owner records in `.local/owners.json`. All five lifecycle enums must
+appear.
 
 ## 5. Verify other databases are untouched
 
@@ -127,10 +149,10 @@ Edit `.env` and fill:
 - `CF_ACCESS_AUD` — *placeholder for now; filled in step 9*
 - `SERVICE_KEY_PEPPER` — generate with `python3 -c "import secrets; print(secrets.token_hex(32))"`
 - `DATABASE_URL` — `postgresql://opsmemory_app:<app-password>@postgres:5432/action_tracker`
-- `ACTION_TRACKER_DATABASE_URL` — `postgresql://opsmemory_owner:<owner-password>@postgres:5432/action_tracker`
-- `RESTORE_TEST_ADMIN_URL` — `postgresql://postgres:<superuser-password>@postgres:5432/postgres`
 - `BACKUP_SPARK2_TARGET` — your Spark #2 rsync target (e.g. `opsbackup@spark2:/srv/backups/opsmemory/action_tracker/`)
 - `SPARK_NETWORK_NAME` — confirm matches your existing Docker network (`docker network ls`)
+- `POSTGRES_CONTAINER` — confirm matches your existing pg container (`docker ps | grep postgres`)
+- `ACTION_TRACKER_DB_ROLE`, `ACTION_TRACKER_DB_NAME`, `RESTORE_TEST_ADMIN_USER`, `RESTORE_TEST_ADMIN_DB` — defaults match the chunk1 deploy; override only if you customized role/db names
 
 While the Cloudflare Access app does not exist yet, leave `AUTH_MODE=cloudflare`. The API will still start (auth dependency only fires on `/whoami`); only `/whoami` will return 401 until you finish step 9.
 

@@ -135,25 +135,10 @@ function Run-Sql($Sql) {
 
 $smokeChecks = @{}
 try {
+    # Schema invariants (don't change as the system grows).
     $migrationOk = (Run-Sql "SELECT count(*) FROM schema_migrations WHERE version='0001_initial'") -as [int]
     if ($migrationOk -ne 1) { throw "schema_migrations missing 0001_initial" }
     $smokeChecks["schema_migrations_0001_initial"] = "ok"
-
-    $userCount = [int](Run-Sql "SELECT count(*) FROM users")
-    if ($userCount -ne 4) { throw "users count expected 4, got $userCount" }
-    $smokeChecks["users_count"] = $userCount
-
-    $businessCount = [int](Run-Sql "SELECT count(*) FROM businesses")
-    if ($businessCount -ne 2) { throw "businesses count expected 2, got $businessCount" }
-    $smokeChecks["businesses_count"] = $businessCount
-
-    $joannaRole = (Run-Sql "SELECT role::text FROM users WHERE email='joanna@borderlinefireworksoutlet.com'") -as [string]
-    if ($joannaRole -ne "admin") { throw "Joanna role expected admin, got '$joannaRole'" }
-    $smokeChecks["joanna_role"] = $joannaRole
-
-    $kyleRole = (Run-Sql "SELECT role::text FROM users WHERE email='agbusiness.kyle@gmail.com'") -as [string]
-    if ($kyleRole -ne "admin") { throw "Kyle role expected admin, got '$kyleRole'" }
-    $smokeChecks["kyle_role"] = $kyleRole
 
     $enumCount = [int](Run-Sql "SELECT count(*) FROM pg_type WHERE typname IN ('task_lifecycle_state','review_lifecycle_state','ingest_lifecycle_state','notification_lifecycle_state','deletion_lifecycle_state')")
     if ($enumCount -ne 5) { throw "expected 5 lifecycle enums, got $enumCount" }
@@ -163,9 +148,26 @@ try {
     if (-not $transitionsTable) { throw "task_state_transitions table missing" }
     $smokeChecks["task_state_transitions_table"] = $transitionsTable
 
-    $membershipCount = [int](Run-Sql "SELECT count(*) FROM business_memberships")
-    if ($membershipCount -ne 6) { throw "business_memberships count expected 6, got $membershipCount" }
-    $smokeChecks["business_memberships_count"] = $membershipCount
+    # Seed shape (loose — businesses always seeded by 0001_initial.sql; users
+    # seeded by scripts/seed_initial.py and grow over time, so use lower bounds).
+    $businessCount = [int](Run-Sql "SELECT count(*) FROM businesses WHERE deletion_state = 'active'")
+    if ($businessCount -lt 1) { throw "businesses count expected >=1, got $businessCount" }
+    $smokeChecks["businesses_active_count"] = $businessCount
+
+    $userCount = [int](Run-Sql "SELECT count(*) FROM users WHERE status = 'active'")
+    if ($userCount -lt 1) { throw "active users expected >=1, got $userCount" }
+    $smokeChecks["users_active_count"] = $userCount
+
+    $adminCount = [int](Run-Sql "SELECT count(*) FROM users WHERE status = 'active' AND role = 'admin'")
+    if ($adminCount -lt 1) { throw "active admin users expected >=1, got $adminCount" }
+    $smokeChecks["admin_count"] = $adminCount
+
+    $identityCount = [int](Run-Sql "SELECT count(*) FROM user_identities WHERE provider = 'cloudflare_access'")
+    if ($identityCount -lt $userCount) { throw "cloudflare_access identities ($identityCount) < users ($userCount)" }
+    $smokeChecks["cloudflare_identities_count"] = $identityCount
+
+    $membershipCount = [int](Run-Sql "SELECT count(*) FROM business_memberships WHERE status = 'active'")
+    $smokeChecks["business_memberships_active_count"] = $membershipCount
 
     Write-Host "[$(Get-Date -Format o)] all smoke checks passed"
 } catch {
