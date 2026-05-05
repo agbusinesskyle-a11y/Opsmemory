@@ -119,7 +119,12 @@ Schema rooted in identity + provenance + lifecycle.
 ### Postgres role separation
 
 - `opsmemory_owner` — owns schema, runs migrations. Used only at deploy time.
-- `opsmemory_app` — runtime API role. Has SELECT/INSERT/UPDATE/DELETE on tables but cannot DROP.
+- `opsmemory_app` — runtime API role. Per-table grants only:
+  - `schema_migrations` — SELECT only
+  - `users`, `user_identities`, `businesses`, `business_memberships`, `service_accounts` — SELECT + UPDATE only
+  - `task_state_transitions` — SELECT + INSERT only
+  - Future tables get a default of SELECT/INSERT/UPDATE; DELETE on any new table must be granted explicitly per-table.
+  Cannot DROP, never DELETEs from any current Chunk 1 table — soft-delete is via `deleted_at` UPDATE.
 
 ### Database isolation
 

@@ -174,11 +174,7 @@ In the Cloudflare dashboard:
 6. Add policy:
    - Name: `OpsMemory Humans`
    - Action: `Allow`
-   - Include: `Emails` →
-     - `agbusiness.kyle@gmail.com`
-     - `joanna@borderlinefireworksoutlet.com`
-     - `noriega3636@gmail.com`
-     - `sarahjconway@gmail.com`
+   - Include: `Emails` → the four owner emails listed in operator-only `docs/secrets-references.md` (Kyle admin, Joanna admin, Caleb owner, Sarah owner)
 7. Save.
 
 After saving, open the application's **Overview** tab and copy:
@@ -210,9 +206,12 @@ Add a DNS record in the Cloudflare dashboard:
 ```
 Type: CNAME
 Name: tracker
-Target: b510e94c-8eab-40dd-ae8d-5c933a3896da.cfargotunnel.com
+Target: <TUNNEL_UUID>.cfargotunnel.com  (real UUID in docs/secrets-references.md)
 Proxy status: Proxied (orange cloud)
 ```
+
+Or use Cloudflare's **Tunnel** record type (the existing Spark #1 tunnel is
+already routing other hostnames; add `tracker` to it the same way).
 
 Restart cloudflared:
 

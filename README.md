@@ -46,7 +46,7 @@ opsmemory/
 Deploys to existing Spark infrastructure:
 
 - Postgres (existing instance, new dedicated `action_tracker` database)
-- Cloudflared tunnel (existing tunnel `b510e94c-8eab-40dd-ae8d-5c933a3896da`, new `tracker.kyleconway.ai` ingress)
+- Cloudflared tunnel (existing Spark #1 tunnel; UUID lives in operator-only `docs/secrets-references.md`), new `tracker.kyleconway.ai` ingress
 - Cloudflare Access (Google SSO IdP, 24h session)
 - litellm (existing proxy, new model routing rules)
 - mcp-server (existing — read integration in Chunk 13)

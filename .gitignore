@@ -51,3 +51,9 @@ out/
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Operator-only references (real tunnel UUIDs, team domains, owner emails, etc.)
+.local/
+docs/secrets-references.md
+seeds.users.json
+seeds.users.local.json

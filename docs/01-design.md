@@ -151,11 +151,18 @@ Each step independently testable. LLM calls logged with prompt, model, version.
 
 ---
 
-## Owners (final, for users seed)
+## Owners (roster shape)
 
-- `agbusiness.kyle@gmail.com` — Kyle Conway — admin — RedHot + Borderline
-- `joanna@borderlinefireworksoutlet.com` — Joanna Noriega — admin — RedHot + Borderline
-- `Noriega3636@gmail.com` — Caleb Noriega — owner — RedHot
-- `sarahjconway@gmail.com` — Sarah Conway — owner — Borderline
+Four owners total, two roles:
 
-All four use Google SSO via Cloudflare Access.
+| Display name | Role | Businesses |
+|---|---|---|
+| Kyle Conway | admin | RedHot + Borderline |
+| Joanna Noriega | admin | RedHot + Borderline |
+| Caleb Noriega | owner | RedHot |
+| Sarah Conway | owner | Borderline |
+
+All four use Google SSO via Cloudflare Access (with Cloudflare One-Time PIN
+as a fallback for any non-Google email). Real email addresses live in
+operator-only `docs/secrets-references.md` and the Cloudflare Access
+policy + Postgres `users` table — not in committed repo files.
