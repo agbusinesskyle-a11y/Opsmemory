@@ -3,15 +3,19 @@
 -- Idempotent. Safe to run repeatedly.
 -- Run as `opsmemory_owner` (creates schema). Runtime app uses `opsmemory_app` (limited privileges).
 --
+-- IMPORTANT: this file has NO top-level BEGIN/COMMIT — scripts/migrate.py
+-- owns the transaction. Migration files run inside the runner's wrapping
+-- transaction so checksum recording, dirty-flag flip, and the migration
+-- itself either all-succeed or all-roll-back together.
+--
 -- Acceptance:
 --   - 7 ENUMs: app_role, user_status, task_lifecycle_state, review_lifecycle_state,
 --     ingest_lifecycle_state, notification_lifecycle_state, deletion_lifecycle_state
 --   - Tables: schema_migrations, businesses, users, user_identities, business_memberships,
 --     service_accounts, task_state_transitions
---   - Seed: 4 users, 2 businesses, 6 business_memberships, 4 user_identities (Cloudflare Access)
+--   - Seed: businesses (RedHot/Borderline) inline; users/identities/memberships
+--     loaded by scripts/seed_initial.py from a runtime config (gitignored)
 --   - Triggers: updated_at on all mutable tables
-
-BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE EXTENSION IF NOT EXISTS citext;
@@ -316,12 +320,10 @@ SET slug = EXCLUDED.slug,
 -- Migration bookkeeping
 -- =========================================================================
 
-INSERT INTO schema_migrations (version, description)
-VALUES ('0001_initial', 'Chunk 1 substrate: identity, businesses, lifecycle enums, audit log, seed data')
-ON CONFLICT (version) DO UPDATE
-SET description = EXCLUDED.description,
-    applied_at = now(),
-    dirty = false;
+-- The schema_migrations row used to be inserted here. scripts/migrate.py
+-- now owns that bookkeeping (records version + checksum + dirty flag +
+-- execution_ms inside its outer transaction). Existing deploys still have
+-- their original row; the runner backfills checksum on first run.
 
 -- =========================================================================
 -- Grant narrow runtime privileges to opsmemory_app (if role exists).
@@ -362,5 +364,3 @@ DO $$ BEGIN
       GRANT USAGE ON SEQUENCES TO opsmemory_app;
   END IF;
 END $$;
-
-COMMIT;
