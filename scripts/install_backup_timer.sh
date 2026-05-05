@@ -19,12 +19,15 @@ if [[ -z "$PWSH" ]]; then
 fi
 
 REPO_DIR=${REPO_DIR:-/opt/opsmemory}
-SCRIPT="${REPO_DIR}/scripts/backup_action_tracker.ps1"
+WRAPPER="${REPO_DIR}/scripts/run_backup.sh"
 ENV_FILE="${REPO_DIR}/.env"
 
-if [[ ! -f "$SCRIPT" ]]; then
-  echo "ERROR: backup script not found at $SCRIPT" >&2
+if [[ ! -f "$WRAPPER" ]]; then
+  echo "ERROR: backup wrapper not found at $WRAPPER" >&2
   exit 1
+fi
+if [[ ! -x "$WRAPPER" ]]; then
+  chmod +x "$WRAPPER"
 fi
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "ERROR: env file not found at $ENV_FILE" >&2
@@ -49,7 +52,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=$ENV_FILE
-ExecStart=$PWSH $SCRIPT
+# run_backup.sh acquires flock on /var/lib/opsmemory/backup/.lock before
+# invoking pwsh, preventing concurrent backups or backup/restore-check
+# overlap (which could otherwise grab a half-written dump).
+ExecStart=$WRAPPER
 User=opsmemory
 Group=opsmemory
 StandardOutput=journal

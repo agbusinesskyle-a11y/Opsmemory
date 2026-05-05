@@ -88,27 +88,47 @@ if (-not $DbRole) { $DbRole = "opsmemory_owner" }
 $DbName = $env:ACTION_TRACKER_DB_NAME
 if (-not $DbName) { $DbName = "action_tracker" }
 
-Write-Host "[$(Get-Date -Format o)] pg_dump (docker exec $ContainerName) -> $DumpFile"
-& bash -c "docker exec -i $ContainerName pg_dump -U $DbRole -d $DbName --format custom --compress 9 --no-owner --no-acl > '$DumpFile'"
+# Atomic publish pattern: write to <name>.partial first, verify with
+# pg_restore --list, then rename to the final filename. Means restore-check
+# never picks up a half-written dump, and crash recovery is `rm *.partial`.
+$PartialFile = "$DumpFile.partial"
+Write-Host "[$(Get-Date -Format o)] pg_dump (docker exec $ContainerName) -> $PartialFile"
 
-if ($LASTEXITCODE -ne 0) {
-    Send-FailureAlert "pg_dump_failed" "exit=$LASTEXITCODE file=$DumpFile"
-    Write-Error "pg_dump failed (exit $LASTEXITCODE)"
-    exit 2
+try {
+    & bash -c "docker exec -i $ContainerName pg_dump -U $DbRole -d $DbName --format custom --compress 9 --no-owner --no-acl > '$PartialFile'"
+
+    if ($LASTEXITCODE -ne 0) {
+        Send-FailureAlert "pg_dump_failed" "exit=$LASTEXITCODE file=$PartialFile"
+        Write-Error "pg_dump failed (exit $LASTEXITCODE)"
+        exit 2
+    }
+
+    $PartialSize = (Get-Item $PartialFile).Length
+    Write-Host "[$(Get-Date -Format o)] pg_dump produced $([math]::Round($PartialSize/1MB, 2)) MB; verifying"
+
+    # ---- Verify dump is parseable -----------------------------------------
+    # pg_restore reads stdin when no filename is given; '-' is NOT a valid
+    # placeholder (postgres rejects it as "No such file").
+    & bash -c "docker exec -i $ContainerName pg_restore --list < '$PartialFile' > /dev/null"
+    if ($LASTEXITCODE -ne 0) {
+        Send-FailureAlert "pg_restore_list_failed" "partial dump corrupt: $PartialFile"
+        Write-Error "pg_restore --list failed — dump may be corrupt"
+        exit 3
+    }
+
+    # ---- Atomic rename: .partial → final filename ------------------------
+    # Move-Item on the same filesystem is atomic on Linux (rename(2)).
+    Move-Item -Path $PartialFile -Destination $DumpFile
+} finally {
+    # Clean up partial file if anything failed before the atomic rename.
+    if (Test-Path $PartialFile) {
+        Write-Host "Cleaning up incomplete partial: $PartialFile"
+        Remove-Item -Path $PartialFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $DumpSize = (Get-Item $DumpFile).Length
-Write-Host "[$(Get-Date -Format o)] pg_dump complete: $([math]::Round($DumpSize/1MB, 2)) MB"
-
-# ---- Verify dump is parseable (via docker exec, stream stdin) ----------
-# pg_restore reads stdin when no filename is given; '-' is NOT a valid
-# placeholder (postgres rejects it as "No such file").
-& bash -c "docker exec -i $ContainerName pg_restore --list < '$DumpFile' > /dev/null"
-if ($LASTEXITCODE -ne 0) {
-    Send-FailureAlert "pg_restore_list_failed" "dump may be corrupt: $DumpFile"
-    Write-Error "pg_restore --list failed — dump may be corrupt"
-    exit 3
-}
+Write-Host "[$(Get-Date -Format o)] pg_dump complete + verified: $([math]::Round($DumpSize/1MB, 2)) MB"
 
 # ---- Optional: rsync to Spark #2 ---------------------------------------
 # rsync default behavior writes to a hidden temp name and renames after

@@ -302,23 +302,28 @@ sudo -u opsmemory ssh spark2 'echo ok'
 
 ## 13. Run the first backup manually
 
+Use the wrapper script — it acquires `flock` on `/var/lib/opsmemory/backup/.lock`
+so it cannot collide with the systemd timer or a concurrent restore-check.
+
 ```bash
 # Source .env so the script picks up envs.
 set -a && source /opt/opsmemory/.env && set +a
 
 # Run as opsmemory user so file ownership matches the systemd timer.
-sudo -u opsmemory --preserve-env=ACTION_TRACKER_DATABASE_URL,BACKUP_ROOT,BACKUP_SPARK2_TARGET,BACKUP_RETENTION_DAYS,BACKUP_STATUS_FILE \
-     pwsh /opt/opsmemory/scripts/backup_action_tracker.ps1
+sudo -u opsmemory --preserve-env=POSTGRES_CONTAINER,ACTION_TRACKER_DB_ROLE,ACTION_TRACKER_DB_NAME,BACKUP_ROOT,BACKUP_SPARK2_TARGET,BACKUP_RETENTION_DAYS,BACKUP_STATUS_FILE \
+     bash /opt/opsmemory/scripts/run_backup.sh
 ```
 
 Expected output: `pg_dump complete`, `rsync -> opsbackup@spark2:...`, `backup complete`. Check `/var/lib/opsmemory/backup/status.json` for the result row.
 
 ## 14. Run the restore check manually
 
+Same wrapper pattern — `flock` waits up to 60s if a backup is in flight.
+
 ```bash
 set -a && source /opt/opsmemory/.env && set +a
-sudo -u opsmemory --preserve-env=BACKUP_ROOT,RESTORE_TEST_ADMIN_URL,RESTORE_TEST_DB,KEEP_RESTORE_DB,RESTORE_STATUS_FILE \
-     pwsh /opt/opsmemory/scripts/restore_check.ps1
+sudo -u opsmemory --preserve-env=POSTGRES_CONTAINER,ACTION_TRACKER_DB_ROLE,ACTION_TRACKER_DB_NAME,RESTORE_TEST_ADMIN_USER,RESTORE_TEST_ADMIN_DB,BACKUP_ROOT,RESTORE_TEST_DB,KEEP_RESTORE_DB,RESTORE_STATUS_FILE \
+     bash /opt/opsmemory/scripts/run_restore_check.sh
 ```
 
 Expected output: `using dump ...`, `pg_restore -> action_tracker_restore_test`, `all smoke checks passed`, `restore-check complete`. Check `/var/lib/opsmemory/backup/restore_status.json`.
