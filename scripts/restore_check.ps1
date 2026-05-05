@@ -125,14 +125,29 @@ if ($IsEncrypted) {
     } else {
         $VerificationMode = "encrypted-structure-only"
         Write-Host "[$(Get-Date -Format o)] gpg private key NOT on this machine; running structure-only verification"
-        # gpg --list-packets fails on truncated / non-GPG files even without
-        # the private key. It DOES need to read the packet headers (which
-        # requires the public key — already imported when we encrypted).
-        & gpg --list-packets --batch --quiet $LatestDump.FullName *> $null
-        if ($LASTEXITCODE -ne 0) {
-            Send-FailureAlert "gpg_list_packets_failed" "dump=$($LatestDump.FullName)"
-            Write-Error "gpg --list-packets failed — encrypted dump may be corrupt"
-            exit 7
+        # IMPORTANT: gpg --list-packets exits non-zero when the secret key
+        # isn't available (it tries to decrypt and fails) BUT still emits
+        # the parsed packet structure on stdout. We can't rely on the exit
+        # code; instead capture combined stdout+stderr and look for the
+        # expected envelope packet markers. Truncated/non-GPG files won't
+        # have these markers.
+        # Use a temp GNUPGHOME so we don't need ~/.gnupg under /var/lib/opsmemory.
+        $TmpGpgHome = "/tmp/opsmemory-gpg-rcheck-$(Get-Random)"
+        New-Item -ItemType Directory -Path $TmpGpgHome -Force | Out-Null
+        try {
+            $env:GNUPGHOME = $TmpGpgHome
+            $listOutput = & gpg --list-packets $LatestDump.FullName 2>&1
+            $listText = ($listOutput | Out-String)
+            $hasPubkeyEnc = $listText -match ':pubkey enc packet:'
+            $hasEncrypted = $listText -match ':aead encrypted packet:|:encrypted packet:|:encrypted data packet:'
+            if (-not ($hasPubkeyEnc -and $hasEncrypted)) {
+                Send-FailureAlert "gpg_list_packets_invalid" "dump=$($LatestDump.FullName); output=$($listText -replace "`n", ' | ' | ForEach-Object {$_.Substring(0, [Math]::Min(500, $_.Length))})"
+                Write-Error "gpg --list-packets did not find PKESK + encrypted-data packets — file may not be a valid GPG envelope"
+                exit 7
+            }
+        } finally {
+            Remove-Item Env:GNUPGHOME -ErrorAction SilentlyContinue
+            if (Test-Path $TmpGpgHome) { Remove-Item -Recurse -Force $TmpGpgHome }
         }
         Write-Host "[$(Get-Date -Format o)] structure-only check passed; full restore must be verified from a machine with the private key"
     }
