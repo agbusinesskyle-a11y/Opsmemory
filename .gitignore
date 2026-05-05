@@ -1,0 +1,53 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.gpg
+*.asc
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Node / web
+node_modules/
+*.log
+.npm/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Backups / dumps (local-only artifacts)
+*.dump
+*.dump.gpg
+*.sql.gz
+backups/
+restore-tmp/
+
+# Build outputs
+dist/
+out/
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/

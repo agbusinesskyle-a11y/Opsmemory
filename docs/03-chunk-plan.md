@@ -1,0 +1,167 @@
+# OpsMemory — 14-Chunk Implementation Plan
+
+Cadence: same as Conway_Motherduckdb. After each chunk, Codex senior-engineer review of completed work AND next-chunk plan, before Kyle approves the next chunk.
+
+## Chunk 1 — Substrate
+
+**Scope**: DB + identity + backups + healthchecks + PWA shell deployed.
+
+**Files**:
+```
+README.md
+.env.example
+docker-compose.yml
+api/Dockerfile
+api/requirements.txt
+api/app/__init__.py
+api/app/main.py
+api/app/db.py
+api/app/auth.py
+api/app/health.py
+api/migrations/0001_initial.sql
+web/index.html
+web/app.js
+web/manifest.json
+web/sw.js
+web/icons/icon-192.png
+web/icons/icon-512.png
+scripts/backup_action_tracker.ps1
+scripts/restore_check.ps1
+docs/05-chunk1-runbook.md
+```
+
+**Acceptance criteria**:
+- `action_tracker` database exists, migrations repeatable.
+- 4 users + 2 businesses + 6 business_memberships seeded.
+- 7 lifecycle ENUMs created (`app_role`, `user_status`, `task_lifecycle_state`, `review_lifecycle_state`, `ingest_lifecycle_state`, `notification_lifecycle_state`, `deletion_lifecycle_state`).
+- API binds `127.0.0.1:8010` only. No public port.
+- `/healthz` (liveness, no DB), `/readyz` (DB ping + migration check + optional backup-status check), `/whoami` (full principal record) all working.
+- Backend validates Cloudflare Access JWT in production mode; supports `AUTH_MODE=local` for dev.
+- PWA shell loads at `tracker.kyleconway.ai`. Joanna can open on phone, Add to Home Screen, launch standalone.
+- Daily backup runs (`pg_dump -Fc -Z 9` + rsync to Spark #2). One manual restore test passing.
+- Existing `n8n`, `openbrain`, `family_docs`, `family_health` databases untouched (verified before/after).
+
+**Explicitly NOT in Chunk 1**: LLM, Slack, SOPs, offline outbox, encryption, B2 offsite.
+
+**Deferred to Chunk 1.5**:
+- Backblaze B2 offsite leg (3rd backup copy)
+- GPG encryption of dumps before they leave home network
+- Weekly automated restore-check timer (Chunk 1 ships manual restore test only)
+
+---
+
+## Chunk 2 — API + read-only dashboard
+
+**Scope**: FastAPI skeleton with authz middleware on every mutation route. Read-only endpoints powering a real dashboard. Audit and event model in place.
+
+**Tables added**: `tasks`, `task_history`, `task_field_versions`, `task_assignees`, `task_businesses`, `task_embeddings` (pgvector extension), `client_mutations`.
+
+**Endpoints**: `GET /v1/tasks`, `GET /v1/tasks/:id`, `GET /v1/businesses`, `GET /v1/users` (admin only).
+
+**Acceptance**: PWA shows real task list (manually inserted via SQL for now). Filters by owner, business, status. Field-level version vectors visible in API responses.
+
+---
+
+## Chunk 3 — First ingest path: meeting recap
+
+**Scope**: 7-step reconciliation pipeline end-to-end on the meeting-recap source. LLM auto-merge OFF (Day 1-30 phase). Everything lands in `review_items`.
+
+**Files**: migrate Co-Work parser from `C:\Meeting Recap\meeting-recap\` → `C:\opsmemory\ingest\meeting_recap\`. Add `reconciliation/` modules.
+
+**Tables added**: `ingest_events` (full schema with status lifecycle), `review_items`, `auto_merge_policy` (seeded OFF for all sources).
+
+**Acceptance**: paste a meeting recap, hit `/v1/ingest/meeting_recap`, see candidate `review_items` populated, verify each step's logged output.
+
+---
+
+## Chunk 4 — Review UI + approve/reject mutation flow
+
+**Scope**: PWA shows pending review queue. Approve / reject / edit-then-approve flow. Approval applies the proposed mutation through validate + apply steps.
+
+**Acceptance**: Kyle clicks approve on a pending item, task is created, audit log shows the approval mutation, `task_state_transitions` records the create.
+
+---
+
+## Chunk 5 — PWA write paths
+
+**Scope**: toggle done, edit task, owner add/remove, completion notes, due date editing, dependency text.
+
+**Acceptance**: 4-tab dashboard (per owner). Click done → task moves to done view. 3-layer concurrency working — `409` returns merge UI.
+
+---
+
+## Chunk 6 — Offline + outbox
+
+**Scope**: Service worker caches app shell + last `/v1/state`. Outbox queue for writes. Sync indicator.
+
+**Acceptance**: airplane mode, toggle a task, see "1 pending"; reconnect, see "synced". Auth refresh on 401 from outbox replay.
+
+---
+
+## Chunk 7 — Slack ingest
+
+**Scope**: Slack bot listens to designated channel. `/task <text>` slash command. ✅ reaction = completion signal.
+
+**Acceptance**: post in channel → ingest_event created → review item appears.
+
+---
+
+## Chunk 8 — Slack query bot
+
+**Scope**: read-only `/tasks <owner>`, `/tasks stale`, `/tasks rh-opening`.
+
+**Acceptance**: Slack returns formatted task list within 2 seconds.
+
+---
+
+## Chunk 9 — SOPs + anchor events
+
+**Scope**: SOP templates, anchor events, materialization, date-shift propagation, per-field human-override flag.
+
+**Tables added**: `sops`, `sop_versions`, `sop_template_tasks`, `anchor_events`, `sop_instances`, `sop_generated_tasks`.
+
+**Acceptance**: drop a SOP file, set anchor date, see materialized tasks. Move anchor date — unedited tasks shift, edited tasks stay.
+
+---
+
+## Chunk 10 — Excel/file drop ingest
+
+**Scope**: Drive folder watch via existing n8n integration. Excel/CSV parser, free-form file parser.
+
+---
+
+## Chunk 11 — Push notifications + settings
+
+**Scope**: per-user notification prefs UI. Daily 7am Phoenix digest as default. Push delivery via Web Push API (PWA) and Slack DM as fallback.
+
+**Tables added**: `notification_prefs`, `notification_deliveries`.
+
+---
+
+## Chunk 12 — Weekly Gmail digest drafts
+
+**Scope**: existing `Tool: Gmail Send Borderline` n8n workflow generates a weekly draft summarizing open + completed + stale items. Recipient allowlist. Drafts only — never auto-sends.
+
+---
+
+## Chunk 13 — mcp-server read-only
+
+**Scope**: MCP integration for Kyle AI Assistant queries. Tenant-scoped reads only. Prompt-injection defenses applied to all task text exposed via MCP.
+
+---
+
+## Chunk 14 — SOP suggestion engine
+
+**Scope**: year-over-year pattern detection on completed tasks. "You and Joanna both completed 'order containers' in May 2025 and May 2026 — promote to RedHot Opening Prep SOP?" One-click promote.
+
+---
+
+## Chunk gates
+
+Before each chunk closes:
+
+1. All chunk acceptance criteria pass.
+2. Codex senior-advisor review of the completed work AND the proposed next-chunk plan.
+3. Kyle approves both review and next-chunk plan.
+
+If any gate fails, the chunk does not close.
