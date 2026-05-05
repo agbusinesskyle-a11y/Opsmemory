@@ -101,7 +101,9 @@ $DumpSize = (Get-Item $DumpFile).Length
 Write-Host "[$(Get-Date -Format o)] pg_dump complete: $([math]::Round($DumpSize/1MB, 2)) MB"
 
 # ---- Verify dump is parseable (via docker exec, stream stdin) ----------
-& bash -c "docker exec -i $ContainerName pg_restore --list - < '$DumpFile' > /dev/null"
+# pg_restore reads stdin when no filename is given; '-' is NOT a valid
+# placeholder (postgres rejects it as "No such file").
+& bash -c "docker exec -i $ContainerName pg_restore --list < '$DumpFile' > /dev/null"
 if ($LASTEXITCODE -ne 0) {
     Send-FailureAlert "pg_restore_list_failed" "dump may be corrupt: $DumpFile"
     Write-Error "pg_restore --list failed — dump may be corrupt"
