@@ -70,7 +70,12 @@ StandardError=journal
 PrivateTmp=true
 ProtectSystem=full
 ReadWritePaths=/var/backups/opsmemory /var/lib/opsmemory
-NoNewPrivileges=true
+# Note: NoNewPrivileges=true is intentionally OFF because snap-confine
+# (used by snap-installed pwsh) requires cap_dac_override at exec time.
+# Setting it makes snap pwsh exit immediately with "snap-confine is
+# packaged without necessary permissions". When pwsh is installed
+# from the Microsoft apt repo instead of snap, NoNewPrivileges=true
+# can be re-enabled.
 UNIT
 
 echo "Writing $TIMER_FILE"
