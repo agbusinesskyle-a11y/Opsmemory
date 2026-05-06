@@ -222,3 +222,47 @@ def idempotency_key(pref_id: str, scheduled_for: datetime) -> str:
         raise ValueError("scheduled_for must be tz-aware")
     iso = scheduled_for.astimezone(timezone.utc).isoformat()
     return f"{pref_id}:{iso}"
+
+
+async def claim_delivery(
+    conn,
+    *,
+    due: DuePref,
+    payload: dict,
+) -> str | None:
+    """Atomically claim a notification_deliveries row for this
+    (pref_id, scheduled_for) tuple. Returns the new row's id when
+    this caller won the race, or None when another worker already
+    inserted one.
+
+    Per Codex chunk-10-step3c-close STEP 4 PLAN (5):
+        INSERT ... ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING id
+
+    The caller (run_notification_scheduler.py + step 5 sender) is
+    responsible for updating the row's status to 'sent' / 'failed'
+    after the dispatch.
+
+    Migration 0015 grants opsmemory_app INSERT + UPDATE on this
+    table; SELECT was already in 0013.
+    """
+    key = idempotency_key(due.pref_id, due.scheduled_for)
+    row = await conn.fetchrow(
+        """
+        INSERT INTO notification_deliveries
+          (idempotency_key, user_id, pref_id, channel,
+           status, scheduled_for, payload)
+        VALUES
+          ($1::text, $2::uuid, $3::uuid, $4::text,
+           'scheduled', $5::timestamptz, $6::jsonb)
+        ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING id::text AS id
+        """,
+        key,
+        due.user_id,
+        due.pref_id,
+        due.channel,
+        due.scheduled_for,
+        payload,
+    )
+    return row["id"] if row else None

@@ -46,6 +46,7 @@ from api.app.db import register_jsonb_codec  # noqa: E402
 from api.app.notifications.digest import build_digest_payload  # noqa: E402
 from api.app.notifications.scheduler import (  # noqa: E402
     DEFAULT_LOOKBACK_MINUTES,
+    claim_delivery,
     collect_due_prefs,
     collect_tasks_for_user,
     idempotency_key,
@@ -61,20 +62,12 @@ async def main_async(args: argparse.Namespace) -> int:
         print("ERROR: DATABASE_URL must be set", file=sys.stderr)
         return 1
 
-    # Honor env override even when the operator forgot the flag.
-    dry_run = args.dry_run or os.environ.get("NOTIFICATIONS_DRY_RUN", "").strip() == "1"
-    if not dry_run:
-        # Step 4 commit 2 only ships dry-run; row-acquisition is
-        # commit 3. Refuse to proceed in non-dry-run mode rather
-        # than silently no-op.
-        print(
-            "ERROR: non-dry-run scheduler is not yet implemented "
-            "(step 4 commit 3 adds notification_deliveries grants and "
-            "row acquisition). Re-run with --dry-run or "
-            "NOTIFICATIONS_DRY_RUN=1.",
-            file=sys.stderr,
-        )
-        return 1
+    # Default to dry-run for safety. NOTIFICATIONS_DRY_RUN=1 forces
+    # dry-run regardless of --claim. Claim mode requires explicit
+    # --claim AND no env override.
+    env_dry = os.environ.get("NOTIFICATIONS_DRY_RUN", "").strip() == "1"
+    claim_mode = args.claim and not env_dry
+    dry_run = not claim_mode
 
     lookback = int(
         os.environ.get("NOTIFICATIONS_LOOKBACK_MINUTES", str(DEFAULT_LOOKBACK_MINUTES))
@@ -123,19 +116,38 @@ async def main_async(args: argparse.Namespace) -> int:
                     scheduled_for=due.scheduled_for,
                 )
                 key = idempotency_key(due.pref_id, due.scheduled_for)
+                tag = "[DRY-RUN]" if not claim_mode else "[CLAIM]"
+                delivery_id = None
+                if claim_mode:
+                    delivery_id = await claim_delivery(
+                        conn, due=due, payload=payload,
+                    )
+                    if delivery_id is None:
+                        # Lost the race or already-claimed; skip
+                        # without counting as an emission.
+                        print(
+                            f"[CLAIM-SKIP] {due.scheduled_for.isoformat()} "
+                            f"channel={due.channel} "
+                            f"user={due.user_display_name or due.user_email or due.user_id} "
+                            f"key={key} "
+                            f"reason=already_claimed"
+                        )
+                        continue
                 # Single-line summary so each emit is greppable in
                 # journalctl.
                 print(
-                    f"[DRY-RUN] {due.scheduled_for.isoformat()} "
+                    f"{tag} {due.scheduled_for.isoformat()} "
                     f"channel={due.channel} "
                     f"user={due.user_display_name or due.user_email or due.user_id} "
                     f"tasks={len(tasks)} "
                     f"key={key} "
+                    f"delivery_id={delivery_id or '-'} "
                     f"title={payload['title']!r}"
                 )
                 emitted += 1
+        tag = "[DRY-RUN]" if not claim_mode else "[CLAIM]"
         print(
-            f"[DRY-RUN] considered={considered} emitted={emitted} "
+            f"{tag} considered={considered} emitted={emitted} "
             f"skipped_channel={skipped_channel}"
         )
         return 0
@@ -159,8 +171,11 @@ def main() -> int:
         help="restrict to one channel",
     )
     parser.add_argument(
-        "--dry-run", action="store_true", default=True,
-        help="(default) compute payloads, log them, no DB writes",
+        "--claim", action="store_true", default=False,
+        help="claim a notification_deliveries row per due pref. "
+             "Without this flag the runner stays in dry-run "
+             "(payloads logged, no DB writes). NOTIFICATIONS_DRY_RUN=1 "
+             "forces dry-run even when --claim is set.",
     )
     args = parser.parse_args()
     return asyncio.run(main_async(args))
