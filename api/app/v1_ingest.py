@@ -128,11 +128,13 @@ async def ingest_meeting_recap(
 
     pool = request.app.state.db
     async with pool.acquire() as conn:
-        # First check: dedup by content hash. If we've seen this exact
-        # canonical content before, return the existing row.
+        # First check: dedup by (source, content_hash). Migration 0005
+        # made the unique index source-scoped per Codex chunk-4-close
+        # review (Slack messages can legitimately repeat across
+        # channels, so a global hash UNIQUE was wrong).
         existing = await conn.fetchrow(
             "SELECT id::text AS id, status::text AS status FROM ingest_events "
-            "WHERE normalized_hash = $1",
+            "WHERE source = 'meeting_recap' AND normalized_hash = $1",
             hash_hex,
         )
         if existing:
@@ -190,9 +192,10 @@ async def ingest_meeting_recap(
                 "SELECT id::text AS id, status::text AS status, "
                 "       (normalized_hash = $1) AS by_hash "
                 "FROM ingest_events "
-                "WHERE normalized_hash = $1 "
-                "   OR (source = 'meeting_recap' AND source_external_id IS NOT NULL "
-                "       AND source_external_id = $2) "
+                "WHERE source = 'meeting_recap' "
+                "  AND (normalized_hash = $1 "
+                "       OR (source_external_id IS NOT NULL "
+                "           AND source_external_id = $2)) "
                 "LIMIT 1",
                 hash_hex,
                 body.source_external_id,
@@ -221,4 +224,184 @@ async def ingest_meeting_recap(
         "event_id": row["id"],
         "status": row["status"],
         "deduped": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Slack ingest (Chunk 5 step 1)
+# ---------------------------------------------------------------------------
+
+# Slack ts is "<seconds>.<microseconds>" — use as the per-message
+# external id along with team + channel for full uniqueness across
+# workspaces.
+class SlackIngest(BaseModel):
+    team_id: str = Field(..., min_length=1, max_length=32,
+                          description="Slack workspace id (T-prefixed).")
+    channel_id: str = Field(..., min_length=1, max_length=32,
+                              description="Slack channel id (C/G/D-prefixed).")
+    ts: str = Field(..., min_length=1, max_length=64,
+                     description="Slack message timestamp (idempotency key).")
+    text: str = Field(..., min_length=1, max_length=200_000,
+                       description="Raw message text. UTF-8.")
+    user_id: str | None = Field(default=None, max_length=32,
+                                  description="Slack user id of the poster.")
+    thread_ts: str | None = Field(default=None, max_length=64,
+                                    description="Parent ts if this is a thread reply.")
+    channel_name: str | None = Field(default=None, max_length=128)
+    user_name: str | None = Field(default=None, max_length=128)
+    extra: dict[str, Any] = Field(default_factory=dict,
+                                    description="Free-form context from n8n forward.")
+
+
+@router.post("/slack")
+async def ingest_slack_message(
+    body: SlackIngest,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Service-only Slack message ingest.
+
+    Called by n8n after Slack signing verification + URL handshake +
+    retry de-dupe at the edge. The OpsMemory API trusts the n8n
+    forward; we still require a service principal carrying
+    `ingest:write` so a leaked admin session can't post here.
+
+    Idempotency:
+      - source_external_id = '{team_id}:{channel_id}:{ts}' is unique
+        per source via the partial UNIQUE index from migration 0003.
+      - normalized_hash + source = 'slack_message' is unique via the
+        source-scoped UNIQUE index from migration 0005.
+
+    Pipeline behavior in this commit:
+      - The event lands as 'received'. The reconciliation worker
+        currently skips non-'meeting_recap' events (pipeline.py:127).
+        A follow-up commit generalizes the prompt + step routing to
+        actually run extraction on Slack messages.
+    """
+    # Service-only — admin user shouldn't post here directly. Per
+    # Codex chunk-3-close rec: machine endpoints require service
+    # principal + scope (admin bypass would be a defense-in-depth
+    # hole if an admin browser session ever made it here).
+    if principal.principal_type != "service":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="slack ingest requires a service principal",
+        )
+    require_scope(principal, SCOPE_INGEST_WRITE)
+
+    canonical = canonicalize(body.text)
+    if len(canonical) < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="text empty after canonicalization",
+        )
+    hash_hex = content_hash(canonical)
+
+    source_external_id = f"{body.team_id}:{body.channel_id}:{body.ts}"
+    metadata = {
+        "team_id": body.team_id,
+        "channel_id": body.channel_id,
+        "ts": body.ts,
+        "thread_ts": body.thread_ts,
+        "user_id": body.user_id,
+        "channel_name": body.channel_name,
+        "user_name": body.user_name,
+        "extra": body.extra,
+    }
+
+    request_id = getattr(request.state, "request_id", None)
+
+    pool = request.app.state.db
+    async with pool.acquire() as conn:
+        # Pre-check by source_external_id (the canonical Slack
+        # idempotency key) first — same Slack message ts repeating is
+        # the common case (Slack retries the webhook on 500s).
+        existing = await conn.fetchrow(
+            "SELECT id::text AS id, status::text AS status FROM ingest_events "
+            "WHERE source = 'slack_message' AND source_external_id = $1",
+            source_external_id,
+        )
+        if existing:
+            return {
+                "event_id": existing["id"],
+                "status": existing["status"],
+                "deduped": True,
+                "dedup_key": "source_external_id",
+            }
+
+        # Source-scoped content-hash dedup: same canonical text from
+        # the same workspace+channel posted under a different ts is
+        # almost certainly a duplicate edit/repost.
+        existing_hash = await conn.fetchrow(
+            "SELECT id::text AS id, status::text AS status FROM ingest_events "
+            "WHERE source = 'slack_message' AND normalized_hash = $1",
+            hash_hex,
+        )
+        if existing_hash:
+            return {
+                "event_id": existing_hash["id"],
+                "status": existing_hash["status"],
+                "deduped": True,
+                "dedup_key": "content_hash",
+            }
+
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO ingest_events
+                  (source, source_external_id, raw_content, normalized_hash,
+                   source_metadata, status,
+                   actor_type, actor_user_id, actor_service_account_id,
+                   request_id)
+                VALUES
+                  ('slack_message', $1, $2, $3, $4::jsonb, 'received',
+                   'service', NULL, $5::uuid, $6)
+                RETURNING id::text AS id, status::text AS status
+                """,
+                source_external_id,
+                canonical,
+                hash_hex,
+                metadata,
+                principal.id,
+                request_id,
+            )
+        except asyncpg.UniqueViolationError:
+            existing = await conn.fetchrow(
+                "SELECT id::text AS id, status::text AS status, "
+                "       (normalized_hash = $1) AS by_hash "
+                "FROM ingest_events "
+                "WHERE source = 'slack_message' "
+                "  AND (normalized_hash = $1 OR source_external_id = $2) "
+                "LIMIT 1",
+                hash_hex,
+                source_external_id,
+            )
+            if not existing:
+                raise
+            return {
+                "event_id": existing["id"],
+                "status": existing["status"],
+                "deduped": True,
+                "dedup_key": "content_hash" if existing["by_hash"] else "source_external_id",
+            }
+
+    log.info(
+        "ingest_slack_message_received",
+        extra={
+            "event_id": row["id"],
+            "team_id": body.team_id,
+            "channel_id": body.channel_id,
+            "ts": body.ts,
+            "service_id": principal.id,
+            "content_bytes": len(canonical),
+            "request_id": request_id,
+        },
+    )
+
+    return {
+        "event_id": row["id"],
+        "status": row["status"],
+        "deduped": False,
+        "source": "slack_message",
+        "source_external_id": source_external_id,
     }
