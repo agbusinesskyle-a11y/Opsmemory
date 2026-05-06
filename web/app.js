@@ -75,13 +75,46 @@ async function api(path, opts) {
   return body;
 }
 
+// Codex chunk-6-close: SW intentionally does not cache /whoami or
+// /v1/businesses (auth-scoped), but a true airplane-mode reload would
+// then render the error UI before the outbox could restore optimistic
+// state. localStorage persistence of the last-known principal +
+// businesses lets the PWA boot offline against a recently-known shape.
+const _LS_PRINCIPAL_KEY = 'opsmemory.principal.v1';
+const _LS_BUSINESSES_KEY = 'opsmemory.businesses.v1';
+
+function _persistPrincipal(p) {
+  try { localStorage.setItem(_LS_PRINCIPAL_KEY, JSON.stringify(p)); }
+  catch (e) { /* quota / private mode — ignore */ }
+}
+function _readPersistedPrincipal() {
+  try {
+    const raw = localStorage.getItem(_LS_PRINCIPAL_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+function _persistBusinesses(b) {
+  try { localStorage.setItem(_LS_BUSINESSES_KEY, JSON.stringify(b || [])); }
+  catch (e) { /* ignore */ }
+}
+function _readPersistedBusinesses() {
+  try {
+    const raw = localStorage.getItem(_LS_BUSINESSES_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
 async function loadPrincipal() {
-  return await api('/whoami');
+  const p = await api('/whoami');
+  _persistPrincipal(p);
+  return p;
 }
 
 async function loadBusinesses() {
   const data = await api('/v1/businesses');
-  return data.businesses || [];
+  const businesses = data.businesses || [];
+  _persistBusinesses(businesses);
+  return businesses;
 }
 
 async function loadTasks(filters) {
@@ -636,6 +669,11 @@ function attachEventHandlers() {
 }
 
 async function refreshTasks() {
+  // Reset the SW stale marker. api() re-sets it to true if the
+  // response carries X-OpsMemory-From-Cache (Codex chunk-6-close
+  // blocker — without this reset the badge stuck on 'cached' even
+  // after a successful network round-trip).
+  state.sync.fromCache = false;
   try {
     const { tasks, total } = await loadTasks(state.filters);
     state.tasks = tasks;
@@ -968,28 +1006,57 @@ function attachConnectivityHandlers() {
   });
 }
 
-(async function () {
+async function _bootPrincipal() {
+  // Try network first; on failure, fall back to persisted last-known
+  // principal so the PWA renders an offline shell with the cached
+  // optimistic state instead of the generic error screen.
   try {
-    state.principal = await loadPrincipal();
-    state.businesses = await loadBusinesses();
-    // Outbox bootstrap: bring back any optimistic patches the user
-    // queued before this reload, then refresh sync counters before
-    // the first render so the header badge is accurate.
+    return await loadPrincipal();
+  } catch (err) {
+    const persisted = _readPersistedPrincipal();
+    if (persisted) {
+      state.sync.online = false;
+      state.sync.fromCache = true;
+      console.warn('[opsmemory] /whoami failed; using persisted principal', err);
+      return persisted;
+    }
+    throw err;
+  }
+}
+
+async function _bootBusinesses() {
+  try {
+    return await loadBusinesses();
+  } catch (err) {
+    const persisted = _readPersistedBusinesses();
+    if (persisted && persisted.length) {
+      console.warn('[opsmemory] /v1/businesses failed; using persisted', err);
+      return persisted;
+    }
+    return [];
+  }
+}
+
+(async function () {
+  // Boot with offline tolerance. /whoami and /v1/businesses fall back
+  // to localStorage if they fail (Codex chunk-6-close fix). Outbox
+  // hydration runs even on the offline path so optimistic patches
+  // survive an airplane-mode reload.
+  registerServiceWorker();
+  attachConnectivityHandlers();
+  try {
+    state.principal = await _bootPrincipal();
+    state.businesses = await _bootBusinesses();
     await hydrateOptimisticFromOutbox();
     await refreshSyncCounters();
     await refreshTasks();
-    registerServiceWorker();
-    attachConnectivityHandlers();
-    // Best-effort initial replay; if offline this is a no-op.
     replayOutbox().catch(function () {});
-    // Small periodic flush so backoff entries get re-tried while the
-    // app stays open (in addition to event-triggered replays).
     setInterval(function () {
       replayOutbox().catch(function () {});
     }, 10_000);
   } catch (err) {
+    // Truly first-run + offline: no persisted principal, /whoami
+    // failed. Render the error UI.
     renderError(err);
-    registerServiceWorker();
-    attachConnectivityHandlers();
   }
 })();

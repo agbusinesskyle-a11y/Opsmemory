@@ -160,7 +160,9 @@ async def _replay_existing(
     row = await conn.fetchrow(
         """
         SELECT status, response_status, result_payload, error_payload,
-               task_id::text AS task_id, payload->>'action' AS action
+               task_id::text         AS task_id,
+               payload->>'action'    AS action,
+               payload->>'task_id'   AS payload_task_id
         FROM client_mutations
         WHERE idempotency_key = $1
         """,
@@ -177,10 +179,13 @@ async def _replay_existing(
                        f"{row['action']!r}; this request was for {action!r}"),
         })
 
-    # task_id must match the requested task (NULL when the original
-    # request 404'd on a missing/invisible task; in that case any
-    # retry against the same task_id should match the requested id).
-    stored = row["task_id"]
+    # task_id must match the requested task. The stored row.task_id is
+    # NULL when the original request 404'd on a missing/invisible task,
+    # so fall back to comparing the originally-requested task_id stored
+    # in payload (Codex chunk-6-close: previously this fallback was
+    # absent, letting a same-key retry against a different task_id
+    # silently replay the prior 404 as if it were for the new task).
+    stored = row["task_id"] if row["task_id"] is not None else row["payload_task_id"]
     if stored is not None and stored != task_id:
         return (409, {
             "code": "idempotency_task_mismatch",
@@ -300,7 +305,7 @@ async def toggle_done(
                                         {"code": "task_not_found",
                                          "task_id": rid})
                 else:
-                    # ---- Authz: business intersect ----
+                    # ---- Authz: business intersect (visibility) ----
                     visible = visible_business_ids(principal)
                     if visible is not None:
                         biz_rows = await conn.fetch(
@@ -313,6 +318,54 @@ async def toggle_done(
                             outcome = _Outcome("rejected", 404,
                                                 {"code": "task_not_visible",
                                                  "task_id": rid})
+
+                # ---- Mutation authz (per locked design 01-design.md §1) ----
+                # Admins can toggle any active task. Owners can complete or
+                # reopen ONLY tasks they are assigned to (task_assignees row
+                # with role='assignee'); reopen by an owner only within the
+                # 24h reversal window — after that, admin only. Service
+                # principals are rejected here because no toggle-mutation
+                # scope is defined yet (per Codex chunk-6-close blocker).
+                if outcome is None:
+                    if principal.principal_type == "user" and principal.role == "admin":
+                        pass
+                    elif principal.principal_type == "user" and principal.role == "owner":
+                        is_assignee = await conn.fetchrow(
+                            "SELECT 1 FROM task_assignees "
+                            "WHERE task_id = $1::uuid AND user_id = $2::uuid "
+                            "  AND role = 'assignee'",
+                            rid, principal.id,
+                        )
+                        if not is_assignee:
+                            outcome = _Outcome("rejected", 403, {
+                                "code": "task_not_assigned",
+                                "task_id": rid,
+                                "detail": ("owner can complete/reopen only "
+                                           "tasks they are assigned to"),
+                            })
+                        elif task["status"] == "done":
+                            # Going-to-open path. Check 24h window.
+                            window = await conn.fetchrow(
+                                "SELECT (completed_at IS NOT NULL "
+                                "        AND completed_at >= now() - interval '24 hours') "
+                                "       AS within FROM tasks WHERE id = $1::uuid",
+                                rid,
+                            )
+                            if window and not window["within"]:
+                                outcome = _Outcome("rejected", 403, {
+                                    "code": "reopen_window_expired",
+                                    "task_id": rid,
+                                    "detail": ("only admins can reopen tasks "
+                                               "completed more than 24 hours ago"),
+                                })
+                    else:
+                        outcome = _Outcome("rejected", 403, {
+                            "code": "service_mutation_forbidden",
+                            "task_id": rid,
+                            "detail": ("toggle_done requires a user "
+                                       "principal; service principals are "
+                                       "not granted this mutation"),
+                        })
 
                 if outcome is None:
                     # ---- Optimistic-lock: whole-task version ----
