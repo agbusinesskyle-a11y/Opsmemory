@@ -10,8 +10,9 @@ Per Codex chunk-10-step3c-close STEP 4 PLAN:
     inserts a notification_deliveries row (sender mode, step 4
     commit 3 + step 5).
 
-This module is intentionally read-only against the DB. Insert-side
-work lives in the runner script so that dry-run mode never touches
+The walker (collect_due_prefs / collect_tasks_for_user) is read-
+only. claim_delivery owns the per-(pref, fire, subscription) row
+INSERT used by the runner's --claim mode; dry-run never touches
 notification_deliveries (Codex STEP 4 PLAN (4)).
 """
 
@@ -268,14 +269,41 @@ async def collect_tasks_for_user(
     return items, has_more, total_count
 
 
-def idempotency_key(pref_id: str, scheduled_for: datetime) -> str:
-    """Per Codex chunk-10-step3c-close STEP 4 PLAN (5):
-    '<pref_id>:<scheduled_for_iso>'.
+def idempotency_key(
+    pref_id: str,
+    scheduled_for: datetime,
+    web_push_subscription_id: str | None = None,
+) -> str:
+    """Per Codex chunk-10-step5 plan-review:
+       web_push:                    '<pref_id>:<iso>:sub:<sub_id>'
+       slack_dm / email_digest:     '<pref_id>:<iso>'    (unchanged)
     """
     if scheduled_for.tzinfo is None:
         raise ValueError("scheduled_for must be tz-aware")
     iso = scheduled_for.astimezone(timezone.utc).isoformat()
+    if web_push_subscription_id is not None:
+        return f"{pref_id}:{iso}:sub:{web_push_subscription_id}"
     return f"{pref_id}:{iso}"
+
+
+async def list_active_subscriptions(conn, *, user_id: str) -> list[dict]:
+    """List a user's active Web Push subscriptions, deterministic
+    order. Codex chunk-10-step5 plan-review: order matches the
+    API's list endpoint (created_at DESC, id DESC) so claim
+    ordering is stable across runs.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT id::text       AS id,
+               endpoint       AS endpoint
+          FROM web_push_subscriptions
+         WHERE user_id = $1::uuid
+           AND status = 'active'
+         ORDER BY created_at DESC, id DESC
+        """,
+        user_id,
+    )
+    return [{"id": r["id"], "endpoint": r["endpoint"]} for r in rows]
 
 
 async def claim_delivery(
@@ -283,32 +311,48 @@ async def claim_delivery(
     *,
     due: DuePref,
     payload: dict,
+    web_push_subscription_id: str | None = None,
 ) -> str | None:
     """Atomically claim a notification_deliveries row for this
-    (pref_id, scheduled_for) tuple. Returns the new row's id when
-    this caller won the race, or None when another worker already
-    inserted one.
+    (pref_id, scheduled_for [, web_push_subscription_id]) tuple.
 
-    Per Codex chunk-10-step3c-close STEP 4 PLAN (5):
-        INSERT ... ON CONFLICT (idempotency_key) DO NOTHING
-        RETURNING id
+    Returns the new row's id when this caller won the race, None
+    on conflict (another worker already inserted one).
+
+    Codex chunk-10-step5 plan-review (3) invariants:
+      - due.channel == 'web_push'  REQUIRES web_push_subscription_id.
+      - other channels MUST NOT pass web_push_subscription_id.
+    These prevent silent miscoded rows from sneaking past review.
 
     The caller (run_notification_scheduler.py + step 5 sender) is
     responsible for updating the row's status to 'sent' / 'failed'
     after the dispatch.
 
-    Migration 0015 grants opsmemory_app INSERT + UPDATE on this
-    table; SELECT was already in 0013.
+    Migrations:
+      0015 grants opsmemory_app INSERT + UPDATE on
+      notification_deliveries; SELECT was already in 0013.
+      0016 adds the web_push_subscription_id column + FK + index.
     """
-    key = idempotency_key(due.pref_id, due.scheduled_for)
+    if due.channel == "web_push":
+        if web_push_subscription_id is None:
+            raise ValueError(
+                "claim_delivery for web_push requires web_push_subscription_id"
+            )
+    else:
+        if web_push_subscription_id is not None:
+            raise ValueError(
+                f"claim_delivery for channel={due.channel!r} must not pass "
+                "web_push_subscription_id"
+            )
+    key = idempotency_key(due.pref_id, due.scheduled_for, web_push_subscription_id)
     row = await conn.fetchrow(
         """
         INSERT INTO notification_deliveries
           (idempotency_key, user_id, pref_id, channel,
-           status, scheduled_for, payload)
+           status, scheduled_for, payload, web_push_subscription_id)
         VALUES
           ($1::text, $2::uuid, $3::uuid, $4::text,
-           'scheduled', $5::timestamptz, $6::jsonb)
+           'scheduled', $5::timestamptz, $6::jsonb, $7)
         ON CONFLICT (idempotency_key) DO NOTHING
         RETURNING id::text AS id
         """,
@@ -318,5 +362,6 @@ async def claim_delivery(
         due.channel,
         due.scheduled_for,
         payload,
+        web_push_subscription_id,  # asyncpg handles None -> NULL
     )
     return row["id"] if row else None

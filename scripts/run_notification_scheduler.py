@@ -50,6 +50,7 @@ from api.app.notifications.scheduler import (  # noqa: E402
     collect_due_prefs,
     collect_tasks_for_user,
     idempotency_key,
+    list_active_subscriptions,
 )
 
 
@@ -78,9 +79,16 @@ async def main_async(args: argparse.Namespace) -> int:
         dsn=dsn, min_size=1, max_size=2, setup=register_jsonb_codec,
     )
     try:
+        # Codex chunk-10-step5 plan-review (5): --limit applies per
+        # due pref, NOT per delivery row. A web_push pref with N
+        # active devices counts as 1 toward --limit. Track delivery
+        # rows separately.
         considered = 0
-        emitted = 0
+        emitted = 0          # prefs that produced ≥1 row
+        delivered = 0        # delivery rows actually claimed/logged
         skipped_channel = 0
+        skipped_no_subs = 0  # web_push pref with 0 active devices
+        skipped_claim = 0    # claim conflict (already claimed)
         errors = 0
         async with pool.acquire() as conn:
             async for due in collect_due_prefs(
@@ -122,33 +130,83 @@ async def main_async(args: argparse.Namespace) -> int:
                         scheduled_for=due.scheduled_for,
                         total_count=total_count,
                     )
-                    key = idempotency_key(due.pref_id, due.scheduled_for)
+                    user_label = (
+                        due.user_display_name or due.user_email or due.user_id
+                    )
                     tag = "[DRY-RUN]" if not claim_mode else "[CLAIM]"
-                    delivery_id = None
-                    if claim_mode:
-                        delivery_id = await claim_delivery(
-                            conn, due=due, payload=payload,
+
+                    if due.channel == "web_push":
+                        # Codex chunk-10-step5 plan-review: one row
+                        # per (pref, fire, active subscription).
+                        subs = await list_active_subscriptions(
+                            conn, user_id=due.user_id,
                         )
-                        if delivery_id is None:
+                        if not subs:
                             print(
                                 f"[CLAIM-SKIP] {due.scheduled_for.isoformat()} "
-                                f"channel={due.channel} "
-                                f"user={due.user_display_name or due.user_email or due.user_id} "
-                                f"key={key} "
-                                f"reason=already_claimed"
+                                f"channel=web_push user={user_label} "
+                                f"reason=no_active_subscriptions"
                             )
+                            skipped_no_subs += 1
                             continue
-                    print(
-                        f"{tag} {due.scheduled_for.isoformat()} "
-                        f"channel={due.channel} "
-                        f"user={due.user_display_name or due.user_email or due.user_id} "
-                        f"tasks={len(tasks)} "
-                        f"total={total_count} "
-                        f"key={key} "
-                        f"delivery_id={delivery_id or '-'} "
-                        f"title={payload['title']!r}"
-                    )
-                    emitted += 1
+                        any_delivered = False
+                        for sub in subs:
+                            key = idempotency_key(
+                                due.pref_id, due.scheduled_for, sub["id"],
+                            )
+                            delivery_id = None
+                            if claim_mode:
+                                delivery_id = await claim_delivery(
+                                    conn, due=due, payload=payload,
+                                    web_push_subscription_id=sub["id"],
+                                )
+                                if delivery_id is None:
+                                    print(
+                                        f"[CLAIM-SKIP] {due.scheduled_for.isoformat()} "
+                                        f"channel=web_push user={user_label} "
+                                        f"sub={sub['id']} key={key} "
+                                        f"reason=already_claimed"
+                                    )
+                                    skipped_claim += 1
+                                    continue
+                            print(
+                                f"{tag} {due.scheduled_for.isoformat()} "
+                                f"channel=web_push user={user_label} "
+                                f"sub={sub['id']} tasks={len(tasks)} "
+                                f"total={total_count} key={key} "
+                                f"delivery_id={delivery_id or '-'} "
+                                f"title={payload['title']!r}"
+                            )
+                            delivered += 1
+                            any_delivered = True
+                        if any_delivered:
+                            emitted += 1
+                    else:
+                        # slack_dm / email_digest: one row per pref+
+                        # fire, web_push_subscription_id stays NULL.
+                        key = idempotency_key(due.pref_id, due.scheduled_for)
+                        delivery_id = None
+                        if claim_mode:
+                            delivery_id = await claim_delivery(
+                                conn, due=due, payload=payload,
+                            )
+                            if delivery_id is None:
+                                print(
+                                    f"[CLAIM-SKIP] {due.scheduled_for.isoformat()} "
+                                    f"channel={due.channel} user={user_label} "
+                                    f"key={key} reason=already_claimed"
+                                )
+                                skipped_claim += 1
+                                continue
+                        print(
+                            f"{tag} {due.scheduled_for.isoformat()} "
+                            f"channel={due.channel} user={user_label} "
+                            f"tasks={len(tasks)} total={total_count} "
+                            f"key={key} delivery_id={delivery_id or '-'} "
+                            f"title={payload['title']!r}"
+                        )
+                        delivered += 1
+                        emitted += 1
                 except Exception:
                     errors += 1
                     log.exception(
@@ -163,7 +221,9 @@ async def main_async(args: argparse.Namespace) -> int:
         tag = "[DRY-RUN]" if not claim_mode else "[CLAIM]"
         print(
             f"{tag} considered={considered} emitted={emitted} "
-            f"skipped_channel={skipped_channel} errors={errors}"
+            f"delivered={delivered} skipped_channel={skipped_channel} "
+            f"skipped_no_subs={skipped_no_subs} skipped_claim={skipped_claim} "
+            f"errors={errors}"
         )
         if errors > 0:
             return 2
@@ -180,7 +240,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--limit", type=int, default=None,
-        help="max prefs to emit per run",
+        help="max prefs to emit per run. NOTE: limit applies per "
+             "due pref, NOT per delivery row. A web_push pref with "
+             "N active devices counts as 1 toward this limit "
+             "(Codex chunk-10-step5 plan-review). Use the final "
+             "summary's delivered=<N> counter to see actual row "
+             "count.",
     )
     parser.add_argument(
         "--channel", type=str, default=None,
