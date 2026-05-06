@@ -100,6 +100,9 @@ const state = {
     // a single inline pill near the subscription table.
     subscriptionRevokes: {},      // { [subscriptionId]: true } when DELETE is in flight
     subscriptionRevokeError: null,
+    // Sub-(c)+ commit 4: Send test push per device. Per-row state
+    // so multiple devices can be tested in parallel.
+    subscriptionTests: {},        // { [subscriptionId]: { pending, status, http, code, detail } }
     // Sub-(b) commit 3: Enable Web Push (subscribe) flow. Single
     // global pending+error pair per Codex chunk-10-step3b2 gate-2
     // (plan for sub-(b)/3).
@@ -1120,6 +1123,13 @@ async function postPushSubscription(body) {
   });
 }
 
+async function postTestPush(subscription_id) {
+  return await api('/v1/notifications/web_push/test', {
+    method: 'POST',
+    body: { subscription_id },
+  });
+}
+
 // Standard Web Push helper: convert a base64url-encoded VAPID
 // public key into the Uint8Array PushManager.subscribe expects.
 function urlBase64ToUint8Array(base64String) {
@@ -1336,15 +1346,34 @@ function renderSettingsWebPushSection() {
     : '<span class="settings-pill badge-default">not subscribed</span>';
 
   const revokes = s.subscriptionRevokes || {};
+  const tests = s.subscriptionTests || {};
   const subRows = (s.subscriptions || []).map(sub => {
     const pending = !!revokes[sub.id];
+    const test = tests[sub.id];
+    const testPending = !!(test && test.pending);
+    let testPill = '';
+    if (test && !test.pending) {
+      if (test.status === 'sent') {
+        testPill = ` <span class="settings-pill badge-granted" title="HTTP ${test.http || '?'} ${test.code || ''}">test sent</span>`;
+      } else if (test.status === 'failed') {
+        const label = test.code || 'failed';
+        testPill = ` <span class="settings-pill badge-denied" title="HTTP ${test.http || '?'} ${test.detail || ''}">test ${escapeHtml(label)}</span>`;
+      } else if (test.status === 'error') {
+        testPill = ` <span class="settings-pill badge-denied" title="${escapeHtml(test.detail || 'error')}">test error</span>`;
+      }
+    }
+    // Codex chunk-10-step5c2-close COMMIT 4 PLAN: per-row pending
+    // disables the Test button. Revoke + Test share the row's
+    // actions cell. Inline result pill (no toast).
     return `
     <tr>
       <td>${escapeHtml(sub.device_label || '(unlabeled device)')}</td>
       <td><code class="settings-keyfrag" title="${escapeHtml(sub.endpoint || '')}">${escapeHtml(_shortenKey(sub.endpoint))}</code></td>
-      <td><span class="settings-pill badge-${sub.status === 'active' ? 'granted' : 'default'}">${escapeHtml(sub.status)}</span></td>
+      <td><span class="settings-pill badge-${sub.status === 'active' ? 'granted' : 'default'}">${escapeHtml(sub.status)}</span>${testPill}</td>
       <td class="muted">${escapeHtml(sub.last_seen_at || sub.created_at || '')}</td>
       <td class="settings-actions-cell">
+        <button class="settings-test-push" data-subscription-id="${escapeHtml(sub.id)}"
+                ${(testPending || pending || sub.status !== 'active') ? 'disabled' : ''}>${testPending ? 'Sending…' : 'Send test'}</button>
         <button class="settings-revoke" data-subscription-id="${escapeHtml(sub.id)}"
                 ${pending ? 'disabled' : ''}>${pending ? 'Revoking…' : 'Revoke'}</button>
       </td>
@@ -2608,6 +2637,54 @@ function attachEventHandlers() {
         state.settings.subscriptionCreatePending = false;
         render();
       }
+    });
+  });
+
+  // Codex chunk-10-step5c2-close COMMIT 4 PLAN: Send test push.
+  // Per-row pending state in state.settings.subscriptionTests.
+  // Inline pill on result; no toast. Errors don't disturb the
+  // global revoke error pill.
+  document.querySelectorAll('.settings-test-push').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const subId = btn.dataset.subscriptionId;
+      if (!subId) return;
+      const tests = state.settings.subscriptionTests || {};
+      if (tests[subId] && tests[subId].pending) return;
+      state.settings.subscriptionTests = {
+        ...tests,
+        [subId]: { pending: true },
+      };
+      render();
+      let next = { pending: false };
+      try {
+        const resp = await postTestPush(subId);
+        next = {
+          pending: false,
+          status: resp.status || 'failed',
+          http: resp.http_status,
+          code: resp.code,
+          detail: resp.detail,
+        };
+      } catch (err) {
+        let detail = (err && err.message) || 'Test failed.';
+        const errDetail = err && err.body && err.body.detail;
+        if (typeof errDetail === 'string') detail = errDetail;
+        else if (errDetail && typeof errDetail === 'object' && !Array.isArray(errDetail)) {
+          detail = errDetail.reason || errDetail.detail || errDetail.code || detail;
+        }
+        next = {
+          pending: false,
+          status: 'error',
+          http: (err && err.status) || null,
+          code: (errDetail && errDetail.code) || null,
+          detail,
+        };
+      }
+      state.settings.subscriptionTests = {
+        ...(state.settings.subscriptionTests || {}),
+        [subId]: next,
+      };
+      render();
     });
   });
 

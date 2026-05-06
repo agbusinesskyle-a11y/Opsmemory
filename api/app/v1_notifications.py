@@ -8,6 +8,7 @@ Endpoints (all user-only — admin/service principals 403):
   GET    /v1/notifications/web_push/subscriptions     list this user's devices
   POST   /v1/notifications/web_push/subscriptions     upsert a subscription
   DELETE /v1/notifications/web_push/subscriptions/{id} soft-revoke
+  POST   /v1/notifications/web_push/test              send a test push (chunk 10 step 5 commit 4)
   GET    /v1/notifications/vapid_public               public VAPID key
 
 Per Codex chunk-10-step1 STEP 2 PLAN:
@@ -101,6 +102,15 @@ class PrefPatchBody(BaseModel):
             return v
         _validate_schedule_object(v)
         return v
+
+
+class TestPushBody(BaseModel):
+    """Body for POST /v1/notifications/web_push/test (chunk 10
+    step 5 commit 4). Single field so the operator can target a
+    specific device row.
+    """
+    model_config = {"extra": "forbid"}
+    subscription_id: uuid.UUID
 
 
 class SubscriptionUpsertBody(BaseModel):
@@ -508,6 +518,162 @@ async def revoke_subscription(
         "already_revoked": already_revoked,
     })
     return {"id": sid, "status": "revoked"}
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/notifications/web_push/test
+# Chunk 10 step 5 commit 4. Lets the user verify a specific device
+# is wired correctly without waiting for the next digest fire.
+# ---------------------------------------------------------------------------
+
+@router.post("/web_push/test")
+async def send_test_push(
+    body: TestPushBody,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Ship a synthetic 'OpsMemory test push' notification to one
+    of the calling user's active subscriptions and report the
+    result.
+
+    Authz: user-only. Service principals are 403 (mirrors prefs).
+    The subscription must be owned by the calling user AND
+    status='active'; 422 otherwise (no leak about whether a
+    foreign subscription exists).
+
+    503 when:
+      - VAPID env not configured at startup
+      - pywebpush wheel not installed (preflight)
+
+    On success the call returns the structured send_one result.
+    The actual HTTP status from the push provider is conveyed in
+    `http_status` + `code` so the PWA can show a nuanced result
+    pill (sent vs unsubscribed vs transient).
+    """
+    _require_user(principal)
+    sid = str(body.subscription_id)
+    pool = request.app.state.db
+
+    # Codex chunk-10-step5c2-close COMMIT 4 PLAN: 503 path for
+    # vapid/sender unavailable runs BEFORE we touch the DB so a
+    # misconfigured deploy fails fast.
+    public_key = getattr(request.app.state, "vapid_public_key", None)
+    if not public_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "vapid_unconfigured",
+                    "detail": "server VAPID keys not configured; ask admin"},
+        )
+    # Local import so the rest of this module loads even when
+    # pywebpush isn't installed (smoke-test environments). The
+    # preflight raises clean RuntimeError on missing wheel; we
+    # translate to 503.
+    try:
+        from .notifications.sender import preflight_sender, send_one
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "sender_unavailable",
+                    "detail": f"sender import failed: {exc}"},
+        )
+    try:
+        vapid = preflight_sender()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "sender_unavailable", "detail": str(exc)},
+        )
+
+    async with pool.acquire() as conn:
+        # Ownership + active-status check inside one read to keep
+        # the 422 path cheap.
+        sub_row = await conn.fetchrow(
+            """
+            SELECT id::text  AS id,
+                   status    AS status
+              FROM web_push_subscriptions
+             WHERE id = $1::uuid
+               AND user_id = $2::uuid
+            """,
+            sid, principal.id,
+        )
+        if sub_row is None:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "subscription_not_found", "id": sid},
+            )
+        if sub_row["status"] != "active":
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "subscription_not_active",
+                        "id": sid, "status": sub_row["status"]},
+            )
+
+        # Codex COMMIT 4 PLAN: don't use a sentinel pref_id. The
+        # column is nullable (migration 0013), so leave it NULL
+        # and document via the payload.kind='test' marker.
+        test_uuid = uuid.uuid4()
+        payload = {
+            "kind": "test",
+            "title": "OpsMemory test push",
+            "body": "If you see this, push is working.",
+            "task_id": None,
+            "url": None,
+            "items": [],
+            "sent_by_user_id": principal.id,
+        }
+        # idempotency_key per Codex COMMIT 4 PLAN. Each test
+        # invocation gets its own uuid so repeated clicks are
+        # genuinely independent rows (operator-debugging
+        # behavior — they want to see each click logged
+        # separately).
+        idem_key = f"web_push_test:{test_uuid}"
+        delivery_row = await conn.fetchrow(
+            """
+            INSERT INTO notification_deliveries
+              (idempotency_key, user_id, pref_id, channel,
+               status, scheduled_for, payload,
+               web_push_subscription_id)
+            VALUES
+              ($1::text, $2::uuid, NULL, 'web_push',
+               'scheduled', now(), $3::jsonb, $4::uuid)
+            RETURNING id::text AS id
+            """,
+            idem_key, principal.id, payload, sid,
+        )
+        delivery_id = delivery_row["id"]
+
+        # Codex COMMIT 4 PLAN: short TTL for tests. Digest TTL
+        # is 24h because a phone offline 24h still wants the
+        # latest digest; a test push has no value past a minute.
+        result = await send_one(
+            conn,
+            delivery_id=delivery_id,
+            user_id=principal.id,
+            pref_id=None,
+            web_push_subscription_id=sid,
+            payload=payload,
+            vapid=vapid,
+            ttl=60,
+        )
+
+    log.info("notifications_test_push", extra={
+        "user_id": principal.id,
+        "subscription_id": sid,
+        "delivery_id": delivery_id,
+        "send_status": result.status,
+        "http_status": result.http_status,
+        "code": result.code,
+    })
+
+    return {
+        "delivery_id": delivery_id,
+        "subscription_id": sid,
+        "status": result.status,
+        "http_status": result.http_status,
+        "code": result.code,
+        "detail": result.detail,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -272,7 +272,7 @@ async def send_one(
     *,
     delivery_id: str,
     user_id: str,
-    pref_id: str,
+    pref_id: str | None,
     web_push_subscription_id: str,
     payload: dict,
     vapid: VapidConfig,

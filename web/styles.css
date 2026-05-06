@@ -1022,7 +1022,8 @@ ul.businesses li {
 .settings-edit-cancel,
 .settings-revoke,
 .settings-enable-push,
-.settings-sw-recheck {
+.settings-sw-recheck,
+.settings-test-push {
   padding: 4px 12px;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1038,7 +1039,15 @@ ul.businesses li {
 .settings-edit-open:disabled,
 .settings-revoke:disabled,
 .settings-enable-push:disabled,
-.settings-sw-recheck:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-sw-recheck:disabled,
+.settings-test-push:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-test-push {
+  background: rgba(0, 100, 200, 0.10);
+  margin-right: 6px;
+}
+.settings-test-push:hover:not(:disabled) {
+  background: rgba(0, 100, 200, 0.20);
+}
 .settings-enable-push {
   background: rgba(0, 100, 200, 0.15);
   font-weight: 600;
