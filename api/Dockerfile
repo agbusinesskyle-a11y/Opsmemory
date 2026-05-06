@@ -5,11 +5,21 @@
 
 FROM python:3.12-slim
 
-# System deps: libpq5 for asyncpg's optional binary path, ca-certs, curl for healthcheck debug.
+# System deps:
+#   libpq5         asyncpg's optional binary path
+#   ca-certificates                tls trust store
+#   curl                           healthcheck debug
+#   tzdata         IANA tz database for zoneinfo. The notification
+#                                  scheduler resolves IANA names
+#                                  (America/Phoenix etc.) at fire
+#                                  time per Codex chunk-10-step4-
+#                                  close (j); python:3.12-slim
+#                                  doesn't ship tzdata by default.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libpq5 \
       ca-certificates \
       curl \
+      tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root runtime user.

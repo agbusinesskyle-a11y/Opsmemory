@@ -67,6 +67,9 @@ async def collect_due_prefs(
         raise ValueError("collect_due_prefs requires a tz-aware now")
     lookback_floor = now - timedelta(minutes=lookback_minutes)
 
+    # Codex chunk-10-step4-close BLOCKER 1: a disabled user with an
+    # enabled pref would otherwise still receive a digest. Mirror
+    # the auth.py user-status filter at the walker level.
     rows = await conn.fetch(
         """
         SELECT p.id::text         AS pref_id,
@@ -80,6 +83,7 @@ async def collect_due_prefs(
           FROM notification_prefs p
           JOIN users u ON u.id = p.user_id
          WHERE p.enabled = true
+           AND u.status = 'active'
         """
     )
     for row in rows:
@@ -126,16 +130,56 @@ async def collect_due_prefs(
         )
 
 
+def _normalize_settings(settings: dict) -> tuple[bool, bool, int]:
+    """Validate + normalize per-pref settings to typed locals.
+
+    Codex chunk-10-step4-close BLOCKER 3: bool(stranger truthy) is
+    almost always True (e.g. bool('false') is True), and int('abc')
+    crashes mid-run. Use strict type identity, fall back to the
+    default whenever the saved value is the wrong shape, and log
+    so an operator can see the bad row.
+    """
+    raw_completed = settings.get("include_completed", False)
+    raw_stale = settings.get("include_stale", True)
+    raw_stale_days = settings.get("stale_days", 7)
+    if type(raw_completed) is not bool:
+        log.warning(
+            "scheduler_settings_include_completed_bad_shape",
+            extra={"got": repr(raw_completed)},
+        )
+        raw_completed = False
+    if type(raw_stale) is not bool:
+        log.warning(
+            "scheduler_settings_include_stale_bad_shape",
+            extra={"got": repr(raw_stale)},
+        )
+        raw_stale = True
+    if type(raw_stale_days) is not int or raw_stale_days < 0 or raw_stale_days > 3650:
+        log.warning(
+            "scheduler_settings_stale_days_bad_shape",
+            extra={"got": repr(raw_stale_days)},
+        )
+        raw_stale_days = 7
+    return raw_completed, raw_stale, raw_stale_days
+
+
 async def collect_tasks_for_user(
     conn,
     *,
     user_id: str,
     settings: dict,
     now: datetime,
-) -> list[dict]:
+    fetch_limit: int = 50,
+) -> tuple[list[dict], bool, int]:
     """Fetch the tasks the digest should mention for this user.
 
-    Honors per-pref settings:
+    Returns (tasks, has_more, total_count). Codex chunk-10-step4-
+    close (d): the digest builder needs to know whether the list
+    was truncated so it can render an honest 'and N more' line
+    instead of a silent cut. We do COUNT(*) OVER() to get the
+    full match count, but cap the rendered list at fetch_limit.
+
+    Honors per-pref settings (validated + normalized):
       include_completed: bool   include status='done' rows? (default false)
       include_stale:     bool   include rows whose due_at is older than now?
                                   (default true)
@@ -143,16 +187,13 @@ async def collect_tasks_for_user(
                                   (default 7; ignored when include_stale=false)
 
     Visibility scoping mirrors auth.py: the user sees tasks for any
-    business they have an active membership in. Owner role isn't a
-    factor here — owners and admins both see what they have access
-    to.
+    business they have an active membership in AND the business
+    itself is still active.
     """
     if now.tzinfo is None:
         raise ValueError("collect_tasks_for_user requires a tz-aware now")
 
-    include_completed = bool(settings.get("include_completed", False))
-    include_stale = bool(settings.get("include_stale", True))
-    stale_days = int(settings.get("stale_days", 7))
+    include_completed, include_stale, stale_days = _normalize_settings(settings)
     stale_floor = now - timedelta(days=stale_days)
 
     # Build the status filter inline per user. Default to open.
@@ -166,6 +207,12 @@ async def collect_tasks_for_user(
     # value differs.
     threshold = stale_floor if include_stale else now
 
+    # Codex chunk-10-step4-close BLOCKER 2: visibility EXISTS must
+    # join through `businesses` and require deletion_state='active'.
+    # Otherwise a task linked only to a soft-deleted business leaks
+    # into the digest. Mirrors the auth.py shape.
+    # Codex (d): COUNT(*) OVER() carries the full match count past
+    # the LIMIT so the digest builder can show 'and N more' honestly.
     sql = f"""
         SELECT t.id::text                     AS id,
                t.summary                      AS summary,
@@ -181,27 +228,33 @@ async def collect_tasks_for_user(
                        ORDER BY b.slug
                    ),
                    ARRAY[]::text[]
-               )                              AS businesses
+               )                              AS businesses,
+               COUNT(*) OVER()                AS total_count
           FROM tasks t
          WHERE EXISTS (
                    SELECT 1
                      FROM task_businesses tb
                      JOIN business_memberships bm
                        ON bm.business_id = tb.business_id
+                     JOIN businesses b
+                       ON b.id = tb.business_id
                     WHERE tb.task_id = t.id
                       AND bm.user_id = $1::uuid
                       AND bm.status = 'active'
+                      AND b.deletion_state = 'active'
                )
            AND t.deletion_state = 'active'
            AND {status_clause}
            AND (t.due_at IS NULL OR t.due_at >= $2::timestamptz)
          ORDER BY t.due_at NULLS LAST, t.priority NULLS LAST, t.created_at DESC
-         LIMIT 50
+         LIMIT $3::int
     """
 
-    rows = await conn.fetch(sql, user_id, threshold)
+    rows = await conn.fetch(sql, user_id, threshold, fetch_limit)
+    total_count = int(rows[0]["total_count"]) if rows else 0
+    has_more = total_count > fetch_limit
 
-    return [
+    items = [
         {
             "id": r["id"],
             "summary": r["summary"],
@@ -212,6 +265,7 @@ async def collect_tasks_for_user(
         }
         for r in rows
     ]
+    return items, has_more, total_count
 
 
 def idempotency_key(pref_id: str, scheduled_for: datetime) -> str:

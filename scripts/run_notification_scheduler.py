@@ -81,6 +81,7 @@ async def main_async(args: argparse.Namespace) -> int:
         considered = 0
         emitted = 0
         skipped_channel = 0
+        errors = 0
         async with pool.acquire() as conn:
             async for due in collect_due_prefs(
                 conn, now=now, lookback_minutes=lookback
@@ -91,65 +92,81 @@ async def main_async(args: argparse.Namespace) -> int:
                     continue
                 if args.limit and emitted >= args.limit:
                     break
-                tasks = await collect_tasks_for_user(
-                    conn,
-                    user_id=due.user_id,
-                    settings=due.settings,
-                    now=now,
-                )
-                user_dict = {
-                    "id": due.user_id,
-                    "email": due.user_email,
-                    "display_name": due.user_display_name,
-                    "timezone": due.user_timezone,
-                }
-                pref_dict = {
-                    "id": due.pref_id,
-                    "channel": due.channel,
-                    "schedule": due.schedule,
-                    "settings": due.settings,
-                }
-                payload = build_digest_payload(
-                    user=user_dict,
-                    pref=pref_dict,
-                    tasks=tasks,
-                    scheduled_for=due.scheduled_for,
-                )
-                key = idempotency_key(due.pref_id, due.scheduled_for)
-                tag = "[DRY-RUN]" if not claim_mode else "[CLAIM]"
-                delivery_id = None
-                if claim_mode:
-                    delivery_id = await claim_delivery(
-                        conn, due=due, payload=payload,
+                # Codex chunk-10-step4-close (i): per-pref try /
+                # except / continue so one user's bad row doesn't
+                # crash the whole scheduler run. Exit 2 escalates
+                # at the end if any per-pref errors occurred.
+                try:
+                    tasks, has_more, total_count = await collect_tasks_for_user(
+                        conn,
+                        user_id=due.user_id,
+                        settings=due.settings,
+                        now=now,
                     )
-                    if delivery_id is None:
-                        # Lost the race or already-claimed; skip
-                        # without counting as an emission.
-                        print(
-                            f"[CLAIM-SKIP] {due.scheduled_for.isoformat()} "
-                            f"channel={due.channel} "
-                            f"user={due.user_display_name or due.user_email or due.user_id} "
-                            f"key={key} "
-                            f"reason=already_claimed"
+                    user_dict = {
+                        "id": due.user_id,
+                        "email": due.user_email,
+                        "display_name": due.user_display_name,
+                        "timezone": due.user_timezone,
+                    }
+                    pref_dict = {
+                        "id": due.pref_id,
+                        "channel": due.channel,
+                        "schedule": due.schedule,
+                        "settings": due.settings,
+                    }
+                    payload = build_digest_payload(
+                        user=user_dict,
+                        pref=pref_dict,
+                        tasks=tasks,
+                        scheduled_for=due.scheduled_for,
+                        total_count=total_count,
+                    )
+                    key = idempotency_key(due.pref_id, due.scheduled_for)
+                    tag = "[DRY-RUN]" if not claim_mode else "[CLAIM]"
+                    delivery_id = None
+                    if claim_mode:
+                        delivery_id = await claim_delivery(
+                            conn, due=due, payload=payload,
                         )
-                        continue
-                # Single-line summary so each emit is greppable in
-                # journalctl.
-                print(
-                    f"{tag} {due.scheduled_for.isoformat()} "
-                    f"channel={due.channel} "
-                    f"user={due.user_display_name or due.user_email or due.user_id} "
-                    f"tasks={len(tasks)} "
-                    f"key={key} "
-                    f"delivery_id={delivery_id or '-'} "
-                    f"title={payload['title']!r}"
-                )
-                emitted += 1
+                        if delivery_id is None:
+                            print(
+                                f"[CLAIM-SKIP] {due.scheduled_for.isoformat()} "
+                                f"channel={due.channel} "
+                                f"user={due.user_display_name or due.user_email or due.user_id} "
+                                f"key={key} "
+                                f"reason=already_claimed"
+                            )
+                            continue
+                    print(
+                        f"{tag} {due.scheduled_for.isoformat()} "
+                        f"channel={due.channel} "
+                        f"user={due.user_display_name or due.user_email or due.user_id} "
+                        f"tasks={len(tasks)} "
+                        f"total={total_count} "
+                        f"key={key} "
+                        f"delivery_id={delivery_id or '-'} "
+                        f"title={payload['title']!r}"
+                    )
+                    emitted += 1
+                except Exception:
+                    errors += 1
+                    log.exception(
+                        "scheduler_pref_error",
+                        extra={
+                            "pref_id": due.pref_id,
+                            "user_id": due.user_id,
+                            "channel": due.channel,
+                        },
+                    )
+                    continue
         tag = "[DRY-RUN]" if not claim_mode else "[CLAIM]"
         print(
             f"{tag} considered={considered} emitted={emitted} "
-            f"skipped_channel={skipped_channel}"
+            f"skipped_channel={skipped_channel} errors={errors}"
         )
+        if errors > 0:
+            return 2
         return 0
     finally:
         await pool.close()

@@ -160,9 +160,31 @@ def _enforce_production_safety() -> None:
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
+def _enforce_tzdata_present() -> None:
+    """Fail fast if the deploy is missing IANA tz data.
+
+    Codex chunk-10-step4-close (j): a defensive import is useless
+    because zoneinfo imports succeed even with no tzdata. Resolve
+    a known zone at startup; ZoneInfoNotFoundError means the base
+    image needs the tzdata system package or the tzdata pip
+    package. The notification scheduler relies on this at fire
+    time and the digest builder embeds tz-aware ISO strings.
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo("America/Phoenix")
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(
+            "tz data missing: ZoneInfo('America/Phoenix') not "
+            "found. Install the tzdata OS package (apt: tzdata) "
+            "or pip install tzdata."
+        ) from exc
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _enforce_production_safety()
+    _enforce_tzdata_present()
     # Chunk 10 step 2: VAPID config validation runs BEFORE init_pool
     # (Codex chunk-10-step2 review (f)). Cleanly-unconfigured is OK
     # (Web Push just returns 503). Partially-configured / malformed

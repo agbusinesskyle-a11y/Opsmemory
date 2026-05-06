@@ -52,6 +52,7 @@ def build_digest_payload(
     pref: dict,
     tasks: list[dict],
     scheduled_for: datetime,
+    total_count: int | None = None,
 ) -> dict[str, Any]:
     """Build the payload dict for one (user, pref, tasks) digest.
 
@@ -65,12 +66,18 @@ def build_digest_payload(
     tasks:   ordered list. Each task: {id, summary, status,
                 priority, due_iso, businesses[]}.
     scheduled_for: tz-aware UTC datetime.
+    total_count: full match count BEFORE the scheduler's LIMIT
+                 truncation. When provided and > len(tasks), the
+                 title and body reflect the true total and the
+                 'and N more' overflow line uses the truncation
+                 delta honestly. Codex chunk-10-step4-close (d).
 
     Returns a payload dict per the module docstring contract.
     """
     if scheduled_for.tzinfo is None:
         raise ValueError("scheduled_for must be tz-aware")
-    n = len(tasks)
+    rendered = len(tasks)
+    n = total_count if total_count is not None and total_count >= rendered else rendered
     channel = pref["channel"]
     pref_id = pref["id"]
 
@@ -86,13 +93,14 @@ def build_digest_payload(
             line = "• " + _truncate(t.get("summary", ""), _BODY_LINE_MAX)
             line += _format_due(t.get("due_iso"))
             body_lines.append(line)
+        # Overflow line is honest about the FULL total (n) minus
+        # what the body has rendered, not just the slice we got.
         if n > _MAX_BODY_TASKS:
             body_lines.append(f"…and {n - _MAX_BODY_TASKS} more.")
         body = "\n".join(body_lines)
-        # When there's exactly one task, surface its id so the
-        # notification click deep-links straight to it. With many
-        # tasks, omit task_id so click lands on the tasks tab.
-        task_id = tasks[0]["id"] if n == 1 else None
+        # When there's exactly one task overall, surface its id so
+        # the notification click deep-links straight to it.
+        task_id = tasks[0]["id"] if n == 1 and rendered == 1 else None
 
     items = [
         {
