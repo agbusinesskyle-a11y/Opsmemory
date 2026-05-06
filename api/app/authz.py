@@ -57,6 +57,14 @@ SCOPE_BUSINESSES_READ = "businesses:read"
 # read all businesses through the API.
 SCOPE_PIPELINE_READ_ALL = "pipeline:read:all_businesses"
 
+# Chunk 8: Slack /tasks slash-command bridge. n8n verifies Slack
+# signing, normalizes the payload, then POSTs /v1/slack/tasks with a
+# service key holding this scope. The endpoint maps the Slack
+# user_id to a canonical OpsMemory user and applies that user's
+# visibility semantics — the service key itself does NOT see all
+# tasks, it just authenticates the n8n forwarder.
+SCOPE_SLACK_QUERY = "slack:query"
+
 
 def require_scope(principal: Principal, scope: str) -> None:
     """Allow if principal is admin user OR service-with-scope.

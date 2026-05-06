@@ -28,6 +28,7 @@ from .v1 import router as v1_router
 from .v1_ingest import router as v1_ingest_router
 from .v1_mutations import router as v1_mutations_router
 from .v1_review import router as v1_review_router
+from .v1_slack_tasks import router as v1_slack_tasks_router
 from .v1_sops import router as v1_sops_router
 
 # ---------------------------------------------------------------------------
@@ -186,6 +187,7 @@ app.include_router(v1_ingest_router)
 app.include_router(v1_review_router)
 app.include_router(v1_mutations_router)
 app.include_router(v1_sops_router)
+app.include_router(v1_slack_tasks_router)
 
 
 # ---------------------------------------------------------------------------
