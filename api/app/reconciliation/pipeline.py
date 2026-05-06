@@ -23,10 +23,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from .extract import extract_meeting_recap
+from .extract import extract
 from .normalize import normalize_candidates
 from .retrieve import retrieve_candidates
 from .choose import choose_action
+from .sources import get_source_config
 from .validate import validate_decision
 
 log = logging.getLogger("opsmemory.reconciliation.pipeline")
@@ -95,10 +96,17 @@ async def _resolve_actor_business_ids(conn, event) -> list[str] | None:
         )
         return [r["id"] for r in biz_rows]
     if actor_type == "service" and event["actor_service_account_id"]:
-        # Service accounts in chunk1 don't have per-business scoping yet;
-        # treat as visible to all businesses they're explicitly granted.
-        # For now: empty list (nothing visible) until per-service biz
-        # grants land. Caller treats [] as "no businesses visible".
+        # Service accounts that hold the `ingest:write` scope are
+        # trusted infra (n8n forwards, doc ingesters); they need to
+        # see all businesses for retrieval, otherwise Slack/email/Excel
+        # ingest events would skip retrieval and produce only
+        # AMBIGUOUS/CREATE proposals (Codex chunk-5-step1 flag).
+        row = await conn.fetchrow(
+            "SELECT scopes FROM service_accounts WHERE id = $1::uuid",
+            event["actor_service_account_id"],
+        )
+        if row and "ingest:write" in (row["scopes"] or []):
+            return None
         return []
     # Fallback: no scoping derivable; refuse to mass-leak — empty.
     return []
@@ -118,21 +126,32 @@ async def process_event(conn, event_id: str) -> dict:
         "SELECT id::text AS id, source, raw_content, status::text AS status, "
         "       retry_count, actor_type, "
         "       actor_user_id::text AS actor_user_id, "
-        "       actor_service_account_id::text AS actor_service_account_id "
+        "       actor_service_account_id::text AS actor_service_account_id, "
+        "       source_metadata "
         "FROM ingest_events WHERE id = $1::uuid",
         event_id,
     )
     if not event:
         return {"event_id": event_id, "status": "missing"}
-    if event["source"] != "meeting_recap":
-        # Other sources land in later chunks (Slack, email, Excel, SOP).
-        # Roll back the claim so the event isn't stuck in 'extracting'.
+
+    # Source registry: refuse anything not configured. This prevents a
+    # forgotten source registration from quietly stranding ingest_events
+    # in 'extracting' (the worker's stale-recovery would just re-claim
+    # them forever). The event is marked failed with a clear error so
+    # operator monitoring catches it.
+    source_config = get_source_config(event["source"])
+    if source_config is None:
         await conn.execute(
-            "UPDATE ingest_events SET status = 'received', processing_started_at = NULL "
-            "WHERE id = $1::uuid",
+            "UPDATE ingest_events SET status = 'failed', failed_at = now(), "
+            "error = $2, retry_count = retry_count + 1 WHERE id = $1::uuid",
             event_id,
+            f"source {event['source']!r} not registered in reconciliation/sources.py",
         )
-        return {"event_id": event_id, "status": "skipped", "reason": f"source={event['source']!r} not handled in chunk3"}
+        log.warning("pipeline_unregistered_source",
+                    extra={"event_id": event_id, "source": event["source"]})
+        return {"event_id": event_id, "status": "failed",
+                "stage": "source_registry",
+                "reason": f"source={event['source']!r} not registered"}
 
     actor_business_ids = await _resolve_actor_business_ids(conn, event)
 
@@ -140,7 +159,12 @@ async def process_event(conn, event_id: str) -> dict:
     try:
         async def on_extract_call(call):
             await _record_llm_call(conn, ingest_event_id=event_id, review_item_id=None, call=call)
-        candidates_raw, _ = await extract_meeting_recap(event["raw_content"], on_call=on_extract_call)
+        candidates_raw, _ = await extract(
+            source_config=source_config,
+            raw_content=event["raw_content"],
+            source_metadata=event["source_metadata"],
+            on_call=on_extract_call,
+        )
     except Exception as exc:
         await conn.execute(
             "UPDATE ingest_events SET status = 'failed', failed_at = now(), "
@@ -180,6 +204,8 @@ async def process_event(conn, event_id: str) -> dict:
             conn, cand,
             business_id_by_slug=business_id_by_slug,
             actor_business_ids=actor_business_ids,
+            due_window_days=source_config.retrieval_due_window_days,
+            recency_fallback_days=source_config.retrieval_recency_fallback_days,
         )
 
         async def on_choose_call_for_cand(call):
@@ -191,6 +217,7 @@ async def process_event(conn, event_id: str) -> dict:
             decision, _ = await choose_action(
                 cand, retrieved,
                 retrieval_skipped=retrieval_skipped,
+                prompt_name=source_config.choose_prompt,
                 on_call=on_choose_call_for_cand,
             )
         except Exception as exc:

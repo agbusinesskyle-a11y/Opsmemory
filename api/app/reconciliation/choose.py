@@ -26,6 +26,7 @@ async def choose_action(
     retrieved: list[dict],
     *,
     retrieval_skipped: bool = False,
+    prompt_name: str = "task_choose.v1",
     on_call=None,
 ) -> tuple[dict, Any | None]:
     """Run the choose step. Returns (decision_dict, llm_call_record_or_None).
@@ -65,7 +66,7 @@ async def choose_action(
             None,
         )
 
-    template, body, digest = load_prompt("meeting_recap_choose.v1")
+    template, body, digest = load_prompt(prompt_name)
     candidate_json = json.dumps(candidate, indent=2, default=str)
     retrieved_json = json.dumps(retrieved, indent=2, default=str)
     prompt = body.replace("{{CANDIDATE_JSON}}", candidate_json) \

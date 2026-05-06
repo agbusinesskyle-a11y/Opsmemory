@@ -32,6 +32,8 @@ async def retrieve_candidates(
     top_n: int = DEFAULT_TOP_N,
     business_id_by_slug: dict[str, str] | None = None,
     actor_business_ids: list[str] | None = None,
+    due_window_days: int = 30,
+    recency_fallback_days: int | None = None,
 ) -> tuple[list[dict], bool]:
     """Return (matches, retrieval_skipped).
 
@@ -76,17 +78,23 @@ async def retrieve_candidates(
             # so the reviewer (admin) sees it.
             return [], True
 
-    # Optional time window: +/- 30 days from candidate.due_at, if set.
+    # Optional time window: ± due_window_days from candidate.due_at, if set.
+    # When candidate has no due_at, fall back to a recency window on
+    # tasks.last_activity_at (used by Slack — present-tense messages
+    # shouldn't match against tasks dormant for years).
     due_iso = candidate.get("due_at")
     time_low: datetime | None = None
     time_high: datetime | None = None
+    recency_low: datetime | None = None
     if due_iso:
         try:
             due_dt = datetime.fromisoformat(due_iso.replace("Z", "+00:00"))
-            time_low = due_dt - timedelta(days=30)
-            time_high = due_dt + timedelta(days=30)
+            time_low = due_dt - timedelta(days=due_window_days)
+            time_high = due_dt + timedelta(days=due_window_days)
         except (ValueError, TypeError):
             pass
+    elif recency_fallback_days is not None:
+        recency_low = datetime.now(timezone.utc) - timedelta(days=recency_fallback_days)
 
     # Lexical match. Use simple `ILIKE %word%` per token to keep this
     # working without a trigram extension. When pg_trgm is added later,
@@ -113,6 +121,12 @@ async def retrieve_candidates(
         where.append(
             f"(t.due_at IS NULL OR (t.due_at >= {p(time_low.isoformat())}::timestamptz "
             f"AND t.due_at <= {p(time_high.isoformat())}::timestamptz))"
+        )
+    elif recency_low is not None:
+        # No due hint, source set a recency fallback (Slack 14d).
+        # last_activity_at is non-null on every task, so no IS NULL escape.
+        where.append(
+            f"t.last_activity_at >= {p(recency_low.isoformat())}::timestamptz"
         )
 
     if tokens:
