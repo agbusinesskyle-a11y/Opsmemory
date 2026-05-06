@@ -2,3 +2,9 @@ fastapi==0.115.5
 uvicorn[standard]==0.32.1
 asyncpg==0.30.0
 PyJWT[crypto]==2.10.1
+# Chunk 9 step 3: server-side XLSX parsing for file_drop ingest.
+# openpyxl reads the XLSX (a ZIP container of XML); defusedxml hardens
+# the XML parser against billion-laughs / external-entity attacks
+# (openpyxl's PyPI page flags this as opt-in).
+openpyxl==3.1.5
+defusedxml==0.7.1

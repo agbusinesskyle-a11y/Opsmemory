@@ -37,10 +37,15 @@ from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .auth import Principal, require_principal
 from .authz import SCOPE_INGEST_WRITE, require_scope
+
+# xlsx_decode imports openpyxl + defusedxml. Lazy-import inside the
+# endpoint so the API still boots when those deps aren't installed
+# (e.g. a partial deploy where requirements.txt didn't update before
+# the API restarted).
 
 log = logging.getLogger("opsmemory.v1_ingest")
 
@@ -534,11 +539,19 @@ class FileDropIngest(BaseModel):
     mime_type: str = Field(..., min_length=1, max_length=128,
                             description="MIME type as reported by Drive (e.g. 'text/csv', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet').")
     filename: str = Field(..., min_length=1, max_length=512)
-    file_content: str = Field(..., min_length=1, max_length=200_000,
-                                description="Text representation of the file. n8n is "
-                                            "responsible for converting Excel to CSV when "
-                                            "needed; the parser commit (step 2) will "
-                                            "handle structured-row extraction.")
+    file_content: str | None = Field(
+        default=None, min_length=1, max_length=200_000,
+        description="Text representation of the file (CSV / plain text). "
+                    "Mutually exclusive with xlsx_base64.")
+    xlsx_base64: str | None = Field(
+        default=None, min_length=1, max_length=8_000_000,
+        description="Base64-encoded XLSX bytes (Chunk 9 step 3). "
+                    "OpsMemory decodes server-side via openpyxl, "
+                    "selects a sheet ('Tasks' if present, else the "
+                    "first visible sheet with a recognizable task "
+                    "header), converts to CSV, then runs the existing "
+                    "CSV parser path. Mutually exclusive with file_content. "
+                    "8MB base64 cap = ~6MB raw XLSX.")
     business_slug: str = Field(..., min_length=1, max_length=64,
                                  description="Business this file is associated with. n8n "
                                              "maps Drive folder -> business slug; "
@@ -553,6 +566,22 @@ class FileDropIngest(BaseModel):
                                             description="Drive file owner email, for audit.")
     extra: dict[str, Any] = Field(default_factory=dict,
                                     description="Free-form context from n8n forward.")
+
+    @model_validator(mode="after")
+    def _exactly_one_body(self):
+        # Codex chunk-9-step2 STEP 3 PLAN: require exactly one of
+        # file_content / xlsx_base64. n8n picks based on Drive's MIME.
+        has_text = self.file_content is not None
+        has_xlsx = self.xlsx_base64 is not None
+        if has_text and has_xlsx:
+            raise ValueError(
+                "exactly one of file_content / xlsx_base64 may be set"
+            )
+        if not has_text and not has_xlsx:
+            raise ValueError(
+                "one of file_content / xlsx_base64 must be set"
+            )
+        return self
 
 
 @router.post("/file_drop")
@@ -591,31 +620,56 @@ async def ingest_file_drop(
         )
     require_scope(principal, SCOPE_INGEST_WRITE)
 
-    # Codex chunk-9-step1 close-fix: reject bytes that look like a
-    # ZIP / XLSX container BEFORE canonicalization. n8n is supposed to
-    # convert binary formats to text; if raw bytes leak through,
-    # surface 415 instead of queuing garbage.
-    if _looks_like_zip_or_xlsx(body.file_content):
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail={"code": "binary_content_unsupported",
-                    "detail": "file_content looks like a ZIP/XLSX binary; "
-                              "n8n should convert to CSV before posting"},
-        )
-
     # Codex chunk-9-step1 close-fix: parse + canonicalize modified_time
     # so source_external_id is deterministic across timezones / Drive
     # serialization variants.
     canonical_modified_time = _parse_drive_modified_time(body.modified_time)
 
-    # Codex chunk-9-step1 close-fix: file_drop content gets a
-    # CSV-safe normalizer (line-ending only) instead of canonicalize()
-    # which would collapse meaningful whitespace inside CSV cells.
-    canonical = canonicalize_file_drop(body.file_content)
+    # Server-side XLSX path (Chunk 9 step 3). When the body carries
+    # xlsx_base64, decode -> pick sheet -> CSV. Reuses the existing
+    # CSV parser path downstream. Decode failures map to a meaningful
+    # 4xx with a code field instead of a 500.
+    xlsx_decode_metadata: dict[str, Any] | None = None
+    if body.xlsx_base64 is not None:
+        try:
+            from .xlsx_decode import XlsxDecodeError, decode_xlsx_to_csv
+        except ImportError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "xlsx_decode_unavailable",
+                        "detail": "openpyxl/defusedxml not installed on this "
+                                  "API instance; reinstall requirements.txt "
+                                  "and restart"},
+            )
+        try:
+            csv_text, xlsx_decode_metadata = decode_xlsx_to_csv(body.xlsx_base64)
+        except XlsxDecodeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": exc.code, "detail": exc.detail},
+            )
+        canonical = canonicalize_file_drop(csv_text)
+    else:
+        # Codex chunk-9-step1 close-fix: reject bytes that look like a
+        # ZIP / XLSX container BEFORE canonicalization. With xlsx_base64
+        # now the proper channel for binary, file_content is required
+        # to be already-text.
+        if _looks_like_zip_or_xlsx(body.file_content or ""):
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail={"code": "binary_content_unsupported",
+                        "detail": "file_content looks like a ZIP/XLSX binary; "
+                                  "post the bytes via xlsx_base64 instead"},
+            )
+        # Codex chunk-9-step1 close-fix: file_drop content gets a
+        # CSV-safe normalizer (line-ending only) instead of canonicalize()
+        # which would collapse meaningful whitespace inside CSV cells.
+        canonical = canonicalize_file_drop(body.file_content or "")
+
     if len(canonical) < 1:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="file_content empty after canonicalization",
+            detail="file content empty after canonicalization",
         )
     hash_hex = content_hash(canonical)
 
@@ -687,6 +741,10 @@ async def ingest_file_drop(
             "business_id": biz["id"],
             "extra": body.extra,
         }
+        if xlsx_decode_metadata is not None:
+            # Chunk 9 step 3: surface XLSX provenance so the audit pane
+            # can show "from sheet 'Tasks' of permits.xlsx".
+            metadata["xlsx_decode"] = xlsx_decode_metadata
 
         try:
             row = await conn.fetchrow(
