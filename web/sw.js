@@ -26,7 +26,7 @@
 //   server sends Cache-Control: no-cache on /sw.js per main.py changes).
 //   Bumping BUILD invalidates old shell caches at activate time.
 
-const BUILD = 'c10s3c-deep-link';
+const BUILD = 'c10s3c-stub-version';
 const SHELL_CACHE = `opsmemory-shell-${BUILD}`;
 const TASKS_CACHE = `opsmemory-tasks-${BUILD}`;
 
@@ -295,7 +295,14 @@ function _resolveSafeTargetUrl(data) {
   if (data && typeof data.url === 'string' && data.url.length) {
     try {
       const u = new URL(data.url, ourOrigin);
-      if (u.origin === ourOrigin) return u.toString();
+      // Codex chunk-10-step3c-close: a same-origin blob: URL
+      // would also pass `u.origin === ourOrigin`. Tighten to
+      // require an http/https protocol so the function lives
+      // up to its safety claim.
+      if (u.origin === ourOrigin
+          && (u.protocol === 'http:' || u.protocol === 'https:')) {
+        return u.toString();
+      }
     } catch (_e) { /* fall through */ }
   }
   if (data && typeof data.task_id === 'string' && data.task_id.length) {

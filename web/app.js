@@ -3229,18 +3229,17 @@ async function _autoExpandDeepLinkedTask(taskId) {
     state.expandedTaskId = taskId;
     state.expandedTaskDetail = detail;
     // Inject a synthetic stub into state.tasks so the renderer
-    // has a row to anchor the expanded detail under. Marked with
-    // a flag so the renderer (and we) can tell it's deep-link-
-    // synthetic if needed.
-    const stubRow = {
-      id: detail.id,
-      summary: detail.summary,
-      status: detail.status,
-      priority: detail.priority,
-      due_iso: detail.due_iso,
-      businesses: detail.businesses || [],
-      _deep_link_only: true,
-    };
+    // has a row to anchor the expanded detail under.
+    //
+    // Codex chunk-10-step3c-close BLOCKER: the stub MUST mirror
+    // the shape of a list-row task (especially `version`),
+    // because Mark done / Reopen reads the row from state.tasks
+    // and sends `base_task_version: task.version` per
+    // api/app/v1_mutations.py. JSON.stringify drops undefined
+    // fields, so a stub without `version` ships a body the
+    // server 422s on. Forward every field the detail returned;
+    // unknown fields are harmless on the renderer side.
+    const stubRow = { ...detail, _deep_link_only: true };
     state.tasks = [stubRow, ...(state.tasks || [])];
     render();
   } catch (err) {
