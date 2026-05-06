@@ -66,18 +66,40 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             extra={"request_id": request_id, "method": request.method, "path": request.url.path},
         )
 
-        # Origin check on browser write requests (Chunk 1.5 step 10).
-        # Service-account requests bypass — they don't carry a browser Origin.
-        if request.method in WRITE_METHODS and not request.headers.get("X-OpsMemory-Service-Key"):
-            origin = request.headers.get("Origin", "")
-            if origin not in ALLOWED_ORIGINS:
+        # Origin enforcement on browser write requests (Chunk 1.5 step 10).
+        #
+        # Two rules, both enforced:
+        #   - If Origin header is PRESENT on a write, it MUST be in
+        #     ALLOWED_ORIGINS. (Browser write — must come from our own UI.)
+        #   - If Origin header is ABSENT on a write, the request MUST be
+        #     a service-key call. (Non-browser, machine-to-machine.)
+        # Mere presence of X-OpsMemory-Service-Key does NOT bypass an
+        # invalid Origin — both checks apply if Origin is present, so a
+        # leaked service key combined with a hijacked browser session
+        # still can't post from elsewhere.
+        if request.method in WRITE_METHODS:
+            origin = request.headers.get("Origin")  # None vs "" matters
+            has_service_key = bool(request.headers.get("X-OpsMemory-Service-Key"))
+            if origin is not None:
+                if origin not in ALLOWED_ORIGINS:
+                    log.info(
+                        "origin_rejected",
+                        extra={"request_id": request_id, "origin": origin, "method": request.method},
+                    )
+                    response = JSONResponse(
+                        status_code=403,
+                        content={"error": "origin_rejected", "request_id": request_id},
+                    )
+                    response.headers["X-Request-ID"] = request_id
+                    return response
+            elif not has_service_key:
                 log.info(
-                    "origin_rejected",
-                    extra={"request_id": request_id, "origin": origin or "(none)", "method": request.method},
+                    "origin_missing_no_service_key",
+                    extra={"request_id": request_id, "method": request.method},
                 )
                 response = JSONResponse(
                     status_code=403,
-                    content={"error": "origin_rejected", "request_id": request_id},
+                    content={"error": "origin_required", "request_id": request_id},
                 )
                 response.headers["X-Request-ID"] = request_id
                 return response

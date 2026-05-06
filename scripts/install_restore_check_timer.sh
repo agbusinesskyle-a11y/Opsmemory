@@ -60,7 +60,10 @@ Wants=network-online.target
 Type=oneshot
 EnvironmentFile=$ENV_FILE
 # Same flock as the daily backup — won't overlap with a fresh backup.
-ExecStartPre=/usr/bin/python3 ${REPO_DIR}/scripts/validate_env.py --quiet
+# --use-environ reads os.environ (already populated by systemd's
+# EnvironmentFile=) so we don't re-open the .env file as the opsmemory
+# user (which can fail if its group ownership has drifted).
+ExecStartPre=/usr/bin/python3 ${REPO_DIR}/scripts/validate_env.py --use-environ --quiet
 ExecStart=$WRAPPER
 User=opsmemory
 Group=opsmemory

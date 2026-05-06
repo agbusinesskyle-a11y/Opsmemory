@@ -78,8 +78,13 @@ SCHEMA: tuple[Var, ...] = (
         "Email of the seeded dev user (must exist in users table)."),
     Var("ALLOW_DEV_USER_SWITCH", lambda e: False,
         "true | false. Production forbids true."),
-    Var("SERVICE_KEY_PEPPER", lambda e: True,
-        "32-byte random hex for service-account HMAC."),
+    # SERVICE_KEY_PEPPER (legacy, no version) is required UNLESS the operator
+    # configured the versioned scheme. With versioning, the versioned envs
+    # are required instead. validate_env doesn't enumerate every possible
+    # version key; it just checks that one of the two schemes is present.
+    Var("SERVICE_KEY_PEPPER",
+        lambda e: not bool(e.get("SERVICE_KEY_PEPPER_ACTIVE_VERSION", "").strip()),
+        "32-byte random hex for service-account HMAC. Replace with versioned scheme for rotation."),
 
     # Database
     Var("DATABASE_URL", lambda e: True,

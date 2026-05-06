@@ -101,33 +101,53 @@ def insert_service_account(
     expires_at: datetime | None,
     pepper_version: str,
 ) -> None:
+    """Insert via psql -v parameterized variables.
+
+    `:'varname'` in the SQL body is replaced by psql with a properly
+    quoted SQL string literal (single quotes doubled for embedded
+    quotes). This prevents SQL injection from operator-controlled
+    --description text. We pass each value as -v key=value; psql does
+    the escaping.
+    """
     container = os.environ.get("POSTGRES_CONTAINER", "postgres")
     role = os.environ.get("ACTION_TRACKER_DB_ROLE", "opsmemory_owner")
     db = os.environ.get("ACTION_TRACKER_DB_NAME", "action_tracker")
 
     metadata = json.dumps({"pepper_version": pepper_version})
-    scopes_array = "ARRAY[" + ",".join(f"'{s}'" for s in scopes) + "]::text[]" if scopes else "ARRAY[]::text[]"
-    expires_clause = f"'{expires_at.isoformat()}'::timestamptz" if expires_at else "NULL"
+    scopes_csv = ",".join(scopes)  # empty string when no scopes
+    expires_iso = expires_at.isoformat() if expires_at else ""
 
+    # psql accepts -v key=value pairs; the SQL body references them
+    # as :'name' for quoted-string literals or :"name" for identifiers.
+    # We use :'name' for all values here. NULL handling for expires_at
+    # is done via NULLIF — empty string from -v becomes SQL NULL.
     sql = (
         "INSERT INTO service_accounts "
         "(name, description, role, status, key_prefix, key_hash, scopes, expires_at, metadata) "
         "VALUES ("
-        f"'{name}', "
-        f"'{description}', "
+        ":'name', "
+        ":'description', "
         "'service', 'active', "
-        f"'{kid}', "
-        f"'{key_hash}', "
-        f"{scopes_array}, "
-        f"{expires_clause}, "
-        f"'{metadata}'::jsonb"
+        ":'kid', "
+        ":'key_hash', "
+        "string_to_array(NULLIF(:'scopes_csv', ''), ',')::text[], "
+        "CASE WHEN :'expires_iso' = '' THEN NULL ELSE :'expires_iso'::timestamptz END, "
+        ":'metadata_json'::jsonb"
         ");"
     )
 
     proc = subprocess.run(
         [
             "docker", "exec", "-i", container, "psql",
-            "-U", role, "-d", db, "-v", "ON_ERROR_STOP=1",
+            "-U", role, "-d", db,
+            "-v", "ON_ERROR_STOP=1",
+            "-v", f"name={name}",
+            "-v", f"description={description}",
+            "-v", f"kid={kid}",
+            "-v", f"key_hash={key_hash}",
+            "-v", f"scopes_csv={scopes_csv}",
+            "-v", f"expires_iso={expires_iso}",
+            "-v", f"metadata_json={metadata}",
             "-c", sql,
         ],
         capture_output=True, text=True,

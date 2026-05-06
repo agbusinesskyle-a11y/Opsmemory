@@ -52,11 +52,12 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=$ENV_FILE
-# Preflight: validate .env before doing any work. ExecStartPre exits non-zero
-# if env is invalid, which prevents the backup from running with a broken
-# config (e.g. placeholder DSN, missing CF_ACCESS_AUD, dev-mode flags in
-# production).
-ExecStartPre=/usr/bin/python3 ${REPO_DIR}/scripts/validate_env.py --quiet
+# Preflight: validate the env that systemd already loaded via
+# EnvironmentFile=. Use --use-environ so we read os.environ (already
+# populated by systemd) instead of re-reading and re-parsing .env from
+# disk, which avoids opening the .env file as the opsmemory user
+# (which can fail if a sed -i has reset its group ownership).
+ExecStartPre=/usr/bin/python3 ${REPO_DIR}/scripts/validate_env.py --use-environ --quiet
 # run_backup.sh acquires flock on /var/lib/opsmemory/backup/.lock before
 # invoking pwsh, preventing concurrent backups or backup/restore-check
 # overlap (which could otherwise grab a half-written dump).

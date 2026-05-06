@@ -92,57 +92,71 @@ def validate(owner: dict[str, Any]) -> None:
             )
 
 
-def build_sql(owners: list[dict[str, Any]]) -> str:
-    parts: list[str] = ["BEGIN;"]
-    for o in owners:
-        parts.append(
-            "INSERT INTO users (id, email, display_name, role) VALUES "
-            f"('{o['id']}', '{o['email']}', "
-            f"$OPSMEMSEED${o['display_name']}$OPSMEMSEED$, '{o['role']}') "
-            "ON CONFLICT (id) DO UPDATE SET "
-            "email = EXCLUDED.email, "
-            "display_name = EXCLUDED.display_name, "
-            "role = EXCLUDED.role, "
-            "updated_at = now();"
-        )
-        parts.append(
-            "INSERT INTO user_identities (user_id, provider, provider_subject, email) VALUES "
-            f"('{o['id']}', 'cloudflare_access', NULL, '{o['email']}') "
-            "ON CONFLICT (provider, email) DO UPDATE SET "
-            "user_id = EXCLUDED.user_id, "
-            "updated_at = now();"
-        )
-        for slug in o.get("businesses", []):
-            biz_id = DEFAULT_BUSINESS_IDS[slug]
-            parts.append(
-                "INSERT INTO business_memberships (business_id, user_id, role) VALUES "
-                f"('{biz_id}', '{o['id']}', '{o['role']}') "
-                "ON CONFLICT (business_id, user_id) DO UPDATE SET "
-                "role = EXCLUDED.role, "
-                "updated_at = now();"
-            )
-    parts.append("COMMIT;")
-    return "\n".join(parts)
+def apply_via_psql(args: list[str], sql_body: str) -> None:
+    """Run psql with -v args, piping a multi-statement SQL body to stdin.
 
-
-def apply_sql(sql: str) -> None:
+    Used for the seed transaction. psql interpolates :'varname' in the
+    body using safe SQL-literal escaping, eliminating the SQL-injection
+    risk that f-string interpolation has with operator-controlled
+    display_name / email.
+    """
     container = os.environ.get("POSTGRES_CONTAINER", "postgres")
     role = os.environ.get("ACTION_TRACKER_DB_ROLE", "opsmemory_owner")
     db = os.environ.get("ACTION_TRACKER_DB_NAME", "action_tracker")
-
-    print(f"Applying seed via docker exec {container} psql -U {role} -d {db}")
-    proc = subprocess.run(
-        ["docker", "exec", "-i", container, "psql", "-U", role, "-d", db,
-         "-v", "ON_ERROR_STOP=1"],
-        input=sql,
-        text=True,
-        capture_output=True,
-    )
+    cmd = ["docker", "exec", "-i", container, "psql",
+           "-U", role, "-d", db, "-v", "ON_ERROR_STOP=1"] + args
+    proc = subprocess.run(cmd, input=sql_body, text=True, capture_output=True)
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout)
         sys.stderr.write(proc.stderr)
         raise SystemExit(f"ERROR: seed psql exited {proc.returncode}")
     print(proc.stdout.strip() or "ok")
+
+
+def seed_one_owner(owner: dict[str, Any]) -> None:
+    """Apply the three INSERT/UPSERT statements for a single owner via psql -v."""
+    sql = """
+INSERT INTO users (id, email, display_name, role) VALUES
+  (:'id'::uuid, :'email', :'display_name', :'role')
+ON CONFLICT (id) DO UPDATE SET
+  email = EXCLUDED.email,
+  display_name = EXCLUDED.display_name,
+  role = EXCLUDED.role,
+  updated_at = now();
+
+INSERT INTO user_identities (user_id, provider, provider_subject, email) VALUES
+  (:'id'::uuid, 'cloudflare_access', NULL, :'email')
+ON CONFLICT (provider, email) DO UPDATE SET
+  user_id = EXCLUDED.user_id,
+  updated_at = now();
+""".strip()
+    apply_via_psql(
+        [
+            "-v", f"id={owner['id']}",
+            "-v", f"email={owner['email']}",
+            "-v", f"display_name={owner['display_name']}",
+            "-v", f"role={owner['role']}",
+        ],
+        sql,
+    )
+
+    for slug in owner.get("businesses", []):
+        biz_id = DEFAULT_BUSINESS_IDS[slug]
+        membership_sql = """
+INSERT INTO business_memberships (business_id, user_id, role) VALUES
+  (:'biz_id'::uuid, :'user_id'::uuid, :'role')
+ON CONFLICT (business_id, user_id) DO UPDATE SET
+  role = EXCLUDED.role,
+  updated_at = now();
+""".strip()
+        apply_via_psql(
+            [
+                "-v", f"biz_id={biz_id}",
+                "-v", f"user_id={owner['id']}",
+                "-v", f"role={owner['role']}",
+            ],
+            membership_sql,
+        )
 
 
 def main() -> int:
@@ -151,8 +165,9 @@ def main() -> int:
         raise SystemExit("ERROR: owners list is empty")
     for o in owners:
         validate(o)
-    sql = build_sql(owners)
-    apply_sql(sql)
+    print(f"Seeding {len(owners)} owner(s) via parameterized psql...")
+    for o in owners:
+        seed_one_owner(o)
     print(f"Seeded {len(owners)} owners.")
     return 0
 

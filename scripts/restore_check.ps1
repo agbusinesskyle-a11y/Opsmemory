@@ -78,11 +78,20 @@ $KeepDb = ($env:KEEP_RESTORE_DB -eq "true")
 $StatusFile = $env:RESTORE_STATUS_FILE
 if (-not $StatusFile) { $StatusFile = "/var/lib/opsmemory/backup/restore_status.json" }
 
+# ---- Temp resources: initialize before try, clean up in finally -------
+# All three temp resources may be created below. Initializing here
+# (before the try/finally that wraps the rest of the script) means the
+# finally block can reliably clean up regardless of which exit path
+# fired, including PowerShell `exit` calls and unhandled exceptions.
+$RemoteFetchTempDir = $null
+$DecryptedTempFile = $null
+$TmpGpgHome = $null
+
+try {
+
 # ---- Source selection: local, spark2, b2 ------------------------------
 # When fetching from remote, we copy the entire backup tree to a temp
 # directory and treat that as $BackupRoot for the rest of the script.
-# Cleanup happens via $RemoteFetchTempDir at exit.
-$RemoteFetchTempDir = $null
 $EffectiveBackupRoot = $BackupRoot
 
 if ($Source -eq "spark2") {
@@ -139,9 +148,6 @@ $LatestDump = Get-ChildItem -Path $EffectiveBackupRoot -Recurse -ErrorAction Sil
 if (-not $LatestDump) {
     $msg = "no backup dump found under $EffectiveBackupRoot (source=$Source)"
     Send-FailureAlert "no_backup" $msg
-    if ($RemoteFetchTempDir -and (Test-Path $RemoteFetchTempDir)) {
-        Remove-Item -Recurse -Force $RemoteFetchTempDir
-    }
     Write-Error $msg
     exit 2
 }
@@ -159,7 +165,6 @@ Write-Host "[$(Get-Date -Format o)] using dump $($LatestDump.FullName) (age $Dum
 # the file is a well-formed GPG envelope, but doesn't decrypt the body.
 # Operator's full restore-check happens from a machine with the private
 # key (typically Spark #2 — Chunk 1.5 step 7).
-$DecryptedTempFile = $null
 $VerificationMode = if ($IsEncrypted) { "encrypted-pending-private-key" } else { "plaintext-full" }
 $RestoreSourcePath = $LatestDump.FullName
 
@@ -179,7 +184,11 @@ if ($IsEncrypted) {
     if ($hasPrivate) {
         $VerificationMode = "encrypted-full"
         Write-Host "[$(Get-Date -Format o)] gpg private key for $GpgRecipient found; decrypting"
+        # 0600 enforced via umask-equivalent: New-Item with -Force then chmod.
+        # PowerShell on Linux honors chmod via filesystem ACLs.
         $DecryptedTempFile = "/tmp/opsmemory-restore-$(Get-Random).dump"
+        New-Item -ItemType File -Path $DecryptedTempFile -Force | Out-Null
+        & chmod 0600 $DecryptedTempFile
         & gpg --batch --quiet --yes --output $DecryptedTempFile --decrypt $LatestDump.FullName
         if ($LASTEXITCODE -ne 0) {
             Send-FailureAlert "gpg_decrypt_failed" "dump=$($LatestDump.FullName)"
@@ -199,20 +208,15 @@ if ($IsEncrypted) {
         # Use a temp GNUPGHOME so we don't need ~/.gnupg under /var/lib/opsmemory.
         $TmpGpgHome = "/tmp/opsmemory-gpg-rcheck-$(Get-Random)"
         New-Item -ItemType Directory -Path $TmpGpgHome -Force | Out-Null
-        try {
-            $env:GNUPGHOME = $TmpGpgHome
-            $listOutput = & gpg --list-packets $LatestDump.FullName 2>&1
-            $listText = ($listOutput | Out-String)
-            $hasPubkeyEnc = $listText -match ':pubkey enc packet:'
-            $hasEncrypted = $listText -match ':aead encrypted packet:|:encrypted packet:|:encrypted data packet:'
-            if (-not ($hasPubkeyEnc -and $hasEncrypted)) {
-                Send-FailureAlert "gpg_list_packets_invalid" "dump=$($LatestDump.FullName); output=$($listText -replace "`n", ' | ' | ForEach-Object {$_.Substring(0, [Math]::Min(500, $_.Length))})"
-                Write-Error "gpg --list-packets did not find PKESK + encrypted-data packets — file may not be a valid GPG envelope"
-                exit 7
-            }
-        } finally {
-            Remove-Item Env:GNUPGHOME -ErrorAction SilentlyContinue
-            if (Test-Path $TmpGpgHome) { Remove-Item -Recurse -Force $TmpGpgHome }
+        $env:GNUPGHOME = $TmpGpgHome
+        $listOutput = & gpg --list-packets $LatestDump.FullName 2>&1
+        $listText = ($listOutput | Out-String)
+        $hasPubkeyEnc = $listText -match ':pubkey enc packet:'
+        $hasEncrypted = $listText -match ':aead encrypted packet:|:encrypted packet:|:encrypted data packet:'
+        if (-not ($hasPubkeyEnc -and $hasEncrypted)) {
+            Send-FailureAlert "gpg_list_packets_invalid" "dump=$($LatestDump.FullName)"
+            Write-Error "gpg --list-packets did not find PKESK + encrypted-data packets — file may not be a valid GPG envelope"
+            exit 7
         }
         Write-Host "[$(Get-Date -Format o)] structure-only check passed; full restore must be verified from a machine with the private key"
     }
@@ -254,9 +258,6 @@ if ($VerificationMode -eq "encrypted-structure-only") {
     $StatusDir = Split-Path -Parent $StatusFile
     New-Item -ItemType Directory -Path $StatusDir -Force | Out-Null
     [IO.File]::WriteAllText($StatusFile, $Status)
-    if ($RemoteFetchTempDir -and (Test-Path $RemoteFetchTempDir)) {
-        Remove-Item -Recurse -Force $RemoteFetchTempDir
-    }
     Write-Host "[$(Get-Date -Format o)] structure-only verify complete; status=$StatusFile"
     return
 }
@@ -278,7 +279,6 @@ Write-Host "[$(Get-Date -Format o)] pg_restore (docker exec $ContainerName) -> $
 if ($LASTEXITCODE -ne 0) {
     Send-FailureAlert "pg_restore_failed" "exit=$LASTEXITCODE dump=$($LatestDump.FullName)"
     if (-not $KeepDb) { try { Run-AdminSql "DROP DATABASE IF EXISTS $RestoreDb" } catch { } }
-    if ($DecryptedTempFile -and (Test-Path $DecryptedTempFile)) { Remove-Item $DecryptedTempFile -Force }
     Write-Error "pg_restore failed (exit $LASTEXITCODE)"
     exit 4
 }
@@ -334,6 +334,9 @@ try {
 } catch {
     Send-FailureAlert "smoke_check_failed" $_.Exception.Message
     if (-not $KeepDb) { try { Run-AdminSql "DROP DATABASE IF EXISTS $RestoreDb" } catch { } }
+    if ($DecryptedTempFile -and (Test-Path $DecryptedTempFile)) {
+        Remove-Item $DecryptedTempFile -Force
+    }
     Write-Error $_.Exception.Message
     exit 5
 }
@@ -345,15 +348,14 @@ if (-not $KeepDb) {
     Write-Host "KEEP_RESTORE_DB=true — leaving $RestoreDb in place"
 }
 
-# Clean up the temp decrypted file (if any). Mode 0600 minimized exposure
-# during the restore window; remove as soon as we're done.
+# Per-success cleanup happens here AND again in the top-level finally
+# below. Belt and suspenders — finally is the canonical cleanup; this
+# inline block only matters in the success path so the temp files are
+# gone before we write the status JSON (smaller window for stale state
+# if a future bug causes the script to hang).
 if ($DecryptedTempFile -and (Test-Path $DecryptedTempFile)) {
     Remove-Item $DecryptedTempFile -Force
-}
-
-# Clean up the remote-fetch temp directory (if --source spark2 or b2).
-if ($RemoteFetchTempDir -and (Test-Path $RemoteFetchTempDir)) {
-    Remove-Item -Recurse -Force $RemoteFetchTempDir
+    $DecryptedTempFile = $null
 }
 
 # ---- Status JSON --------------------------------------------------------
@@ -384,3 +386,21 @@ try {
 }
 
 Write-Host "[$(Get-Date -Format o)] restore-check complete dump_age=${DumpAgeHours}h status=$StatusFile"
+
+}  # end of top-level try
+finally {
+    # Canonical cleanup. Runs on success, on every `exit N` path, and
+    # on any unhandled exception. Order: GNUPGHOME env var first (so
+    # nested gpg invocations stop using the temp dir), then the three
+    # temp resources.
+    Remove-Item Env:GNUPGHOME -ErrorAction SilentlyContinue
+    if ($TmpGpgHome -and (Test-Path $TmpGpgHome)) {
+        Remove-Item -Recurse -Force $TmpGpgHome -ErrorAction SilentlyContinue
+    }
+    if ($DecryptedTempFile -and (Test-Path $DecryptedTempFile)) {
+        Remove-Item -Force $DecryptedTempFile -ErrorAction SilentlyContinue
+    }
+    if ($RemoteFetchTempDir -and (Test-Path $RemoteFetchTempDir)) {
+        Remove-Item -Recurse -Force $RemoteFetchTempDir -ErrorAction SilentlyContinue
+    }
+}

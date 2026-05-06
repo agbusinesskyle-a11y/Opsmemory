@@ -215,28 +215,30 @@ async def _load_user(
 
 
 def _resolve_pepper(version: str | None) -> str | None:
-    """Return the pepper for a specific version, or the active one if version is None.
+    """Return the pepper that the given row was hashed with.
 
-    Pepper versioning:
-      SERVICE_KEY_PEPPER_ACTIVE_VERSION = "v1"   # which version to write new keys with
-      SERVICE_KEY_PEPPER_V1             = "<hex>" # actual pepper for v1
-      SERVICE_KEY_PEPPER_V2             = "<hex>" # next-version pepper after rotation
+    Each service_accounts row records the pepper version in
+    metadata.pepper_version. This function looks up THAT version, never
+    a different one — silently mapping an empty pepper_version to the
+    currently-active versioned pepper would let a rotation invalidate
+    every legacy key.
 
-    The legacy SERVICE_KEY_PEPPER (no version suffix) is honored when set
-    and treated as v1 — backward compat for chunk1 deploys.
+    Mapping:
+      version="V1" (or any non-empty)  -> SERVICE_KEY_PEPPER_<VERSION>
+      version=None / empty             -> legacy SERVICE_KEY_PEPPER
+                                          (NOT the currently active versioned one)
+
+    Bootstrap (creating new keys) uses a separate path that picks the
+    active pepper — see scripts/bootstrap_service_account.py.
     """
     if version:
         env_name = f"SERVICE_KEY_PEPPER_{version.upper()}"
         return os.environ.get(env_name)
-    # Default: prefer the active version, fall back to legacy SERVICE_KEY_PEPPER.
-    active = os.environ.get("SERVICE_KEY_PEPPER_ACTIVE_VERSION")
-    if active:
-        return os.environ.get(f"SERVICE_KEY_PEPPER_{active.upper()}")
     return os.environ.get("SERVICE_KEY_PEPPER")
 
 
 _KEY_PATTERN = re.compile(
-    r"^opsmem_(?P<env>live|test)_(?P<kid>[A-Za-z0-9]{16})_(?P<secret>[A-Za-z0-9_-]{32,})$"
+    r"^opsmem_(?P<env>live|test)_(?P<kid>[A-Za-z0-9]{16})_(?P<secret>[A-Za-z0-9]{43})$"
 )
 
 

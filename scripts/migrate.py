@@ -76,6 +76,7 @@ def discover() -> list[Migration]:
     if not MIGRATIONS_DIR.is_dir():
         raise SystemExit(f"ERROR: migrations dir not found: {MIGRATIONS_DIR}")
     out: list[Migration] = []
+    seen_prefixes: dict[str, Path] = {}
     for p in sorted(MIGRATIONS_DIR.iterdir()):
         if not p.is_file() or not p.name.endswith(".sql"):
             continue
@@ -83,6 +84,13 @@ def discover() -> list[Migration]:
         if not m:
             print(f"  skipping non-migration file: {p.name}", file=sys.stderr)
             continue
+        prefix = m.group(1)  # 4-digit numeric prefix
+        if prefix in seen_prefixes:
+            raise SystemExit(
+                f"ERROR: duplicate migration prefix {prefix!r}: "
+                f"{p.name} conflicts with {seen_prefixes[prefix].name}"
+            )
+        seen_prefixes[prefix] = p
         version = p.stem
         sql = p.read_text(encoding="utf-8")
         checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
