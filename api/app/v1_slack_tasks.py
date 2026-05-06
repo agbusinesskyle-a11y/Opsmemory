@@ -24,12 +24,13 @@ Request shape (n8n payload contract):
 Response shape: Slack Block Kit JSON with response_type=ephemeral.
 n8n forwards this to Slack as the slash-command response.
 
-Slash-command grammar (this commit ships only the first; stale +
-category land in step 2/3):
-  /tasks <owner>          # who's working on what (this commit)
-  /tasks stale            # not touched in N days (step 2)
-  /tasks <category>       # filter by tasks.category (step 3)
-  /tasks                  # help text
+Slash-command grammar:
+  /tasks <owner>             # who's working on what (chunk 8 step 1)
+  /tasks stale               # not touched in N days (chunk 8 step 2)
+  /tasks category:<name>     # explicit category filter (chunk 8 step 3)
+  /tasks <name>              # bare arg: owner first, falls back to
+                             # category when no active user matches
+  /tasks                     # help text
 
 Auth + identity model (per Codex chunk-7-close STEP 8 PLAN):
   1. Service principal carrying SCOPE_SLACK_QUERY admits the n8n forward.
@@ -106,7 +107,10 @@ def _help_blocks() -> dict:
             "  Pass a Slack mention (`/tasks @kyle`) or a name substring "
             "(`/tasks Joanna`).\n"
             f"• `/tasks stale` — open tasks not touched in {days}+ days.\n"
-            "• `/tasks <category>` — _coming soon (chunk 8 step 3)_."
+            "• `/tasks category:<name>` — open tasks in that category "
+            "(case-insensitive, exact match).\n"
+            "• `/tasks <name>` — owner first; falls back to category if "
+            "no active user matches."
         ),
     ])
 
@@ -339,6 +343,56 @@ async def _query_stale_tasks(
     return [dict(r) for r in rows]
 
 
+async def _query_category_tasks(
+    conn,
+    category: str,
+    caller_visible_biz: list[str] | None,
+    *,
+    limit: int = 25,
+) -> list[dict]:
+    """Open active tasks whose category matches `category` exactly
+    (case-insensitive, trimmed both sides), scoped to caller's
+    visible businesses. Per Codex chunk-8-step2 STEP 3 PLAN: no
+    `%...%` substring matching — that creates noisy collisions like
+    'permitting' matching 'permit'.
+
+    Returns same row shape as _query_owner_tasks for shared formatting.
+    """
+    where = [
+        "t.status = 'open'",
+        "t.deletion_state = 'active'",
+        "t.category IS NOT NULL",
+        "btrim(t.category) ILIKE btrim($1)",
+    ]
+    params: list[Any] = [category]
+    if caller_visible_biz is not None:
+        if not caller_visible_biz:
+            return []
+        params.append(caller_visible_biz)
+        where.append(
+            f"EXISTS (SELECT 1 FROM task_businesses tb "
+            f"        WHERE tb.task_id = t.id "
+            f"          AND tb.business_id::text = ANY(${len(params)}::text[]))"
+        )
+    sql = f"""
+        SELECT t.id::text                AS id,
+               t.summary                 AS summary,
+               t.due_at::text            AS due_at,
+               t.dependency_text         AS dependency_text,
+               t.last_activity_at::text  AS last_activity_at,
+               array_agg(DISTINCT b.slug::text) AS businesses
+        FROM tasks t
+        LEFT JOIN task_businesses tb2 ON tb2.task_id = t.id
+        LEFT JOIN businesses b        ON b.id = tb2.business_id
+        WHERE {' AND '.join(where)}
+        GROUP BY t.id
+        ORDER BY t.due_at NULLS LAST, t.last_activity_at DESC, t.id
+        LIMIT {limit}
+    """
+    rows = await conn.fetch(sql, *params)
+    return [dict(r) for r in rows]
+
+
 def _format_stale_line(t: Any) -> str:
     """Stale list line — same shape as owner-tasks but leads with
     'last touched' instead of due."""
@@ -478,12 +532,52 @@ async def slack_tasks(
         if head in ("help", "?"):
             return _help_blocks()
 
-        # Default: treat the entire text as the owner argument.
-        owner, err = await _resolve_owner_arg(
+        # Explicit `category:<name>` form (per Codex chunk-8-step2
+        # STEP 3 PLAN — unambiguous when a category collides with an
+        # owner name or a reserved word like 'stale').
+        if text.lower().startswith("category:"):
+            category_arg = text.split(":", 1)[1].strip()
+            if not category_arg:
+                return _ephemeral([_section(
+                    "Specify a category. Example: `/tasks category:opening`"
+                )])
+            return await _render_category_response(
+                conn, body, caller, category_arg, caller_visible_biz,
+            )
+
+        # Bare argument: try owner first; fall back to category ONLY
+        # when owner resolution returned a clean "no active user
+        # matches" result. Owner ambiguity wins (we don't want to
+        # silently switch to category when the user clearly meant a
+        # name match) — surface the ambiguity error and tell them to
+        # use `/tasks category:<name>` if that's what they meant.
+        owner, owner_err = await _resolve_owner_arg(
             conn, body.team_id, text, caller_visible_biz,
         )
-        if err:
-            return _ephemeral([_section(err)])
+        if owner is None:
+            # Distinguish "no match" (try category) from "ambiguous"
+            # (return error). Codex chunk-8-step2 STEP 3 PLAN:
+            # ambiguity wins.
+            if owner_err and owner_err.startswith("No active OpsMemory user"):
+                category_tasks = await _query_category_tasks(
+                    conn, text, caller_visible_biz,
+                )
+                if category_tasks:
+                    return await _render_category_response(
+                        conn, body, caller, text, caller_visible_biz,
+                        prefetched=category_tasks,
+                    )
+                # Neither owner nor category matched — surface the
+                # owner error verbatim, plus a category hint.
+                return _ephemeral([_section(
+                    owner_err +
+                    " If you meant a category, try "
+                    f"`/tasks category:{_md_escape(text)}`."
+                )])
+            # Empty arg or ambiguous — return owner error directly.
+            return _ephemeral([_section(owner_err)])
+
+        # Owner matched cleanly.
         tasks = await _query_owner_tasks(
             conn, owner["id"], caller_visible_biz,
         )
@@ -507,3 +601,41 @@ async def slack_tasks(
             _section(header),
             _section(body_block),
         ])
+
+
+async def _render_category_response(
+    conn,
+    body: SlackTasksRequest,
+    caller: dict,
+    category: str,
+    caller_visible_biz: list[str] | None,
+    *,
+    prefetched: list[dict] | None = None,
+) -> dict:
+    """Shared formatter for both `/tasks category:<name>` and the
+    bare-arg category fallback. `prefetched` lets the caller skip a
+    second query when it has already run one."""
+    tasks = (prefetched if prefetched is not None
+             else await _query_category_tasks(
+                 conn, category, caller_visible_biz,
+             ))
+    if not tasks:
+        return _ephemeral([_section(
+            f"No open tasks in category `{_md_escape(category)}` "
+            "in your visible businesses."
+        )])
+    header = (
+        f"*Category {_md_escape(category)}* — "
+        f"{len(tasks)} open task{'s' if len(tasks) != 1 else ''}:"
+    )
+    body_block = "\n".join(_format_task_line(t) for t in tasks)
+    log.info("slack_tasks_category_query", extra={
+        "team_id": body.team_id,
+        "caller_id": caller["id"],
+        "category": category,
+        "task_count": len(tasks),
+    })
+    return _ephemeral([
+        _section(header),
+        _section(body_block),
+    ])
