@@ -273,6 +273,13 @@ async def process_event(conn, event_id: str) -> dict:
                     "dependency_text": cand.get("dependency_text"),
                     "businesses": cand.get("businesses") or [],
                     "owner_display_hint": cand.get("owner_display"),
+                    # Resolved canonical user from slack_resolve (when
+                    # source=slack_message). review_apply._apply_create_task
+                    # uses this to insert task_assignees(role='assignee')
+                    # on approve. None means "no resolved owner" — the
+                    # task is created without an assignee, reviewer can
+                    # assign manually post-approve.
+                    "owner_user_id": cand.get("owner_user_id"),
                 }
             }
         elif decision["action"] == "UPDATE_TASK":

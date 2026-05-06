@@ -122,20 +122,31 @@ def normalize_candidate(raw: dict, *, now: datetime | None = None) -> dict:
     owner_display = _resolve_owner_display(raw.get("owner_hint"))
     businesses = _resolve_businesses(raw.get("businesses_hint") or [])
     due = _resolve_due(raw.get("due_hint"), now=now)
-    # Pass through Slack mention ids unchanged. Source-specific resolvers
-    # (slack_resolve.py) read them after this step. Filter to a list of
-    # plain strings so a hostile/buggy LLM payload can't smuggle nested
-    # objects into the candidate.
+    # Pass through Slack mention ids unchanged (deduped, capped). The
+    # cap protects the resolver from a pathological "paging everyone"
+    # message yielding 100+ DB lookups, and dedupe protects from a
+    # repeated mention. Filter to plain strings so a hostile/buggy LLM
+    # payload can't smuggle nested objects into the candidate.
     raw_slack_ids = raw.get("owner_slack_user_ids")
     owner_slack_user_ids: list[str] = []
     if isinstance(raw_slack_ids, list):
+        seen: set[str] = set()
         for entry in raw_slack_ids:
             if isinstance(entry, str) and 0 < len(entry) <= 64:
-                owner_slack_user_ids.append(entry)
+                if entry not in seen:
+                    seen.add(entry)
+                    owner_slack_user_ids.append(entry)
+                    if len(owner_slack_user_ids) >= 10:
+                        break
+    # Pass through the boolean owner_is_poster flag. False if not a bool
+    # to keep downstream consumers simple.
+    raw_is_poster = raw.get("owner_is_poster")
+    owner_is_poster = bool(raw_is_poster) if isinstance(raw_is_poster, bool) else False
     return {
         "summary": summary,
         "owner_display": owner_display,
         "owner_slack_user_ids": owner_slack_user_ids,
+        "owner_is_poster": owner_is_poster,
         "businesses": businesses,
         "due_at": due,
         "dependency_text": (raw.get("dependency_hint") or None),

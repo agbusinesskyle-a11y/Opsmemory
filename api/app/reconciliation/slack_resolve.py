@@ -143,14 +143,30 @@ async def resolve_slack_context(
     channel_id = md.get("channel_id")
 
     # ---- Channel -> business ----
+    channel_mapped_slug = await _resolve_channel_business(conn, team_id, channel_id)
     if not candidate.get("businesses"):
-        slug = await _resolve_channel_business(conn, team_id, channel_id)
-        if slug:
-            candidate["businesses"] = [slug]
+        if channel_mapped_slug:
+            candidate["businesses"] = [channel_mapped_slug]
             candidate.setdefault("business_resolution_source", "channel_mapping")
             log.info("slack_channel_business_resolved", extra={
-                "team_id": team_id, "channel_id": channel_id, "business": slug,
+                "team_id": team_id, "channel_id": channel_id,
+                "business": channel_mapped_slug,
             })
+    elif channel_mapped_slug and channel_mapped_slug not in candidate["businesses"]:
+        # Text business explicitly named one (or more) businesses, and
+        # the channel maps to a different one. Don't override the
+        # explicit text — but record the disagreement so the reviewer
+        # sees it (Codex chunk-5-close: text > channel default, but
+        # log/store the conflict).
+        candidate["business_resolution_conflict"] = {
+            "text_businesses": list(candidate["businesses"]),
+            "channel_mapped": channel_mapped_slug,
+            "channel_id": channel_id,
+        }
+        log.info("slack_channel_business_conflict", extra={
+            "team_id": team_id, "channel_id": channel_id,
+            "text": candidate["businesses"], "channel": channel_mapped_slug,
+        })
 
     # ---- Mentions -> canonical user ----
     raw_user_ids: list[str] = []
@@ -158,13 +174,16 @@ async def resolve_slack_context(
     if isinstance(extracted_ids, list):
         for entry in extracted_ids:
             resolved = _strip_user_id(entry)
-            if resolved:
+            if resolved and resolved not in raw_user_ids:
                 raw_user_ids.append(resolved)
-    # Fall back to source_metadata.user_id (the message poster) when
-    # the LLM didn't surface any explicit mentions. Captures the
-    # "Karen needs the permits" case — Karen unresolvable, but at
-    # least records the poster as a candidate owner.
-    if not raw_user_ids:
+                if len(raw_user_ids) >= 10:
+                    break
+    # Fall back to source_metadata.user_id (the message poster) ONLY
+    # when extract surfaced owner_is_poster=true. The pre-fix behavior
+    # of always treating the poster as owner produced false assignment
+    # for messages like "Karen needs the permits" (poster relays a
+    # request, isn't doing the work).
+    if not raw_user_ids and candidate.get("owner_is_poster"):
         poster = md.get("user_id")
         if poster:
             stripped = _strip_user_id(poster)

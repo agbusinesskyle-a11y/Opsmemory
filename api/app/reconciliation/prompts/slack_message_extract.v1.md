@@ -31,22 +31,30 @@ The four owners in the system are:
 - Caleb Noriega (owner of RedHot Fireworks) — sometimes "Caleb"
 - Sarah Conway (owner of Borderline Fireworks) — sometimes "Sarah"
 
-Two separate output fields handle owner resolution:
+There are three owner-related output fields. They are NOT interchangeable.
 
 - `owner_hint`: a canonical full name **only** when the message text
-  uses a recognizable English first/last name (e.g. "Kyle is on it").
-- `owner_slack_user_ids`: a list of every `<@U...>` mention id that
-  appears in the message body. Emit them verbatim (the deterministic
-  resolver outside this prompt maps them to canonical users via the
-  Slack identities table). Examples:
-  - `"<@U03ABC123> can you grab containers"` ->
-    `["U03ABC123"]`
-  - `"order from <@U05DEF456> by Tuesday"` ->
-    `["U05DEF456"]`
-  - no mentions in body -> `[]`
+  names a recognizable owner first/last name in an assignee role
+  (e.g. "Kyle is on it", "Sarah will order"). Set null otherwise.
+- `owner_slack_user_ids`: a list of `<@U...>` mention ids that appear
+  in the message and are clearly **the responsible party** for the
+  task — i.e. the message is asking that user to do the work or
+  acknowledging they will. Do NOT include mentions that are just FYI,
+  context, or asking-on-behalf-of-someone-else. Examples:
+  - `"<@U03ABC123> can you grab containers"` -> include U03ABC123.
+  - `"<@U05DEF456> heads up: Karen called about the permit"` ->
+    do NOT include (FYI mention).
+  - `"<@U07XYZ789> said <@U09QWE012> would handle it"` -> include
+    U09QWE012 (responsible), NOT U07XYZ789 (the relayer).
+  - no responsible mentions -> empty list `[]`.
+- `owner_is_poster`: boolean. Set `true` only when the message author
+  commits in first person to do the task (e.g. "I'll handle the
+  containers", "I'm ordering the lights"). Otherwise `false`. The
+  resolver uses this to decide whether to fall back to the message
+  poster as owner when no mentions resolved.
 
 Do NOT try to resolve `<@U...>` mentions to a canonical name yourself;
-the resolver has the mapping. Just collect the ids.
+the resolver has the mapping. Just collect the responsible ids.
 
 ## Business inference
 
@@ -86,7 +94,8 @@ Emit a single JSON object:
     {
       "summary": "string, 1 sentence imperative form (e.g. 'Order containers from Chris')",
       "owner_hint": "Kyle Conway | Joanna Noriega | Caleb Noriega | Sarah Conway | null",
-      "owner_slack_user_ids": ["U03ABC123", "U05DEF456"],
+      "owner_slack_user_ids": ["U03ABC123"],
+      "owner_is_poster": false,
       "businesses_hint": ["redhot" or "borderline" — empty list if no signal],
       "due_hint": "ISO 8601 date or relative phrase ('Tuesday') or null",
       "dependency_hint": "free-form text (e.g. 'waiting on Karen') or null",
@@ -102,8 +111,10 @@ Rules:
 
 - One candidate per discrete commitment. Most Slack messages produce zero
   or one.
-- Use the workspace/channel context (provided alongside the message) to
-  inform business hints, but never to guess content.
+- Workspace/channel context (provided alongside the message) is for the
+  audit trail only. Do NOT use it to infer business or invent task
+  content. The deterministic resolver applies channel -> business
+  mapping after extraction.
 - Never invent owners or due dates. When uncertain, use null.
 - Never include the `<MESSAGE>` markers in your output.
 

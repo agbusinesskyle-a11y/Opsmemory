@@ -347,6 +347,36 @@ async def _apply_create_task(
             reviewer_id,
         )
 
+    # ----- Insert task_assignees (when slack_resolve gave us an owner) -----
+    # Closes Codex chunk-5-close blocker: pipeline now carries
+    # owner_user_id in proposed_patch.create; the apply path materializes
+    # the assignment so the canonical user appears as the task's
+    # assignee on the dashboard. None means "no resolved owner" — the
+    # task is created with no assignee and the reviewer can add one
+    # via PATCH later.
+    owner_user_id = create.get("owner_user_id")
+    if owner_user_id:
+        # Verify the user still exists and is active before assigning;
+        # a stale review_item could reference a removed user.
+        user_row = await conn.fetchrow(
+            "SELECT id::text AS id FROM users "
+            "WHERE id = $1::uuid AND status = 'active'",
+            owner_user_id,
+        )
+        if user_row:
+            await conn.execute(
+                """
+                INSERT INTO task_assignees
+                  (task_id, user_id, role, assigned_by)
+                VALUES
+                  ($1::uuid, $2::uuid, 'assignee', $3::uuid)
+                ON CONFLICT (task_id, user_id) DO NOTHING
+                """,
+                task_id,
+                user_row["id"],
+                reviewer_id,
+            )
+
     # ----- Insert task_field_versions baseline -----
     for field_name in _CREATE_FIELD_NAMES:
         await conn.execute(

@@ -241,23 +241,29 @@ async def ingest_meeting_recap(
 # Slack ts is "<seconds>.<microseconds>" — use as the per-message
 # external id along with team + channel for full uniqueness across
 # workspaces.
-_SLACK_ID_PATTERN = r"^[A-Z][A-Z0-9]{1,30}$"
+# Per Codex chunk-5-close: each Slack id type has a stable prefix.
+# Field-specific patterns reject mistaken cross-field forwards from
+# n8n (a channel id in the user_id field, etc.).
+_SLACK_TEAM_ID_PATTERN = r"^T[A-Z0-9]{2,30}$"
+_SLACK_CHANNEL_ID_PATTERN = r"^[CGD][A-Z0-9]{2,30}$"
+_SLACK_USER_ID_PATTERN = r"^[UW][A-Z0-9]{2,30}$"
+_SLACK_ENTERPRISE_ID_PATTERN = r"^E[A-Z0-9]{2,30}$"
 _SLACK_TS_PATTERN = r"^\d{8,12}\.\d{6}$"
 
 
 class SlackIngest(BaseModel):
     model_config = {"extra": "forbid"}
 
-    team_id: str = Field(..., min_length=2, max_length=32, pattern=_SLACK_ID_PATTERN,
+    team_id: str = Field(..., min_length=3, max_length=32, pattern=_SLACK_TEAM_ID_PATTERN,
                           description="Slack workspace id (T-prefixed).")
-    channel_id: str = Field(..., min_length=2, max_length=32, pattern=_SLACK_ID_PATTERN,
-                              description="Slack channel id (C/G/D-prefixed).")
+    channel_id: str = Field(..., min_length=3, max_length=32, pattern=_SLACK_CHANNEL_ID_PATTERN,
+                              description="Slack channel id (C public, G private, D DM).")
     ts: str = Field(..., min_length=8, max_length=32, pattern=_SLACK_TS_PATTERN,
                      description="Slack message timestamp (idempotency key).")
     text: str = Field(..., min_length=1, max_length=50_000,
                        description="Raw message text. UTF-8. Slack caps at 40k.")
-    user_id: str | None = Field(default=None, max_length=32, pattern=_SLACK_ID_PATTERN,
-                                  description="Slack user id of the poster.")
+    user_id: str | None = Field(default=None, max_length=32, pattern=_SLACK_USER_ID_PATTERN,
+                                  description="Slack user id of the poster (U or W prefix).")
     thread_ts: str | None = Field(default=None, max_length=32, pattern=_SLACK_TS_PATTERN,
                                     description="Parent ts if this is a thread reply.")
     channel_name: str | None = Field(default=None, max_length=128)
@@ -266,7 +272,7 @@ class SlackIngest(BaseModel):
                                        description="Workspace subdomain, e.g. 'kyleconway'.")
     workspace_name: str | None = Field(default=None, max_length=128,
                                           description="Display name of the workspace.")
-    enterprise_id: str | None = Field(default=None, max_length=32, pattern=_SLACK_ID_PATTERN,
+    enterprise_id: str | None = Field(default=None, max_length=32, pattern=_SLACK_ENTERPRISE_ID_PATTERN,
                                          description="Slack Enterprise Grid id, when applicable.")
     extra: dict[str, Any] = Field(default_factory=dict,
                                     description="Free-form context from n8n forward.")
