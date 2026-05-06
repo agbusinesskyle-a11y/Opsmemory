@@ -618,10 +618,20 @@ function renderSopItem(sop) {
 }
 
 function renderSopList() {
+  // Surface a top-level load error so a /v1/sops failure doesn't
+  // silently render as the empty state. refreshSops sets
+  // state.sops.loadError; this is the matching display path.
+  if (state.sops.loadError && !state.sops.items.length) {
+    return `<div class="error sop-load-error">${escapeHtml(state.sops.loadError)}</div>`;
+  }
   if (!state.sops.items.length) {
     return `<div class="empty-state">No SOPs match the current filters.</div>`;
   }
+  const errorBanner = state.sops.loadError
+    ? `<div class="error sop-load-error">${escapeHtml(state.sops.loadError)}</div>`
+    : '';
   return `
+    ${errorBanner}
     <div class="task-count">${state.sops.total} SOP${state.sops.total === 1 ? '' : 's'}</div>
     <ul class="sop-list">${state.sops.items.map(renderSopItem).join('')}</ul>
   `;
@@ -745,13 +755,22 @@ function attachEventHandlers() {
       } else {
         state.sops.selectedVersionNo = versionNo;
         state.sops.selectedVersionDetail = null;
+        // Capture the SOP id under which this fetch was issued so a
+        // subsequent collapse-then-expand of a different SOP doesn't
+        // commit this fetch's result under the new SOP. Codex flagged
+        // that the version-no race guard alone doesn't cover the
+        // (sop_id, version_no) tuple — version_no=1 exists on every
+        // SOP.
+        const fetchSopId = sopId;
         render();
         try {
           const detail = await loadSopVersionDetail(sopId, versionNo);
-          if (state.sops.selectedVersionNo !== versionNo) return;
+          if (state.sops.expandedId !== fetchSopId
+              || state.sops.selectedVersionNo !== versionNo) return;
           state.sops.selectedVersionDetail = detail;
         } catch (err) {
-          if (state.sops.selectedVersionNo !== versionNo) return;
+          if (state.sops.expandedId !== fetchSopId
+              || state.sops.selectedVersionNo !== versionNo) return;
           state.sops.loadError = err.message || 'Failed to load version templates.';
         }
       }
