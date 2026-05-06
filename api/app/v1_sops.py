@@ -1293,6 +1293,31 @@ async def fire_anchor_event(
                             "version_id": sop["latest_version_id"]},
                 )
 
+            # Pre-check sop_instances to surface a clean
+            # sop_already_materialized 409 BEFORE we hit the
+            # ingest_events (source, source_external_id) partial
+            # UNIQUE — without this pre-check, a re-fire would 23505
+            # on the ingest INSERT and bubble as a 500 (Codex
+            # chunk-7-step3 close-fix). The sop_instances UNIQUE on
+            # (anchor_event_id, sop_version_id) still serves as the
+            # final guard against a TOCTOU race; we catch its
+            # collision below too.
+            existing_instance = await conn.fetchrow(
+                "SELECT id::text AS id FROM sop_instances "
+                "WHERE anchor_event_id = $1::uuid "
+                "  AND sop_version_id = $2::uuid",
+                anchor["id"], sop["latest_version_id"],
+            )
+            if existing_instance:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_already_materialized",
+                            "anchor_id": anchor["id"],
+                            "sop_version_id": sop["latest_version_id"],
+                            "existing_instance_id": existing_instance["id"],
+                            "detail": "this anchor + version pair has already been fired"},
+                )
+
             # ---- Build the audit ingest_events row ----
             # raw_content carries an operator-readable summary of what
             # was materialized. normalized_hash is deterministic per
@@ -1307,33 +1332,49 @@ async def fire_anchor_event(
             hash_input = f"sop_anchor:{anchor['id']}:{sop['latest_version_id']}"
             normalized_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
 
-            ingest_row = await conn.fetchrow(
-                """
-                INSERT INTO ingest_events
-                  (source, source_external_id, raw_content, normalized_hash,
-                   source_metadata, status,
-                   actor_type, actor_user_id, actor_service_account_id,
-                   processing_started_at, processed_at)
-                VALUES
-                  ('sop_anchor', $1, $2, $3, $4::jsonb, 'pending_review',
-                   'user', $5::uuid, NULL,
-                   now(), now())
-                RETURNING id::text AS id
-                """,
-                f"anchor:{anchor['id']}",  # source_external_id = anchor uuid
-                raw_summary,
-                normalized_hash,
-                {
-                    "anchor_event_id": anchor["id"],
-                    "anchor_kind": anchor["kind"],
-                    "sop_id": sop["id"],
-                    "sop_version_id": sop["latest_version_id"],
-                    "scheduled_for": anchor["scheduled_for"].isoformat()
-                                       if anchor["scheduled_for"] else None,
-                    "template_count": len(templates),
-                },
-                actor_id,
-            )
+            try:
+                ingest_row = await conn.fetchrow(
+                    """
+                    INSERT INTO ingest_events
+                      (source, source_external_id, raw_content, normalized_hash,
+                       source_metadata, status,
+                       actor_type, actor_user_id, actor_service_account_id,
+                       processing_started_at, processed_at)
+                    VALUES
+                      ('sop_anchor', $1, $2, $3, $4::jsonb, 'pending_review',
+                       'user', $5::uuid, NULL,
+                       now(), now())
+                    RETURNING id::text AS id
+                    """,
+                    f"anchor:{anchor['id']}",  # source_external_id = anchor uuid
+                    raw_summary,
+                    normalized_hash,
+                    {
+                        "anchor_event_id": anchor["id"],
+                        "anchor_kind": anchor["kind"],
+                        "sop_id": sop["id"],
+                        "sop_version_id": sop["latest_version_id"],
+                        "scheduled_for": anchor["scheduled_for"].isoformat()
+                                           if anchor["scheduled_for"] else None,
+                        "template_count": len(templates),
+                    },
+                    actor_id,
+                )
+            except asyncpg.UniqueViolationError:
+                # Defense in depth on top of the sop_instances pre-check
+                # above. An orphan ingest_events row with the same
+                # source_external_id (e.g. operator-created via psql)
+                # would land here. Surface a meaningful 409 instead of
+                # bubbling as a 500.
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_anchor_ingest_collision",
+                            "anchor_id": anchor["id"],
+                            "detail": ("an ingest_events row already exists "
+                                        "with source='sop_anchor' and "
+                                        "source_external_id='anchor:<id>'; "
+                                        "manually inspect and reconcile")},
+                )
             ingest_event_id = ingest_row["id"]
 
             # ---- INSERT sop_instances (UNIQUE collision = noop / 409) ----
@@ -1372,6 +1413,13 @@ async def fire_anchor_event(
                 proposed_patch = {
                     "create": {
                         "summary": t["summary"],
+                        # Codex chunk-7-step3 close-fix: description +
+                        # priority are part of the SOP authoring
+                        # contract; pass them through so review_apply
+                        # materializes them into tasks (where the
+                        # columns already exist from chunk 2).
+                        "description": t["description"],
+                        "priority": t["priority"],
                         "due_at": due_at_iso,
                         "category": t["category"],
                         "dependency_text": t["dependency_text"],
@@ -1382,6 +1430,8 @@ async def fire_anchor_event(
                 }
                 candidate_facts = {
                     "summary": t["summary"],
+                    "description": t["description"],
+                    "priority": t["priority"],
                     "businesses": [biz["slug"]],
                     "due_at": due_at_iso,
                     "category": t["category"],

@@ -317,21 +317,29 @@ async def _apply_create_task(
     reviewer_id = reviewer.id if reviewer.principal_type == "user" else None
 
     # ----- Insert tasks -----
+    # Codex chunk-7-step3 close-fix: description + priority were in the
+    # SOP authoring schema + read API but the apply path dropped them.
+    # Pass through whenever the patch carries them; non-SOP review_items
+    # (meeting_recap / slack_message) populate via .get() returning None.
     task_row = await conn.fetchrow(
         """
         INSERT INTO tasks
-          (summary, due_at, category, dependency_text,
+          (summary, description, due_at, category, priority,
+           dependency_text,
            source_event_id, version, last_activity_at,
            created_at, updated_at)
         VALUES
-          ($1, $2::timestamptz, $3, $4,
-           $5::uuid, 1, now(),
+          ($1, $2, $3::timestamptz, $4, $5,
+           $6,
+           $7::uuid, 1, now(),
            now(), now())
         RETURNING id::text AS id
         """,
         summary,
+        create.get("description"),
         create.get("due_at"),
         create.get("category"),
+        create.get("priority"),
         create.get("dependency_text"),
         ingest_event_id,
     )
