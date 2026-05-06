@@ -182,6 +182,11 @@ async def apply_review_item(
 
     # ----- 3. Action-specific apply -----
     action = row["proposed_action"]
+    base_field_versions = row["base_field_versions"]
+    if isinstance(base_field_versions, str):
+        base_field_versions = json.loads(base_field_versions)
+    base_field_versions = base_field_versions or {}
+
     if action == "CREATE_TASK":
         applied_task_id = await _apply_create_task(
             conn,
@@ -191,10 +196,35 @@ async def apply_review_item(
             confidence=row["confidence"],
             reviewer=reviewer,
         )
-    elif action in ("UPDATE_TASK", "COMPLETE_TASK"):
-        # Next commit lands UPDATE/COMPLETE with version-vector concurrency
-        # checks against base_task_version + base_field_versions.
-        raise ApplyNotImplemented(action)
+    elif action == "UPDATE_TASK":
+        if not row["target_task_id"]:
+            raise ApplyConflict("target_task_id_required",
+                                {"proposed_action": action})
+        applied_task_id = await _apply_update_task(
+            conn,
+            review_item_id=review_item_id,
+            ingest_event_id=row["ingest_event_id"],
+            target_task_id=row["target_task_id"],
+            proposed_patch=proposed_patch,
+            base_task_version=row["base_task_version"],
+            base_field_versions=base_field_versions,
+            confidence=row["confidence"],
+            reviewer=reviewer,
+        )
+    elif action == "COMPLETE_TASK":
+        if not row["target_task_id"]:
+            raise ApplyConflict("target_task_id_required",
+                                {"proposed_action": action})
+        applied_task_id = await _apply_complete_task(
+            conn,
+            review_item_id=review_item_id,
+            ingest_event_id=row["ingest_event_id"],
+            target_task_id=row["target_task_id"],
+            proposed_patch=proposed_patch,
+            base_task_version=row["base_task_version"],
+            confidence=row["confidence"],
+            reviewer=reviewer,
+        )
     elif action in ("IGNORE", "AMBIGUOUS"):
         # Reviewer can only "approve" actionable items; AMBIGUOUS/IGNORE
         # should be rejected, not approved.
@@ -391,3 +421,346 @@ async def _apply_create_task(
         )
 
     return task_id
+
+
+# ---------------------------------------------------------------------------
+# UPDATE_TASK
+# ---------------------------------------------------------------------------
+
+# Strict allowlist of fields the apply path will mutate via UPDATE_TASK.
+# Anything outside this set in proposed_patch.update is a validation
+# error — never silently ignored. Status-changing fields (status,
+# completed_at, completed_by, completion_note, deletion_state) are
+# reserved for COMPLETE_TASK / future delete flows so the audit trail
+# stays interpretable. Provenance/concurrency columns (id, version,
+# source_event_id, created_at, updated_at, last_activity_at) are
+# managed by the apply path itself.
+_UPDATE_MUTABLE_FIELDS = ("summary", "due_at", "category", "dependency_text")
+
+
+async def _apply_update_task(
+    conn,
+    *,
+    review_item_id: str,
+    ingest_event_id: str,
+    target_task_id: str,
+    proposed_patch: dict,
+    base_task_version: int | None,
+    base_field_versions: dict,
+    confidence: float | None,
+    reviewer: Principal,
+) -> str:
+    """Apply an UPDATE_TASK proposal with version-vector concurrency.
+
+    Returns target_task_id on success.
+
+    Conflicts (raise ApplyConflict; demote to needs_changes):
+      - target_not_found / target_deleted
+      - task_version_moved (tasks.version != base_task_version)
+      - field_version_moved (any touched field's version doesn't match)
+      - update_field_unknown (proposed field outside the allowlist)
+    """
+    update = proposed_patch.get("update") or {}
+    if not isinstance(update, dict) or not update:
+        raise ApplyValidationError([{"code": "update_empty",
+                                     "message": "proposed_patch.update missing or empty"}])
+
+    bad_fields = [k for k in update.keys() if k not in _UPDATE_MUTABLE_FIELDS]
+    if bad_fields:
+        raise ApplyValidationError([{
+            "code": "update_field_unknown",
+            "message": f"fields {bad_fields} not in UPDATE allowlist {list(_UPDATE_MUTABLE_FIELDS)}",
+        }])
+
+    # ----- Lock target -----
+    task_row = await conn.fetchrow(
+        """
+        SELECT id::text AS id, summary, due_at::text AS due_at,
+               category, dependency_text,
+               status::text AS status,
+               deletion_state::text AS deletion_state,
+               version
+        FROM tasks WHERE id = $1::uuid FOR UPDATE
+        """,
+        target_task_id,
+    )
+    if not task_row:
+        raise ApplyConflict("target_not_found", {"target_task_id": target_task_id})
+    if task_row["deletion_state"] != "active":
+        raise ApplyConflict("target_deleted",
+                            {"target_task_id": target_task_id,
+                             "deletion_state": task_row["deletion_state"]})
+
+    # ----- Concurrency check: whole-task version -----
+    if base_task_version is not None and task_row["version"] != base_task_version:
+        raise ApplyConflict("task_version_moved", {
+            "target_task_id": target_task_id,
+            "base_task_version": base_task_version,
+            "current_task_version": task_row["version"],
+        })
+
+    # ----- Concurrency check: per-field versions for touched fields -----
+    fv_rows = await conn.fetch(
+        "SELECT field_name, version FROM task_field_versions "
+        "WHERE task_id = $1::uuid AND field_name = ANY($2::text[])",
+        target_task_id,
+        list(update.keys()),
+    )
+    current_fv = {r["field_name"]: r["version"] for r in fv_rows}
+    for field_name in update.keys():
+        base_v = base_field_versions.get(field_name)
+        cur_v = current_fv.get(field_name)
+        # Allow None base only when the field has no row yet (first
+        # mutation of a field on an old task). Otherwise require equality.
+        if base_v is None and cur_v is None:
+            continue
+        if base_v != cur_v:
+            raise ApplyConflict("field_version_moved", {
+                "target_task_id": target_task_id,
+                "field_name": field_name,
+                "base_version": base_v,
+                "current_version": cur_v,
+            })
+
+    # ----- Mutate tasks (single UPDATE for all changed fields) -----
+    # Build dynamic SET for the touched fields. The allowlist guarantees
+    # field names are safe identifiers.
+    set_fragments: list[str] = []
+    params: list[Any] = [target_task_id]
+    for fname, fval in update.items():
+        params.append(fval)
+        cast = "::timestamptz" if fname == "due_at" else ""
+        set_fragments.append(f"{fname} = ${len(params)}{cast}")
+    set_fragments.append("version = version + 1")
+    set_fragments.append("last_activity_at = now()")
+    set_fragments.append("updated_at = now()")
+    sql = f"UPDATE tasks SET {', '.join(set_fragments)} WHERE id = $1::uuid"
+    await conn.execute(sql, *params)
+
+    reviewer_id = reviewer.id if reviewer.principal_type == "user" else None
+
+    # ----- Bump per-field version counters (one row per touched field) -----
+    for fname in update.keys():
+        await conn.execute(
+            """
+            INSERT INTO task_field_versions
+              (task_id, field_name, version, updated_by, source_event_id)
+            VALUES ($1::uuid, $2, 1, $3::uuid, $4::uuid)
+            ON CONFLICT (task_id, field_name) DO UPDATE
+              SET version         = task_field_versions.version + 1,
+                  updated_at      = now(),
+                  updated_by      = EXCLUDED.updated_by,
+                  source_event_id = EXCLUDED.source_event_id
+            """,
+            target_task_id,
+            fname,
+            reviewer_id,
+            ingest_event_id,
+        )
+
+    # ----- One task_history row per changed field -----
+    actor_type = "user" if reviewer.principal_type == "user" else "service"
+    actor_user_id = reviewer.id if actor_type == "user" else None
+    actor_service_id = reviewer.id if actor_type == "service" else None
+    for fname, new_val in update.items():
+        old_val = task_row[fname] if fname in task_row else None
+        await conn.execute(
+            """
+            INSERT INTO task_history
+              (task_id, mutation_id, field_name, change_type,
+               old_value, new_value,
+               actor_user_id, actor_service_account_id, actor_type,
+               source_event_id, reason, confidence)
+            VALUES
+              ($1::uuid, $2, $3, 'update',
+               $4::jsonb, $5::jsonb,
+               $6::uuid, $7::uuid, $8,
+               $9::uuid, $10, $11)
+            """,
+            target_task_id,
+            f"review:{review_item_id}:{fname}",
+            fname,
+            json.dumps(old_val),
+            json.dumps(new_val),
+            actor_user_id,
+            actor_service_id,
+            actor_type,
+            ingest_event_id,
+            f"approved review_item {review_item_id} (field {fname})",
+            confidence,
+        )
+
+    return target_task_id
+
+
+# ---------------------------------------------------------------------------
+# COMPLETE_TASK
+# ---------------------------------------------------------------------------
+
+# Fields that change on a complete. Per Codex chunk-4-step1 review:
+# track these explicitly so the version vocabulary is documented.
+_COMPLETE_FIELD_NAMES = ("status", "completed_at", "completed_by", "completion_note")
+
+
+async def _apply_complete_task(
+    conn,
+    *,
+    review_item_id: str,
+    ingest_event_id: str,
+    target_task_id: str,
+    proposed_patch: dict,
+    base_task_version: int | None,
+    confidence: float | None,
+    reviewer: Principal,
+) -> str:
+    """Apply a COMPLETE_TASK proposal. Returns target_task_id.
+
+    COMPLETE uses whole-task version concurrency only (base_task_version
+    must equal current tasks.version). Per-field comparison is overkill
+    here — completion is a coherent transition; if anyone touched the
+    task in any way since the review was queued, the reviewer should
+    look again.
+
+    Conflicts:
+      - target_not_found / target_deleted
+      - task_already_done (current status is 'done')
+      - task_version_moved
+    """
+    complete = proposed_patch.get("complete") or {}
+    completion_note = complete.get("completion_note")
+
+    task_row = await conn.fetchrow(
+        """
+        SELECT id::text AS id, status::text AS status,
+               deletion_state::text AS deletion_state,
+               completion_note, completed_at::text AS completed_at,
+               version
+        FROM tasks WHERE id = $1::uuid FOR UPDATE
+        """,
+        target_task_id,
+    )
+    if not task_row:
+        raise ApplyConflict("target_not_found", {"target_task_id": target_task_id})
+    if task_row["deletion_state"] != "active":
+        raise ApplyConflict("target_deleted",
+                            {"target_task_id": target_task_id,
+                             "deletion_state": task_row["deletion_state"]})
+    if task_row["status"] == "done":
+        raise ApplyConflict("task_already_done",
+                            {"target_task_id": target_task_id,
+                             "current_status": task_row["status"]})
+    if base_task_version is not None and task_row["version"] != base_task_version:
+        raise ApplyConflict("task_version_moved", {
+            "target_task_id": target_task_id,
+            "base_task_version": base_task_version,
+            "current_task_version": task_row["version"],
+        })
+
+    reviewer_id = reviewer.id if reviewer.principal_type == "user" else None
+
+    # ----- Mutate tasks: status -> done, completed_at, completed_by, note -----
+    completed_row = await conn.fetchrow(
+        """
+        UPDATE tasks
+           SET status          = 'done',
+               completed_at    = now(),
+               completed_by    = $2::uuid,
+               completion_note = $3,
+               version         = version + 1,
+               last_activity_at = now(),
+               updated_at      = now()
+         WHERE id = $1::uuid
+        RETURNING completed_at::text AS completed_at
+        """,
+        target_task_id,
+        reviewer_id,
+        completion_note,
+    )
+    new_completed_at = completed_row["completed_at"] if completed_row else None
+
+    # ----- Bump per-field versions (status / completed_at / completed_by / completion_note) -----
+    for fname in _COMPLETE_FIELD_NAMES:
+        await conn.execute(
+            """
+            INSERT INTO task_field_versions
+              (task_id, field_name, version, updated_by, source_event_id)
+            VALUES ($1::uuid, $2, 1, $3::uuid, $4::uuid)
+            ON CONFLICT (task_id, field_name) DO UPDATE
+              SET version         = task_field_versions.version + 1,
+                  updated_at      = now(),
+                  updated_by      = EXCLUDED.updated_by,
+                  source_event_id = EXCLUDED.source_event_id
+            """,
+            target_task_id,
+            fname,
+            reviewer_id,
+            ingest_event_id,
+        )
+
+    # ----- task_history: one row per mutated field -----
+    actor_type = "user" if reviewer.principal_type == "user" else "service"
+    actor_user_id = reviewer.id if actor_type == "user" else None
+    actor_service_id = reviewer.id if actor_type == "service" else None
+
+    history_rows = (
+        ("status", task_row["status"], "done"),
+        ("completed_at", task_row["completed_at"], new_completed_at),
+        ("completed_by", None, str(reviewer_id) if reviewer_id else None),
+        ("completion_note", task_row["completion_note"], completion_note),
+    )
+    for fname, old_val, new_val in history_rows:
+        await conn.execute(
+            """
+            INSERT INTO task_history
+              (task_id, mutation_id, field_name, change_type,
+               old_value, new_value,
+               actor_user_id, actor_service_account_id, actor_type,
+               source_event_id, reason, confidence)
+            VALUES
+              ($1::uuid, $2, $3, 'complete',
+               $4::jsonb, $5::jsonb,
+               $6::uuid, $7::uuid, $8,
+               $9::uuid, $10, $11)
+            """,
+            target_task_id,
+            f"review:{review_item_id}:{fname}",
+            fname,
+            json.dumps(old_val),
+            json.dumps(new_val),
+            actor_user_id,
+            actor_service_id,
+            actor_type,
+            ingest_event_id,
+            f"approved complete from review_item {review_item_id} (field {fname})",
+            confidence,
+        )
+
+    # ----- task_state_transitions: open -> done, one per business -----
+    biz_rows = await conn.fetch(
+        "SELECT business_id::text AS business_id "
+        "FROM task_businesses WHERE task_id = $1::uuid",
+        target_task_id,
+    )
+    for biz in biz_rows:
+        await conn.execute(
+            """
+            INSERT INTO task_state_transitions
+              (task_id, business_id, from_state, to_state,
+               actor_kind, actor_user_id, actor_service_account_id,
+               reason, metadata)
+            VALUES
+              ($1::uuid, $2::uuid, 'open', 'done',
+               $3, $4::uuid, $5::uuid,
+               $6, $7::jsonb)
+            """,
+            target_task_id,
+            biz["business_id"],
+            actor_type,
+            actor_user_id,
+            actor_service_id,
+            f"complete from review_item {review_item_id}",
+            json.dumps({"review_item_id": review_item_id,
+                        "ingest_event_id": ingest_event_id}),
+        )
+
+    return target_task_id
