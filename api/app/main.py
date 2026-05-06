@@ -34,7 +34,7 @@ log = logging.getLogger("opsmemory.main")
 CSP_HEADER = (
     "default-src 'self'; "
     "script-src 'self'; "
-    "style-src 'self' 'unsafe-inline'; "
+    "style-src 'self'; "
     "img-src 'self' data:; "
     "connect-src 'self'; "
     "manifest-src 'self'; "
@@ -45,9 +45,17 @@ CSP_HEADER = (
     "frame-ancestors 'none'"
 )
 
+# Origins allowed for browser write requests. Cloudflare Access already
+# gates all traffic at the edge, but enforcing Origin at the app layer is
+# defense in depth against any future cross-origin browser exploit.
+# Service-account requests (X-OpsMemory-Service-Key) bypass this check —
+# they aren't browsers and don't send Origin.
+ALLOWED_ORIGINS = {"https://tracker.kyleconway.ai"}
+WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
-    """Inject request ID, log start/end, attach security headers."""
+    """Inject request ID, log start/end, attach security headers, enforce Origin on writes."""
 
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
@@ -57,6 +65,22 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             "req_start",
             extra={"request_id": request_id, "method": request.method, "path": request.url.path},
         )
+
+        # Origin check on browser write requests (Chunk 1.5 step 10).
+        # Service-account requests bypass — they don't carry a browser Origin.
+        if request.method in WRITE_METHODS and not request.headers.get("X-OpsMemory-Service-Key"):
+            origin = request.headers.get("Origin", "")
+            if origin not in ALLOWED_ORIGINS:
+                log.info(
+                    "origin_rejected",
+                    extra={"request_id": request_id, "origin": origin or "(none)", "method": request.method},
+                )
+                response = JSONResponse(
+                    status_code=403,
+                    content={"error": "origin_rejected", "request_id": request_id},
+                )
+                response.headers["X-Request-ID"] = request_id
+                return response
 
         try:
             response = await call_next(request)
@@ -169,6 +193,14 @@ async def serve_manifest() -> FileResponse:
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="not found")
     return FileResponse(path, media_type="application/manifest+json")
+
+
+@app.get("/styles.css")
+async def serve_styles() -> FileResponse:
+    path = _safe_web_path("styles.css")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path, media_type="text/css")
 
 
 @app.get("/sw.js")
