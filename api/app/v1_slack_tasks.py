@@ -362,7 +362,11 @@ async def _query_category_tasks(
         "t.status = 'open'",
         "t.deletion_state = 'active'",
         "t.category IS NOT NULL",
-        "btrim(t.category) ILIKE btrim($1)",
+        # Codex chunk-8-close blocker: prior `ILIKE btrim($1)` would
+        # interpret `%` and `_` in the user's argument as wildcards
+        # ('open_ing' matching 'opening'). Switch to lower-and-trim
+        # equality so the match is truly exact + case-insensitive.
+        "lower(btrim(t.category)) = lower(btrim($1))",
     ]
     params: list[Any] = [category]
     if caller_visible_biz is not None:
@@ -407,6 +411,19 @@ def _format_stale_line(t: Any) -> str:
     return " ".join(parts)
 
 
+# Tasks LIMIT for Slack ephemeral responses. Per Codex chunk-8-close (g):
+# fetch limit+1 and surface "showing first N" when there are more.
+_TASK_LIMIT = 25
+
+
+def _truncated(rows: list[dict], display_limit: int) -> tuple[list[dict], bool]:
+    """Slice rows to display_limit and report whether more existed.
+    Caller fetched display_limit+1 to detect the overflow."""
+    if len(rows) > display_limit:
+        return rows[:display_limit], True
+    return rows, False
+
+
 async def _query_owner_tasks(
     conn,
     owner_user_id: str,
@@ -444,7 +461,7 @@ async def _query_owner_tasks(
         LEFT JOIN businesses b        ON b.id = tb2.business_id
         WHERE {' AND '.join(where)}
         GROUP BY t.id
-        ORDER BY t.due_at NULLS LAST, t.last_activity_at DESC
+        ORDER BY t.due_at NULLS LAST, t.last_activity_at DESC, t.id
         LIMIT {limit}
     """
     rows = await conn.fetch(sql, *params)
@@ -504,9 +521,11 @@ async def slack_tasks(
 
         if head == "stale":
             days = _stale_days()
-            tasks = await _query_stale_tasks(
+            raw = await _query_stale_tasks(
                 conn, caller_visible_biz, days=days,
+                limit=_TASK_LIMIT + 1,
             )
+            tasks, more = _truncated(raw, _TASK_LIMIT)
             if not tasks:
                 return _ephemeral([_section(
                     f"No open tasks have been untouched for "
@@ -515,7 +534,9 @@ async def slack_tasks(
                 )])
             header = (
                 f"*Stale tasks* — {len(tasks)} not touched in "
-                f"{days}+ day{'s' if days != 1 else ''}, oldest first:"
+                f"{days}+ day{'s' if days != 1 else ''}, oldest first"
+                + (" (showing first " + str(_TASK_LIMIT) + ")" if more else "")
+                + ":"
             )
             body_block = "\n".join(_format_stale_line(t) for t in tasks)
             log.info("slack_tasks_stale_query", extra={
@@ -523,6 +544,7 @@ async def slack_tasks(
                 "caller_id": caller["id"],
                 "days": days,
                 "task_count": len(tasks),
+                "truncated": more,
             })
             return _ephemeral([
                 _section(header),
@@ -559,8 +581,11 @@ async def slack_tasks(
             # (return error). Codex chunk-8-step2 STEP 3 PLAN:
             # ambiguity wins.
             if owner_err and owner_err.startswith("No active OpsMemory user"):
+                # Probe with limit+1 so the "showing first N"
+                # truncation hint can fire if there are more.
                 category_tasks = await _query_category_tasks(
                     conn, text, caller_visible_biz,
+                    limit=_TASK_LIMIT + 1,
                 )
                 if category_tasks:
                     return await _render_category_response(
@@ -578,9 +603,11 @@ async def slack_tasks(
             return _ephemeral([_section(owner_err)])
 
         # Owner matched cleanly.
-        tasks = await _query_owner_tasks(
+        raw = await _query_owner_tasks(
             conn, owner["id"], caller_visible_biz,
+            limit=_TASK_LIMIT + 1,
         )
+        tasks, more = _truncated(raw, _TASK_LIMIT)
         if not tasks:
             return _ephemeral([_section(
                 f"*{_md_escape(owner['display_name'])}* has no open tasks "
@@ -588,7 +615,9 @@ async def slack_tasks(
             )])
         header = (
             f"*{_md_escape(owner['display_name'])}* — "
-            f"{len(tasks)} open task{'s' if len(tasks) != 1 else ''}:"
+            f"{len(tasks)} open task{'s' if len(tasks) != 1 else ''}"
+            + (" (showing first " + str(_TASK_LIMIT) + ")" if more else "")
+            + ":"
         )
         body_block = "\n".join(_format_task_line(t) for t in tasks)
         log.info("slack_tasks_owner_query", extra={
@@ -596,6 +625,7 @@ async def slack_tasks(
             "caller_id": caller["id"],
             "owner_id": owner["id"],
             "task_count": len(tasks),
+            "truncated": more,
         })
         return _ephemeral([
             _section(header),
@@ -615,10 +645,12 @@ async def _render_category_response(
     """Shared formatter for both `/tasks category:<name>` and the
     bare-arg category fallback. `prefetched` lets the caller skip a
     second query when it has already run one."""
-    tasks = (prefetched if prefetched is not None
-             else await _query_category_tasks(
-                 conn, category, caller_visible_biz,
-             ))
+    raw = (prefetched if prefetched is not None
+           else await _query_category_tasks(
+               conn, category, caller_visible_biz,
+               limit=_TASK_LIMIT + 1,
+           ))
+    tasks, more = _truncated(raw, _TASK_LIMIT)
     if not tasks:
         return _ephemeral([_section(
             f"No open tasks in category `{_md_escape(category)}` "
@@ -626,7 +658,9 @@ async def _render_category_response(
         )])
     header = (
         f"*Category {_md_escape(category)}* — "
-        f"{len(tasks)} open task{'s' if len(tasks) != 1 else ''}:"
+        f"{len(tasks)} open task{'s' if len(tasks) != 1 else ''}"
+        + (" (showing first " + str(_TASK_LIMIT) + ")" if more else "")
+        + ":"
     )
     body_block = "\n".join(_format_task_line(t) for t in tasks)
     log.info("slack_tasks_category_query", extra={
@@ -634,6 +668,7 @@ async def _render_category_response(
         "caller_id": caller["id"],
         "category": category,
         "task_count": len(tasks),
+        "truncated": more,
     })
     return _ephemeral([
         _section(header),
