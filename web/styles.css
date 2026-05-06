@@ -286,9 +286,10 @@ ul.businesses li {
   font-style: italic;
 }
 
-/* ---- view tabs (top-level: Tasks / Review) ---- */
+/* ---- view tabs (top-level: Tasks / Settings / Review / SOPs) ---- */
 .view-tabs {
   display: flex;
+  flex-wrap: wrap;       /* Codex chunk-10-step3a (7): wrap on mobile */
   gap: 4px;
   padding: 8px 20px 0 20px;
   border-bottom: 1px solid var(--border);
@@ -939,3 +940,78 @@ ul.businesses li {
   margin-left: auto;
 }
 .goto-review:hover { background: rgba(0, 100, 200, 0.15); }
+
+/* ---------------------------------------------------------------- */
+/* Chunk 10 step 3 sub-(a): Settings tab (read-only).               */
+/* ---------------------------------------------------------------- */
+.settings-shell { padding: 16px 20px; }
+.settings-loading { padding: 24px 20px; }
+.settings-section {
+  margin-bottom: 24px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--tile);
+}
+.settings-section h3 { margin: 0 0 12px 0; font-size: 16px; }
+.settings-section h4 { margin: 16px 0 8px 0; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.settings-row:last-child { border-bottom: none; }
+.settings-label { color: var(--muted); flex: 0 0 200px; font-size: 13px; }
+.settings-value { flex: 1; font-size: 14px; }
+.settings-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.badge-default { background: rgba(120, 120, 120, 0.20); color: var(--muted); }
+.badge-granted { background: rgba(0, 150, 0, 0.20); color: #2a8c2a; }
+.badge-denied  { background: var(--error-bg); color: var(--error-fg); }
+.settings-keyfrag {
+  font-family: ui-monospace, "Courier New", monospace;
+  font-size: 12px;
+  background: rgba(120, 120, 120, 0.10);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.settings-kv {
+  font-family: ui-monospace, "Courier New", monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+.settings-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.settings-table th,
+.settings-table td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-table th {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.settings-row-default { opacity: 0.65; }
+.settings-error {
+  background: var(--error-bg);
+  color: var(--error-fg);
+  padding: 8px 12px;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  font-size: 13px;
+}

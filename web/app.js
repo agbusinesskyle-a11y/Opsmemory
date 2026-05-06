@@ -21,7 +21,7 @@ const state = {
   },
   expandedTaskId: null,
   expandedTaskDetail: null,
-  view: 'tasks',                // 'tasks' | 'review' | 'sops' (review/sops admin-only)
+  view: 'tasks',                // 'tasks' | 'review' | 'sops' (admin) | 'settings' (any user)
   review: {
     items: [],
     total: 0,
@@ -75,6 +75,22 @@ const state = {
   // pending in-flight mutations on the rendered task. Cleared when a
   // mutation reaches a terminal state.
   optimistic: {},
+  // Chunk 10 step 3 sub-(a): Settings tab (read-only). Displays
+  // notification prefs, web-push subscriptions, and the server's
+  // VAPID config status. NO permission prompts, NO subscribe, NO
+  // PATCH from this commit — those land in sub-(b)/(c).
+  settings: {
+    prefs: [],
+    subscriptions: [],
+    vapidPublicKey: null,         // null = server not configured (or 503)
+    permissionState: 'default',   // 'default' | 'granted' | 'denied' | 'unsupported'
+    pushApiAvailable: null,       // boolean | null (null = not yet probed)
+    serviceWorkerReady: false,    // resolved with timeout in refreshSettings
+    browserSubscription: null,    // PushSubscription read-only
+    loaded: false,                // first refresh has completed
+    loading: false,               // a refresh is in flight
+    loadError: null,              // inline error pill (does NOT replace shell)
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -349,9 +365,16 @@ function renderHeader() {
     .map(b => `<span class="biz-pill">${escapeHtml(b.name)}</span>`)
     .join(' ');
   const isAdmin = p.role === 'admin';
+  // Codex chunk-10-step3a: Settings is per-user, gated on
+  // principal_type==='user' (the backend's _require_user). Don't
+  // reuse the admin role check.
+  const isUserPrincipal = p.principal_type === 'user';
   const tabs = `
     <div class="view-tabs">
       <button class="view-tab${state.view === 'tasks' ? ' active' : ''}" data-view="tasks">Tasks</button>
+      ${isUserPrincipal
+        ? `<button class="view-tab${state.view === 'settings' ? ' active' : ''}" data-view="settings">Settings</button>`
+        : ''}
       ${isAdmin
         ? `<button class="view-tab${state.view === 'review' ? ' active' : ''}" data-view="review">Review</button>`
         : ''}
@@ -977,6 +1000,11 @@ function render() {
       <div id="sops-area">${renderSopList()}</div>
       ${renderAnchorsSection()}
     `;
+  } else if (state.view === 'settings') {
+    root.innerHTML = `
+      ${renderHeader()}
+      <div id="settings-area">${renderSettings()}</div>
+    `;
   } else {
     root.innerHTML = `
       ${renderHeader()}
@@ -991,6 +1019,256 @@ function renderError(err) {
   const root = document.getElementById('root');
   if (!root) return;
   root.innerHTML = `<div class="error">${escapeHtml(err.message || 'Unknown error.')}</div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 10 step 3 sub-(a) — Settings tab (read-only).
+// ---------------------------------------------------------------------------
+
+// Safe Notification.permission read. Codex chunk-10-step3a (2):
+// using a bare `Notification` reference throws ReferenceError on
+// browsers without the API; gate on `'Notification' in window`.
+function readNotificationPermission() {
+  if (typeof window !== 'undefined'
+      && 'Notification' in window
+      && typeof window.Notification.permission === 'string') {
+    return window.Notification.permission;
+  }
+  return 'unsupported';
+}
+
+function detectPushApiAvailable() {
+  return (typeof window !== 'undefined'
+          && 'PushManager' in window
+          && typeof navigator !== 'undefined'
+          && 'serviceWorker' in navigator
+          && 'Notification' in window);
+}
+
+// Codex chunk-10-step3a (3): wrap navigator.serviceWorker.ready in
+// a timeout. The browser can hang indefinitely if registration is
+// late or fails; the Settings shell must not block on it.
+async function _readServiceWorkerSubscription(timeoutMs) {
+  if (!('serviceWorker' in navigator)) {
+    return { ready: false, subscription: null };
+  }
+  const readyPromise = navigator.serviceWorker.ready.then(reg => {
+    if (!reg || !reg.pushManager) return { ready: true, subscription: null };
+    return reg.pushManager.getSubscription().then(sub => ({
+      ready: true, subscription: sub,
+    }));
+  });
+  const timeoutPromise = new Promise(resolve => {
+    setTimeout(() => resolve({ ready: false, subscription: null, timedOut: true }), timeoutMs);
+  });
+  try {
+    return await Promise.race([readyPromise, timeoutPromise]);
+  } catch (err) {
+    return { ready: false, subscription: null, error: err };
+  }
+}
+
+async function loadNotificationPrefs() {
+  return await api('/v1/notifications/prefs');
+}
+
+async function loadPushSubscriptions() {
+  return await api('/v1/notifications/web_push/subscriptions');
+}
+
+async function loadVapidPublicKey() {
+  // Treat 503 as "server doesn't have VAPID configured" — that's a
+  // valid state, not an error. Per
+  // api/app/v1_notifications.py vapid_public 503 contract.
+  try {
+    const r = await api('/v1/notifications/vapid_public');
+    return r.public_key || null;
+  } catch (err) {
+    if (err && err.status === 503) return null;
+    throw err;
+  }
+}
+
+async function refreshSettings() {
+  state.settings.loading = true;
+  state.settings.loadError = null;
+
+  state.settings.pushApiAvailable = detectPushApiAvailable();
+  state.settings.permissionState = readNotificationPermission();
+
+  // Run the three API loads concurrently so a slow network doesn't
+  // serialize them. SW probe runs in parallel too with its own
+  // timeout.
+  const apiPromises = Promise.all([
+    loadNotificationPrefs(),
+    loadPushSubscriptions(),
+    loadVapidPublicKey(),
+  ]);
+  const swPromise = state.settings.pushApiAvailable
+    ? _readServiceWorkerSubscription(2000)
+    : Promise.resolve({ ready: false, subscription: null });
+
+  try {
+    const [[prefsResp, subsResp, vapidPub], swResult] = await Promise.all([
+      apiPromises, swPromise,
+    ]);
+    state.settings.prefs = (prefsResp && prefsResp.items) || [];
+    state.settings.subscriptions = (subsResp && subsResp.items) || [];
+    state.settings.vapidPublicKey = vapidPub;
+    state.settings.serviceWorkerReady = !!swResult.ready;
+    state.settings.browserSubscription = swResult.subscription || null;
+    state.settings.loaded = true;
+  } catch (err) {
+    state.settings.loadError = (err && err.message) || 'Failed to load settings.';
+  } finally {
+    state.settings.loading = false;
+    render();
+  }
+}
+
+function _shortenKey(key) {
+  // Codex chunk-10-step3a (5): show first 8 + ellipsis + last 4.
+  // Don't call it a 'fingerprint' (we're not hashing). Public key
+  // is non-secret, but rendering 88 base64 chars in the UI is noise.
+  if (!key || typeof key !== 'string') return '';
+  if (key.length <= 16) return key;
+  return key.slice(0, 8) + '…' + key.slice(-4);
+}
+
+function _renderPermissionPill(state_value) {
+  const cls = {
+    'granted': 'badge-granted',
+    'denied':  'badge-denied',
+    'default': 'badge-default',
+    'unsupported': 'badge-default',
+  }[state_value] || 'badge-default';
+  return `<span class="settings-pill ${cls}">${escapeHtml(state_value)}</span>`;
+}
+
+function _renderScheduleSummary(schedule) {
+  if (!schedule || typeof schedule !== 'object') return '<span class="muted">—</span>';
+  const kind = schedule.kind || 'unknown';
+  const tz = schedule.timezone || '';
+  if (kind === 'daily') {
+    const h = (schedule.hour != null) ? String(schedule.hour).padStart(2, '0') : '??';
+    const m = (schedule.minute != null) ? String(schedule.minute).padStart(2, '0') : '00';
+    return escapeHtml(`daily ${h}:${m} ${tz}`);
+  }
+  if (kind === 'weekly') {
+    const days = Array.isArray(schedule.days) ? schedule.days.join(',') : '';
+    const h = (schedule.hour != null) ? String(schedule.hour).padStart(2, '0') : '??';
+    const m = (schedule.minute != null) ? String(schedule.minute).padStart(2, '0') : '00';
+    return escapeHtml(`weekly [${days}] ${h}:${m} ${tz}`);
+  }
+  return escapeHtml(JSON.stringify(schedule));
+}
+
+function _renderSettingsLine(label, value) {
+  return `<div class="settings-row"><span class="settings-label">${escapeHtml(label)}</span><span class="settings-value">${value}</span></div>`;
+}
+
+function renderSettingsWebPushSection() {
+  const s = state.settings;
+  if (s.pushApiAvailable === false) {
+    return `
+      <section class="settings-section">
+        <h3>Web Push</h3>
+        ${_renderSettingsLine('Push API', '<span class="settings-pill badge-default">not supported</span>')}
+        <p class="muted">This browser doesn't support Web Push. Install OpsMemory as a PWA in a supported browser (Chrome, Edge, Firefox, Safari 16.4+) to receive push notifications.</p>
+      </section>
+    `;
+  }
+  const vapidStatus = s.vapidPublicKey
+    ? `<span class="settings-pill badge-granted">configured</span> <code class="settings-keyfrag">${escapeHtml(_shortenKey(s.vapidPublicKey))}</code>`
+    : `<span class="settings-pill badge-default">not configured</span>`;
+  const swStatus = s.serviceWorkerReady
+    ? '<span class="settings-pill badge-granted">ready</span>'
+    : '<span class="settings-pill badge-default">not ready</span>';
+  const browserSubStatus = s.browserSubscription
+    ? '<span class="settings-pill badge-granted">subscribed</span>'
+    : '<span class="settings-pill badge-default">not subscribed</span>';
+
+  const subRows = (s.subscriptions || []).map(sub => `
+    <tr>
+      <td>${escapeHtml(sub.device_label || '(unlabeled device)')}</td>
+      <td><code class="settings-keyfrag">${escapeHtml(_shortenKey(sub.endpoint))}</code></td>
+      <td><span class="settings-pill badge-${sub.status === 'active' ? 'granted' : 'default'}">${escapeHtml(sub.status)}</span></td>
+      <td class="muted">${escapeHtml(sub.last_seen_at || sub.created_at || '')}</td>
+    </tr>
+  `).join('');
+  const subsTable = s.subscriptions && s.subscriptions.length
+    ? `<table class="settings-table">
+         <thead><tr><th>Device</th><th>Endpoint</th><th>Status</th><th>Last seen</th></tr></thead>
+         <tbody>${subRows}</tbody>
+       </table>`
+    : '<p class="muted">No active subscriptions on file.</p>';
+
+  return `
+    <section class="settings-section">
+      <h3>Web Push</h3>
+      ${_renderSettingsLine('Browser Push API', '<span class="settings-pill badge-granted">supported</span>')}
+      ${_renderSettingsLine('Notification permission', _renderPermissionPill(s.permissionState))}
+      ${_renderSettingsLine('Service worker', swStatus)}
+      ${_renderSettingsLine('Server VAPID key', vapidStatus)}
+      ${_renderSettingsLine('This browser', browserSubStatus)}
+      <h4>Active subscriptions</h4>
+      ${subsTable}
+      <p class="muted">Enable / disable controls land in the next update.</p>
+    </section>
+  `;
+}
+
+function renderSettingsPrefsSection() {
+  const s = state.settings;
+  const rows = (s.prefs || []).map(p => {
+    const enabledPill = p.enabled
+      ? '<span class="settings-pill badge-granted">enabled</span>'
+      : '<span class="settings-pill badge-default">disabled</span>';
+    const defaultPill = p.synthesized_default
+      ? ' <span class="settings-pill badge-default" title="No saved row yet — defaults shown.">default not yet saved</span>'
+      : '';
+    const settingsKv = (p.settings && Object.keys(p.settings).length)
+      ? `<code class="settings-kv">${escapeHtml(JSON.stringify(p.settings))}</code>`
+      : '<span class="muted">—</span>';
+    return `
+      <tr class="${p.synthesized_default ? 'settings-row-default' : ''}">
+        <td><strong>${escapeHtml(p.channel)}</strong>${defaultPill}</td>
+        <td>${enabledPill}</td>
+        <td>${_renderScheduleSummary(p.schedule)}</td>
+        <td>${settingsKv}</td>
+      </tr>
+    `;
+  }).join('');
+  const table = s.prefs && s.prefs.length
+    ? `<table class="settings-table">
+         <thead><tr><th>Channel</th><th>Status</th><th>Schedule</th><th>Settings</th></tr></thead>
+         <tbody>${rows}</tbody>
+       </table>`
+    : '<p class="muted">No preferences loaded.</p>';
+  return `
+    <section class="settings-section">
+      <h3>Notification preferences</h3>
+      ${table}
+      <p class="muted">Preferences are read-only here for now. Edit / save controls land in the next update.</p>
+    </section>
+  `;
+}
+
+function renderSettings() {
+  const s = state.settings;
+  if (!s.loaded && s.loading) {
+    return '<div class="settings-loading muted">Loading settings…</div>';
+  }
+  const errorPill = s.loadError
+    ? `<div class="settings-error">⚠ ${escapeHtml(s.loadError)}</div>`
+    : '';
+  return `
+    <div class="settings-shell">
+      ${errorPill}
+      ${renderSettingsWebPushSection()}
+      ${renderSettingsPrefsSection()}
+    </div>
+  `;
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +1295,14 @@ function attachEventHandlers() {
       } else if (v === 'sops') {
         state.sops.loadError = null;
         await refreshSops();
+      } else if (v === 'settings') {
+        state.settings.loadError = null;
+        // Render the loading shell first, then load on demand.
+        // Codex chunk-10-step3a: refreshSettings reports its own
+        // errors inline (loadError pill) rather than replacing the
+        // shell via renderError().
+        render();
+        await refreshSettings();
       } else {
         render();
       }
