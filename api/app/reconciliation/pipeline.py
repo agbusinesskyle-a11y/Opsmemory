@@ -27,6 +27,7 @@ from .extract import extract
 from .normalize import normalize_candidates
 from .retrieve import retrieve_candidates
 from .choose import choose_action
+from .slack_resolve import resolve_slack_context
 from .sources import get_source_config
 from .validate import validate_decision
 
@@ -179,6 +180,14 @@ async def process_event(conn, event_id: str) -> dict:
 
     # ---- Normalize ----
     normalized = normalize_candidates(candidates_raw)
+
+    # ---- Source-specific resolvers (Slack channel + mention -> canonical) ----
+    if event["source"] == "slack_message":
+        for cand in normalized:
+            await resolve_slack_context(
+                conn, cand,
+                source_metadata=event["source_metadata"],
+            )
 
     if not normalized:
         # No actionable candidates extracted — completed with zero review items.

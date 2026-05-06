@@ -122,9 +122,20 @@ def normalize_candidate(raw: dict, *, now: datetime | None = None) -> dict:
     owner_display = _resolve_owner_display(raw.get("owner_hint"))
     businesses = _resolve_businesses(raw.get("businesses_hint") or [])
     due = _resolve_due(raw.get("due_hint"), now=now)
+    # Pass through Slack mention ids unchanged. Source-specific resolvers
+    # (slack_resolve.py) read them after this step. Filter to a list of
+    # plain strings so a hostile/buggy LLM payload can't smuggle nested
+    # objects into the candidate.
+    raw_slack_ids = raw.get("owner_slack_user_ids")
+    owner_slack_user_ids: list[str] = []
+    if isinstance(raw_slack_ids, list):
+        for entry in raw_slack_ids:
+            if isinstance(entry, str) and 0 < len(entry) <= 64:
+                owner_slack_user_ids.append(entry)
     return {
         "summary": summary,
         "owner_display": owner_display,
+        "owner_slack_user_ids": owner_slack_user_ids,
         "businesses": businesses,
         "due_at": due,
         "dependency_text": (raw.get("dependency_hint") or None),
