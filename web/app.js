@@ -43,9 +43,12 @@ const state = {
     selectedVersionDetail: null, // { version, template_tasks[] }
     loadError: null,
     // UI 2/3: inline authoring. When non-null, the SOP detail
-    // renders an editable template table for state.sops.editing.versionNo
-    // instead of the read-only list.
-    editing: null,              // null | { versionNo, templates: [...], saving, saveError, publishError, pending }
+    // renders an editable template table for the editing target.
+    // Scoped by BOTH sopId and versionNo (Codex chunk-7-step4-ui2
+    // blocker — without sopId scoping, expanding another SOP and
+    // hitting Save would clobber the new SOP with the prior SOP's
+    // template buffer).
+    editing: null,              // null | { sopId, versionNo, templates, saving, saveError, publishError, pending, dirty }
   },
   // Sync indicator state. The header pill reads from these.
   sync: {
@@ -600,7 +603,10 @@ function renderSopVersionRow(version, expanded) {
   const publishedLine = version.published_at
     ? `<span class="muted">published ${escapeHtml(fmtRelative(version.published_at))}</span>`
     : '';
+  // Editor is scoped to (sopId, versionNo). state.sops.expandedId is
+  // the SOP whose detail block this row renders inside.
   const isEditing = state.sops.editing
+                  && state.sops.editing.sopId === state.sops.expandedId
                   && state.sops.editing.versionNo === version.version_no;
   let templatesBlock = '';
   if (expanded && isEditing) {
@@ -771,6 +777,13 @@ function attachEventHandlers() {
     btn.addEventListener('click', async () => {
       const v = btn.dataset.view;
       if (state.view === v) return;
+      // Codex chunk-7-step4-ui2 blocker: clear SOP editor on view
+      // change so a stale editing state can't pick up a different
+      // SOP/version on save.
+      if (state.sops.editing && state.sops.editing.dirty) {
+        if (!window.confirm('Discard unsaved SOP template edits?')) return;
+      }
+      state.sops.editing = null;
       state.view = v;
       state.review.actionError = null;
       if (v === 'review') {
@@ -787,6 +800,10 @@ function attachEventHandlers() {
   // ----- SOPs view handlers -----
   document.querySelectorAll('.sop-status-tab').forEach(btn => {
     btn.addEventListener('click', async () => {
+      if (state.sops.editing && state.sops.editing.dirty) {
+        if (!window.confirm('Discard unsaved SOP template edits?')) return;
+      }
+      state.sops.editing = null;
       state.sops.statusFilter = btn.dataset.sopStatus;
       state.sops.expandedId = null;
       state.sops.expandedDetail = null;
@@ -798,6 +815,14 @@ function attachEventHandlers() {
   const sopBizFilter = document.getElementById('sop-business-filter');
   if (sopBizFilter) {
     sopBizFilter.addEventListener('change', async () => {
+      if (state.sops.editing && state.sops.editing.dirty) {
+        if (!window.confirm('Discard unsaved SOP template edits?')) {
+          // Revert the dropdown to the prior selection.
+          sopBizFilter.value = state.sops.businessFilter;
+          return;
+        }
+      }
+      state.sops.editing = null;
       state.sops.businessFilter = sopBizFilter.value;
       state.sops.expandedId = null;
       state.sops.expandedDetail = null;
@@ -812,7 +837,24 @@ function attachEventHandlers() {
       if (e.target.closest('.sop-version')) return;
       if (e.target.closest('button')) return;
       const sopId = li.dataset.sopId;
+      // Codex chunk-7-step4-ui2 blocker: switching SOPs while editing
+      // would leave stale editing state pointed at the other SOP's
+      // version-no. Clear with dirty-confirm.
+      if (state.sops.editing
+          && state.sops.editing.sopId !== sopId
+          && state.sops.editing.dirty) {
+        if (!window.confirm('Discard unsaved SOP template edits?')) return;
+      }
+      if (state.sops.editing && state.sops.editing.sopId !== sopId) {
+        state.sops.editing = null;
+      }
       if (state.sops.expandedId === sopId) {
+        // Collapsing the currently-edited SOP also clears editing
+        // (with dirty-confirm above already handled).
+        if (state.sops.editing && state.sops.editing.dirty) {
+          if (!window.confirm('Discard unsaved SOP template edits?')) return;
+        }
+        state.sops.editing = null;
         state.sops.expandedId = null;
         state.sops.expandedDetail = null;
         state.sops.selectedVersionNo = null;
@@ -841,27 +883,39 @@ function attachEventHandlers() {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       const sopId = btn.dataset.sopId;
+      let newVersion;
       try {
-        const newVersion = await createSopDraftVersion(sopId, {});
-        // Refresh the SOP detail so the new draft row appears, then
-        // open it in edit mode.
+        newVersion = await createSopDraftVersion(sopId, {});
+      } catch (err) {
+        state.sops.loadError = formatSopError('create draft', err);
+        render();
+        return;
+      }
+      // Draft is created server-side. Try to refresh the local detail
+      // so the new row appears; on refresh failure, surface "draft
+      // created; refresh failed locally" rather than swallowing the
+      // create success (Codex chunk-7-step4-ui2 (h)).
+      try {
         const detail = await loadSopDetail(sopId);
         state.sops.expandedDetail = detail;
-        state.sops.selectedVersionNo = newVersion.version_no;
-        state.sops.selectedVersionDetail = { version: newVersion, template_tasks: [] };
-        state.sops.editing = {
-          versionNo: newVersion.version_no,
-          templates: [],
-          saving: false,
-          saveError: null,
-          publishError: null,
-          pending: null,
-        };
+      } catch {
+        state.sops.loadError = 'Draft created; UI refresh failed. Reload to see it.';
         render();
-      } catch (err) {
-        state.sops.loadError = err.message || 'Failed to create draft version.';
-        render();
+        return;
       }
+      state.sops.selectedVersionNo = newVersion.version_no;
+      state.sops.selectedVersionDetail = { version: newVersion, template_tasks: [] };
+      state.sops.editing = {
+        sopId,
+        versionNo: newVersion.version_no,
+        templates: [],
+        saving: false,
+        saveError: null,
+        publishError: null,
+        pending: null,
+        dirty: false,
+      };
+      render();
     });
   });
 
@@ -870,8 +924,32 @@ function attachEventHandlers() {
       e.stopPropagation();
       const versionNo = parseInt(btn.dataset.versionNo, 10);
       const sopId = state.sops.expandedId;
-      // Use existing template list as the editing baseline.
-      const detail = state.sops.selectedVersionDetail;
+      if (!sopId) return;
+      // Codex chunk-7-step4-ui2 blocker: must load version detail
+      // BEFORE entering edit mode if the loaded detail doesn't
+      // match this (sopId, versionNo). Otherwise a fast click on
+      // a slow network opens an empty editor over a real draft
+      // and Save (replace-all PATCH) wipes the draft's templates.
+      let detail = state.sops.selectedVersionDetail;
+      const detailMatches = detail
+        && state.sops.selectedVersionNo === versionNo;
+      if (!detailMatches) {
+        try {
+          detail = await loadSopVersionDetail(sopId, versionNo);
+          // Race: another click changed the selection while this
+          // fetch was in flight.
+          if (state.sops.expandedId !== sopId
+              || state.sops.selectedVersionNo !== versionNo) {
+            // Update detail anyway so the next render is consistent.
+            return;
+          }
+          state.sops.selectedVersionDetail = detail;
+        } catch (err) {
+          state.sops.loadError = formatSopError('load draft', err);
+          render();
+          return;
+        }
+      }
       const baseline = (detail && detail.template_tasks)
         ? detail.template_tasks.map(t => ({
             summary: t.summary || '',
@@ -884,12 +962,14 @@ function attachEventHandlers() {
           }))
         : [];
       state.sops.editing = {
+        sopId,
         versionNo,
         templates: baseline,
         saving: false,
         saveError: null,
         publishError: null,
         pending: null,
+        dirty: false,
       };
       render();
     });
@@ -912,6 +992,7 @@ function attachEventHandlers() {
         value = null;  // empty string -> null for optional fields
       }
       state.sops.editing.templates[idx][field] = value;
+      state.sops.editing.dirty = true;
       // No re-render: input keeps focus.
     });
   });
@@ -922,6 +1003,7 @@ function attachEventHandlers() {
       if (!state.sops.editing) return;
       const idx = parseInt(btn.dataset.editIdx, 10);
       state.sops.editing.templates.splice(idx, 1);
+      state.sops.editing.dirty = true;
       render();
     });
   });
@@ -939,6 +1021,7 @@ function attachEventHandlers() {
         priority: '',
         owner_role: '',
       });
+      state.sops.editing.dirty = true;
       render();
     });
   });
@@ -946,6 +1029,9 @@ function attachEventHandlers() {
   document.querySelectorAll('.sop-edit-cancel').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (state.sops.editing && state.sops.editing.dirty) {
+        if (!window.confirm('Discard unsaved template edits?')) return;
+      }
       state.sops.editing = null;
       render();
     });
@@ -954,39 +1040,7 @@ function attachEventHandlers() {
   document.querySelectorAll('.sop-edit-save').forEach(btn => {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (!state.sops.editing) return;
-      const sopId = state.sops.expandedId;
-      const versionNo = state.sops.editing.versionNo;
-      // Drop empty rows (a user added a row then didn't fill it).
-      const cleaned = state.sops.editing.templates
-        .filter(t => (t.summary || '').trim().length > 0)
-        // Coerce empty strings -> null for optional fields the server
-        // expects to be either real strings or absent.
-        .map(t => ({
-          summary: t.summary.trim(),
-          description: t.description ? t.description.trim() : null,
-          due_offset_days: t.due_offset_days,
-          dependency_text: t.dependency_text ? t.dependency_text.trim() : null,
-          category: t.category ? t.category.trim() : null,
-          priority: t.priority ? t.priority.trim() : null,
-          owner_role: t.owner_role ? t.owner_role.trim() : null,
-        }));
-      state.sops.editing.pending = 'save';
-      state.sops.editing.saveError = null;
-      render();
-      try {
-        await saveSopTemplates(sopId, versionNo, cleaned);
-        // Reload version detail so the read-only template panel
-        // matches what's now on the server.
-        const fresh = await loadSopVersionDetail(sopId, versionNo);
-        state.sops.selectedVersionDetail = fresh;
-        state.sops.editing.templates = cleaned;
-        state.sops.editing.pending = null;
-      } catch (err) {
-        state.sops.editing.pending = null;
-        state.sops.editing.saveError = formatActionError('save templates', err);
-      }
-      render();
+      await _saveSopTemplatesFlow();
     });
   });
 
@@ -994,31 +1048,47 @@ function attachEventHandlers() {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (!state.sops.editing) return;
-      const sopId = state.sops.expandedId;
       const versionNo = state.sops.editing.versionNo;
       const ok = window.confirm(
         `Publish v${versionNo}? Any prior published version will be superseded. Templates become immutable after publish.`
       );
       if (!ok) return;
+      // Codex chunk-7-step4-ui2 blocker: Publish must consume any
+      // unsaved editor changes first; otherwise the OLD draft state
+      // is published and frozen, silently losing the edits.
+      if (state.sops.editing.dirty) {
+        const saved = await _saveSopTemplatesFlow();
+        if (!saved) return;  // save failed; surface error and stop
+      }
       const changeLog = window.prompt('Change log (optional):', '') || '';
-      state.sops.editing.pending = 'publish';
-      state.sops.editing.publishError = null;
+      const ed = state.sops.editing;
+      if (!ed) return;
+      const sopId = ed.sopId;
+      ed.pending = 'publish';
+      ed.publishError = null;
       render();
       try {
         await publishSopVersion(sopId, versionNo,
                                  changeLog.trim() ? { change_log: changeLog.trim() } : {});
-        // Refresh: SOP detail now shows the new published version
-        // + previous published version moved to superseded.
+      } catch (err) {
+        ed.pending = null;
+        ed.publishError = formatSopError('publish', err);
+        render();
+        return;
+      }
+      // Publish succeeded server-side. Clear editing first so a
+      // subsequent refresh failure doesn't leave a misleading editor
+      // open (Codex chunk-7-step4-ui2 (i)).
+      state.sops.editing = null;
+      try {
         const detail = await loadSopDetail(sopId);
         state.sops.expandedDetail = detail;
         state.sops.selectedVersionDetail = await loadSopVersionDetail(sopId, versionNo);
-        state.sops.editing = null;
-        await refreshSops();  // pick up the new latest_version_no on the list row
-      } catch (err) {
-        state.sops.editing.pending = null;
-        state.sops.editing.publishError = formatActionError('publish', err);
-        render();
+        await refreshSops();
+      } catch {
+        state.sops.loadError = 'Published; UI refresh failed. Reload to see latest state.';
       }
+      render();
     });
   });
 
@@ -1272,6 +1342,101 @@ function formatActionError(verb, err) {
   }
   if (err.kind === 'validation') {
     return `Validation failed during ${verb}. Item demoted to needs_changes — see Last apply error.`;
+  }
+  if (err.kind === 'not_implemented') {
+    return `Action not yet implemented.`;
+  }
+  return err.message || `Failed to ${verb}.`;
+}
+
+// Shared save flow used by both Save Templates and Publish (Publish
+// auto-saves first when dirty per Codex chunk-7-step4-ui2 blocker #2).
+// Returns true on save success (or no-op when not dirty), false on
+// failure. Surfaces error in state.sops.editing.saveError.
+async function _saveSopTemplatesFlow() {
+  if (!state.sops.editing) return false;
+  const ed = state.sops.editing;
+  const sopId = ed.sopId;
+  const versionNo = ed.versionNo;
+
+  // Validate due_offset_days client-side per Codex chunk-7-step4-ui2 (b)
+  // — server's 422 is a backstop, but clearer feedback up front.
+  for (let i = 0; i < ed.templates.length; i++) {
+    const t = ed.templates[i];
+    if (t.due_offset_days != null) {
+      if (typeof t.due_offset_days !== 'number'
+          || t.due_offset_days < -3650
+          || t.due_offset_days > 3650) {
+        ed.saveError = `Row ${i + 1}: due_offset_days must be an integer between -3650 and 3650.`;
+        render();
+        return false;
+      }
+    }
+  }
+
+  // Drop empty rows (a user added a row then didn't fill it).
+  const cleaned = ed.templates
+    .filter(t => (t.summary || '').trim().length > 0)
+    .map(t => ({
+      summary: t.summary.trim(),
+      description: t.description ? t.description.trim() : null,
+      due_offset_days: t.due_offset_days,
+      dependency_text: t.dependency_text ? t.dependency_text.trim() : null,
+      category: t.category ? t.category.trim() : null,
+      priority: t.priority ? t.priority.trim() : null,
+      owner_role: t.owner_role ? t.owner_role.trim() : null,
+    }));
+
+  // Codex chunk-7-step4-ui2 (e): block save when cleaned would be
+  // empty AND the version had non-zero templates already (would wipe
+  // a previously valid draft). For a brand-new draft (zero templates
+  // on server) saving empty is harmless but pointless — block too.
+  if (cleaned.length === 0) {
+    ed.saveError = 'Cannot save an empty template list. Add at least one row with a summary.';
+    render();
+    return false;
+  }
+
+  ed.pending = 'save';
+  ed.saveError = null;
+  render();
+  try {
+    await saveSopTemplates(sopId, versionNo, cleaned);
+    const fresh = await loadSopVersionDetail(sopId, versionNo);
+    if (state.sops.editing && state.sops.editing.sopId === sopId
+        && state.sops.editing.versionNo === versionNo) {
+      state.sops.selectedVersionDetail = fresh;
+      state.sops.editing.templates = cleaned;
+      state.sops.editing.dirty = false;
+      state.sops.editing.pending = null;
+    }
+    render();
+    return true;
+  } catch (err) {
+    if (state.sops.editing && state.sops.editing.sopId === sopId
+        && state.sops.editing.versionNo === versionNo) {
+      state.sops.editing.pending = null;
+      state.sops.editing.saveError = formatSopError('save templates', err);
+    }
+    render();
+    return false;
+  }
+}
+
+// SOP-specific formatter (Codex chunk-7-step4-ui2 fix — formatActionError
+// uses review-queue-specific phrasing about "demoted to needs_changes"
+// which is wrong for SOP errors).
+function formatSopError(verb, err) {
+  if (!err) return `Failed to ${verb}.`;
+  if (err.kind === 'conflict') {
+    const code = err.body && err.body.detail && err.body.detail.code;
+    return `Conflict during ${verb}` + (code ? ` (${code})` : '') +
+           `. Refresh the SOP and try again.`;
+  }
+  if (err.kind === 'validation') {
+    const detail = err.body && err.body.detail;
+    if (typeof detail === 'string') return `Validation failed: ${detail}.`;
+    return `Validation failed during ${verb}.`;
   }
   if (err.kind === 'not_implemented') {
     return `Action not yet implemented.`;
