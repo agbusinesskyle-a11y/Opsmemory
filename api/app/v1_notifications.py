@@ -434,24 +434,42 @@ async def revoke_subscription(
     sid = str(subscription_id)
     pool = request.app.state.db
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            """
-            UPDATE web_push_subscriptions
-               SET status = 'revoked'
-             WHERE id = $1::uuid
-               AND user_id = $2::uuid
-               AND status = 'active'
-            """,
-            sid, principal.id,
-        )
-        if result.endswith(" 0"):
-            raise HTTPException(
-                status_code=404,
-                detail={"code": "subscription_not_found", "id": sid},
+        # Codex chunk-10-step2 (e): make this idempotent. Two-phase
+        # check: first see if the row exists for this user (any
+        # status); if yes, set to revoked and return success even if
+        # already revoked. Only return 404 when the id genuinely
+        # doesn't belong to this user (or doesn't exist at all).
+        # This makes retry/double-click/ambiguous-network safe.
+        async with conn.transaction():
+            owner = await conn.fetchrow(
+                """
+                SELECT id, status
+                  FROM web_push_subscriptions
+                 WHERE id = $1::uuid
+                   AND user_id = $2::uuid
+                 FOR UPDATE
+                """,
+                sid, principal.id,
             )
+            if owner is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "subscription_not_found", "id": sid},
+                )
+            already_revoked = owner["status"] == "revoked"
+            if not already_revoked:
+                await conn.execute(
+                    """
+                    UPDATE web_push_subscriptions
+                       SET status = 'revoked'
+                     WHERE id = $1::uuid
+                    """,
+                    sid,
+                )
     log.info("notifications_subscription_revoked", extra={
         "user_id": principal.id,
         "subscription_id": sid,
+        "already_revoked": already_revoked,
     })
     return {"id": sid, "status": "revoked"}
 

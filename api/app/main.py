@@ -163,11 +163,10 @@ def _enforce_production_safety() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _enforce_production_safety()
-    pool = await init_pool()
-    app.state.db = pool
-    # Chunk 10 step 2: VAPID config validation. Cleanly-unconfigured
-    # is OK (Web Push just returns 503). Partially-configured is
-    # fatal (operator started setup but didn't finish).
+    # Chunk 10 step 2: VAPID config validation runs BEFORE init_pool
+    # (Codex chunk-10-step2 review (f)). Cleanly-unconfigured is OK
+    # (Web Push just returns 503). Partially-configured / malformed
+    # is fatal — fail before opening DB connections.
     try:
         vapid = validate_vapid_config({k: v for k, v in os.environ.items()})
     except ValueError as exc:
@@ -181,6 +180,8 @@ async def lifespan(app: FastAPI):
         log.info("vapid_not_configured",
                  extra={"detail": "VAPID env vars unset; Web Push endpoints "
                                   "return 503 vapid_unconfigured"})
+    pool = await init_pool()
+    app.state.db = pool
     log.info("opsmemory_started", extra={"version": os.environ.get("APP_VERSION", "chunk1")})
     try:
         yield
