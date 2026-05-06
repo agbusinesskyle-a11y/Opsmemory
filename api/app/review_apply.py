@@ -450,6 +450,24 @@ async def _apply_create_task(
              "ingest_event_id": ingest_event_id},
         )
 
+    # ----- SOP linkage backfill (Chunk 7 step 3c) -----
+    # If this review_item came from an SOP anchor fire, the
+    # sop_generated_tasks junction has a row pointing at it with
+    # task_id=NULL. Set task_id now so subsequent date-shift
+    # propagation (chunk 7 follow-up) and audit pane queries can
+    # find the materialized task. WHERE task_id IS NULL ensures we
+    # don't clobber a backfill from a reapply / future re-bind path.
+    await conn.execute(
+        """
+        UPDATE sop_generated_tasks
+           SET task_id = $2::uuid
+         WHERE review_item_id = $1::uuid
+           AND task_id IS NULL
+        """,
+        review_item_id,
+        task_id,
+    )
+
     return task_id
 
 

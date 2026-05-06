@@ -9,6 +9,16 @@ SOP-generated, ...).
 pipeline.process_event refuses to run extraction on a source not
 registered here — better to surface the operator gap than to silently
 queue review_items from an unconfigured source.
+
+DIRECT_SOURCES is a separate set of sources whose review_items are
+materialized SYNCHRONOUSLY by an admin endpoint (e.g. SOP anchor
+fire), not by the LLM pipeline. They write ingest_events for
+provenance + sop_generated_tasks junction rows but never go through
+extract / normalize / retrieve / choose / validate. The reconciliation
+worker (scripts/run_pipeline.py) ignores these sources by virtue of
+not finding them in SOURCES; this constant exists so other modules
+can check `source in DIRECT_SOURCES` without re-implementing the
+list.
 """
 
 from __future__ import annotations
@@ -55,3 +65,15 @@ SOURCES: dict[str, SourceConfig] = {
 
 def get_source_config(source: str) -> SourceConfig | None:
     return SOURCES.get(source)
+
+
+# Sources whose review_items get materialized directly by an admin
+# endpoint instead of the LLM pipeline. The fire endpoint
+# (POST /v1/anchor_events/{id}/fire) inserts ingest_events rows with
+# source = 'sop_anchor' for provenance, but the worker never picks
+# them up because they're not in SOURCES.
+DIRECT_SOURCES: frozenset[str] = frozenset({"sop_anchor"})
+
+
+def is_direct_source(source: str) -> bool:
+    return source in DIRECT_SOURCES

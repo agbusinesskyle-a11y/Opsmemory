@@ -25,6 +25,9 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
+import hashlib
+from datetime import timedelta
+
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 from pydantic import BaseModel, Field
@@ -1131,4 +1134,318 @@ async def create_anchor_event(
 
     log.info("anchor_event_created", extra={"id": row["id"], "actor": actor_id})
     return _serialize_anchor(row)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/anchor_events/{id}/fire
+# ---------------------------------------------------------------------------
+
+class _FireAnchorBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    # Reserved for future Codex follow-ups (e.g. dry-run flag); empty
+    # for now so the endpoint accepts {} as a valid POST body.
+
+
+@router.post("/v1/anchor_events/{anchor_id}/fire")
+async def fire_anchor_event(
+    anchor_id: uuid.UUID,
+    body: _FireAnchorBody,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Materialize the SOP at this anchor into review_items SYNCHRONOUSLY.
+
+    Per Codex chunk-7-step2 STEP 3 PLAN: do NOT route SOP fire through
+    the LLM pipeline. Templates are pre-formed candidates with no need
+    for extract/normalize/retrieve/choose. The fire endpoint writes
+    everything in one transaction:
+
+      1. Lock the anchor FOR UPDATE; require state='scheduled'.
+      2. Lock the SOP FOR UPDATE; require status='active' and
+         latest_version_id IS NOT NULL (a published version exists).
+      3. Fetch all sop_template_tasks for the latest version,
+         ordered by seq_no.
+      4. INSERT ingest_events(source='sop_anchor',
+                                status='pending_review') as audit /
+         provenance. The worker (scripts/run_pipeline.py) never picks
+         these up because 'sop_anchor' is not in
+         reconciliation.sources.SOURCES.
+      5. INSERT sop_instances(anchor_event_id, sop_version_id,
+                                ingest_event_id, fired_by). UNIQUE on
+         (anchor_event_id, sop_version_id) prevents re-fire (Codex:
+         "re-firing the same SOP from the same anchor is a noop /
+         409, not a duplicate materialization").
+      6. For each template:
+         - Compute due_at = anchor.scheduled_for + due_offset_days.
+         - INSERT review_items with proposed_action='CREATE_TASK',
+           confidence=1.0, no candidate_facts/retrieved_candidates
+           (deterministic fire — no LLM ambiguity to record), the
+           template's owner_user_id passed through to the apply step.
+         - INSERT sop_generated_tasks linking template -> review_item.
+      7. UPDATE anchor SET state='fired', fired_at, fired_by.
+
+    Approval flow continues unchanged: an admin reviewer goes to the
+    Review tab, sees N pending review_items from this fire, approves
+    each. review_apply._apply_create_task creates the tasks and
+    backfills sop_generated_tasks.task_id (chunk-7-step3c).
+    """
+    require_admin(principal)
+    pool = request.app.state.db
+    actor_id = principal.id if principal.principal_type == "user" else None
+    rid = str(anchor_id)
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            anchor = await conn.fetchrow(
+                """
+                SELECT a.id::text                AS id,
+                       a.business_id::text       AS business_id,
+                       a.kind                    AS kind,
+                       a.sop_id::text            AS sop_id,
+                       a.scheduled_for           AS scheduled_for,
+                       a.state::text             AS state
+                FROM anchor_events a
+                WHERE a.id = $1::uuid
+                FOR UPDATE
+                """,
+                rid,
+            )
+            if not anchor:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "anchor_event_not_found", "id": rid},
+                )
+            if anchor["state"] != "scheduled":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "anchor_not_scheduled",
+                            "state": anchor["state"],
+                            "detail": "only scheduled anchors can fire"},
+                )
+
+            sop = await conn.fetchrow(
+                """
+                SELECT s.id::text                AS id,
+                       s.status::text            AS status,
+                       s.latest_version_id::text AS latest_version_id
+                FROM sops s
+                WHERE s.id = $1::uuid
+                FOR UPDATE
+                """,
+                anchor["sop_id"],
+            )
+            if not sop:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_not_found",
+                            "sop_id": anchor["sop_id"]},
+                )
+            if sop["status"] != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_archived", "sop_id": sop["id"]},
+                )
+            if not sop["latest_version_id"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_unpublished",
+                            "sop_id": sop["id"],
+                            "detail": "SOP has no published version to materialize"},
+                )
+
+            biz = await conn.fetchrow(
+                "SELECT slug::text AS slug FROM businesses WHERE id = $1::uuid",
+                anchor["business_id"],
+            )
+            if not biz:
+                # Should be unreachable: anchor.business_id has FK to businesses.
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "business_missing",
+                            "business_id": anchor["business_id"]},
+                )
+
+            templates = await conn.fetch(
+                """
+                SELECT id::text             AS id,
+                       seq_no               AS seq_no,
+                       summary              AS summary,
+                       description          AS description,
+                       due_offset_days      AS due_offset_days,
+                       dependency_text      AS dependency_text,
+                       category             AS category,
+                       priority             AS priority,
+                       owner_role           AS owner_role,
+                       owner_user_id::text  AS owner_user_id
+                FROM sop_template_tasks
+                WHERE sop_version_id = $1::uuid
+                ORDER BY seq_no
+                """,
+                sop["latest_version_id"],
+            )
+            if not templates:
+                # Defensive: publish endpoint refuses empty versions
+                # too, but if a future migration somehow leaves a
+                # published version with zero templates, refuse fire.
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_version_empty",
+                            "version_id": sop["latest_version_id"]},
+                )
+
+            # ---- Build the audit ingest_events row ----
+            # raw_content carries an operator-readable summary of what
+            # was materialized. normalized_hash is deterministic per
+            # (anchor, version) but doesn't participate in any UNIQUE
+            # for sop_anchor (the meeting_recap-only partial unique
+            # from migration 0006 is the only hash-uniqueness rule).
+            raw_summary = (
+                f"SOP fire: anchor {anchor['id']} kind={anchor['kind']!r} "
+                f"sop {sop['id']} version {sop['latest_version_id']} "
+                f"templates={len(templates)} fired_by={actor_id}"
+            )
+            hash_input = f"sop_anchor:{anchor['id']}:{sop['latest_version_id']}"
+            normalized_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
+
+            ingest_row = await conn.fetchrow(
+                """
+                INSERT INTO ingest_events
+                  (source, source_external_id, raw_content, normalized_hash,
+                   source_metadata, status,
+                   actor_type, actor_user_id, actor_service_account_id,
+                   processing_started_at, processed_at)
+                VALUES
+                  ('sop_anchor', $1, $2, $3, $4::jsonb, 'pending_review',
+                   'user', $5::uuid, NULL,
+                   now(), now())
+                RETURNING id::text AS id
+                """,
+                f"anchor:{anchor['id']}",  # source_external_id = anchor uuid
+                raw_summary,
+                normalized_hash,
+                {
+                    "anchor_event_id": anchor["id"],
+                    "anchor_kind": anchor["kind"],
+                    "sop_id": sop["id"],
+                    "sop_version_id": sop["latest_version_id"],
+                    "scheduled_for": anchor["scheduled_for"].isoformat()
+                                       if anchor["scheduled_for"] else None,
+                    "template_count": len(templates),
+                },
+                actor_id,
+            )
+            ingest_event_id = ingest_row["id"]
+
+            # ---- INSERT sop_instances (UNIQUE collision = noop / 409) ----
+            try:
+                instance_row = await conn.fetchrow(
+                    """
+                    INSERT INTO sop_instances
+                      (anchor_event_id, sop_version_id, ingest_event_id,
+                       fired_by)
+                    VALUES
+                      ($1::uuid, $2::uuid, $3::uuid, $4::uuid)
+                    RETURNING id::text AS id
+                    """,
+                    anchor["id"], sop["latest_version_id"],
+                    ingest_event_id, actor_id,
+                )
+            except asyncpg.UniqueViolationError:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_already_materialized",
+                            "anchor_id": anchor["id"],
+                            "sop_version_id": sop["latest_version_id"],
+                            "detail": "this anchor + version pair has already been fired"},
+                )
+            instance_id = instance_row["id"]
+
+            # ---- Per-template review_items + sop_generated_tasks ----
+            anchor_dt = anchor["scheduled_for"]
+            for t in templates:
+                if t["due_offset_days"] is not None:
+                    due_at = anchor_dt + timedelta(days=int(t["due_offset_days"]))
+                    due_at_iso = due_at.isoformat()
+                else:
+                    due_at_iso = None
+
+                proposed_patch = {
+                    "create": {
+                        "summary": t["summary"],
+                        "due_at": due_at_iso,
+                        "category": t["category"],
+                        "dependency_text": t["dependency_text"],
+                        "businesses": [biz["slug"]],
+                        "owner_display_hint": None,
+                        "owner_user_id": t["owner_user_id"],
+                    }
+                }
+                candidate_facts = {
+                    "summary": t["summary"],
+                    "businesses": [biz["slug"]],
+                    "due_at": due_at_iso,
+                    "category": t["category"],
+                    "dependency_text": t["dependency_text"],
+                    "owner_user_id": t["owner_user_id"],
+                    "sop_template_task_id": t["id"],
+                    "sop_template_seq_no": t["seq_no"],
+                    "source_kind": "sop_anchor",
+                }
+                review_row = await conn.fetchrow(
+                    """
+                    INSERT INTO review_items
+                      (ingest_event_id, proposed_action, target_task_id,
+                       proposed_patch, candidate_facts, retrieved_candidates,
+                       confidence, reason,
+                       base_task_version, base_field_versions,
+                       validation_errors, status)
+                    VALUES
+                      ($1::uuid, 'CREATE_TASK', NULL,
+                       $2::jsonb, $3::jsonb, '[]'::jsonb,
+                       1.0, $4,
+                       NULL, '{}'::jsonb,
+                       '[]'::jsonb, 'pending')
+                    RETURNING id::text AS id
+                    """,
+                    ingest_event_id,
+                    proposed_patch,
+                    candidate_facts,
+                    f"SOP fire: anchor {anchor['id']} template seq {t['seq_no']}",
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO sop_generated_tasks
+                      (sop_instance_id, sop_template_task_id, review_item_id)
+                    VALUES ($1::uuid, $2::uuid, $3::uuid)
+                    """,
+                    instance_id, t["id"], review_row["id"],
+                )
+
+            # ---- Mark anchor fired ----
+            await conn.execute(
+                """
+                UPDATE anchor_events
+                   SET state      = 'fired',
+                       fired_at   = now(),
+                       fired_by   = $2::uuid,
+                       updated_by = $2::uuid
+                 WHERE id = $1::uuid
+                """,
+                anchor["id"], actor_id,
+            )
+
+    log.info("anchor_event_fired", extra={
+        "anchor_id": anchor["id"],
+        "sop_version_id": sop["latest_version_id"],
+        "instance_id": instance_id,
+        "template_count": len(templates),
+        "actor": actor_id,
+    })
+    return {
+        "anchor_event_id": anchor["id"],
+        "sop_instance_id": instance_id,
+        "sop_version_id": sop["latest_version_id"],
+        "ingest_event_id": ingest_event_id,
+        "review_items_created": len(templates),
+    }
 
