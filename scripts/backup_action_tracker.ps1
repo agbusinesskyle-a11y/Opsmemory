@@ -200,6 +200,53 @@ if ($Spark2Target) {
     Write-Host "BACKUP_SPARK2_TARGET not set — skipping rsync"
 }
 
+# ---- Optional: Backblaze B2 offsite upload (Chunk 1.5 step 6) ----------
+# Uses `rclone copy` (NOT sync — sync deletes destination files; copy is
+# additive). No persistent rclone.conf — credentials passed via flags so
+# no secrets land on disk outside .env.
+#
+# Bucket retention is configured at the B2 console (lifecycle rules) —
+# the script just uploads. Local prune still happens via BACKUP_RETENTION_DAYS.
+$B2Enabled = ($env:B2_ENABLED -eq "true")
+$B2Uploaded = $false
+$B2RemotePath = ""
+if ($B2Enabled) {
+    $B2Bucket = $env:B2_BUCKET
+    $B2KeyId = $env:B2_KEY_ID
+    $B2AppKey = $env:B2_APPLICATION_KEY
+    if (-not $B2Bucket -or -not $B2KeyId -or -not $B2AppKey) {
+        Send-FailureAlert "b2_config_missing" "B2_ENABLED=true but bucket/key incomplete"
+        Write-Error "B2_ENABLED=true requires B2_BUCKET + B2_KEY_ID + B2_APPLICATION_KEY"
+        exit 8
+    }
+    if (-not (Get-Command rclone -ErrorAction SilentlyContinue)) {
+        Send-FailureAlert "b2_rclone_missing" "rclone not found in PATH"
+        Write-Error "rclone not found — install via 'sudo curl https://rclone.org/install.sh | sudo bash'"
+        exit 8
+    }
+    # Path layout: bucket/action_tracker/YYYY/MM/<filename>. Uploading the
+    # full backup tree below this prefix means rclone copy can pick up any
+    # new files (including historical ones rsynced from Spark #2).
+    $B2RemotePath = "${B2Bucket}/action_tracker"
+    Write-Host "[$(Get-Date -Format o)] rclone copy -> b2:$B2RemotePath/"
+    & rclone --config /dev/null `
+             --b2-account $B2KeyId `
+             --b2-key $B2AppKey `
+             --b2-hard-delete `
+             --transfers 4 `
+             --b2-chunk-size 96M `
+             copy $BackupRoot ":b2:$B2RemotePath/"
+    if ($LASTEXITCODE -ne 0) {
+        Send-FailureAlert "b2_upload_failed" "exit=$LASTEXITCODE bucket=$B2Bucket"
+        Write-Error "rclone copy to B2 failed (exit $LASTEXITCODE)"
+        exit 8
+    }
+    $B2Uploaded = $true
+    Write-Host "[$(Get-Date -Format o)] B2 upload complete"
+} else {
+    Write-Host "B2_ENABLED!=true — skipping offsite upload"
+}
+
 # ---- Retention prune (local only) --------------------------------------
 # Match both .dump (plaintext) and .dump.gpg (encrypted) so retention works
 # regardless of GPG_ENABLED toggling between runs.
@@ -238,7 +285,8 @@ $Status = [ordered]@{
     pruned_count      = $Pruned
     encrypted         = [bool]$GpgEnabled
     gpg_recipient     = if ($GpgEnabled) { $GpgRecipient } else { "" }
-    offsite           = $false
+    offsite           = [bool]$B2Uploaded
+    b2_remote_path    = if ($B2Uploaded) { $B2RemotePath } else { "" }
     schema_version    = "0001_initial"
 } | ConvertTo-Json
 
