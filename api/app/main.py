@@ -26,6 +26,7 @@ from .health import router as health_router
 from .logging_config import configure_logging
 from .v1 import router as v1_router
 from .v1_ingest import router as v1_ingest_router
+from .v1_review import router as v1_review_router
 
 # ---------------------------------------------------------------------------
 # Logging — proper JSON formatter (escapes quotes/newlines correctly).
@@ -180,6 +181,7 @@ app.add_middleware(RequestContextMiddleware)
 app.include_router(health_router)
 app.include_router(v1_router)
 app.include_router(v1_ingest_router)
+app.include_router(v1_review_router)
 
 
 # ---------------------------------------------------------------------------
