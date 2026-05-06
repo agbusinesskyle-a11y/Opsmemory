@@ -39,17 +39,17 @@ resolve mentions.
 
 ## Business inference
 
-Slack channel name is the strongest business signal:
+Only emit a business hint when the message **text** explicitly names
+one of the businesses:
 
-- channel name contains "redhot" / "rhf" / "az" → `redhot`
-- channel name contains "borderline" / "bf" / "sd" → `borderline`
-- channel is generic (e.g. "general", "random") and the message itself
-  has no explicit business reference → list neither (leave
-  `businesses_hint` empty); the choose / validate step will mark it
-  AMBIGUOUS.
+- "RedHot" / "RedHot Fireworks" → `redhot`
+- "Borderline" / "Borderline Fireworks" → `borderline`
 
-Do NOT guess a business from the message text alone unless an explicit
-business name appears.
+Do NOT infer business from the channel name, channel id, or workspace
+metadata. A deterministic post-extract resolver (outside this prompt)
+maps channel → business when the operator has configured the channel
+mapping. If the message text has no explicit business name, leave
+`businesses_hint` as an empty list `[]`.
 
 ## Noise filter
 

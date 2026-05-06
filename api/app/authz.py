@@ -49,6 +49,13 @@ def require_admin(principal: Principal) -> None:
 SCOPE_INGEST_WRITE = "ingest:write"
 SCOPE_TASKS_READ_ALL = "tasks:read:all"
 SCOPE_BUSINESSES_READ = "businesses:read"
+# Reconciliation pipeline read scope: a service account holding this
+# scope sees all businesses for retrieval (otherwise Slack/email/Excel
+# events ingested by a service principal would skip retrieval and
+# produce only AMBIGUOUS/CREATE proposals). Per least-privilege, this
+# is split from ingest:write so a write-only ingest key can't also
+# read all businesses through the API.
+SCOPE_PIPELINE_READ_ALL = "pipeline:read:all_businesses"
 
 
 def require_scope(principal: Principal, scope: str) -> None:

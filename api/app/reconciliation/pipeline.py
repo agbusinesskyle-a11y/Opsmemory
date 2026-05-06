@@ -96,16 +96,19 @@ async def _resolve_actor_business_ids(conn, event) -> list[str] | None:
         )
         return [r["id"] for r in biz_rows]
     if actor_type == "service" and event["actor_service_account_id"]:
-        # Service accounts that hold the `ingest:write` scope are
-        # trusted infra (n8n forwards, doc ingesters); they need to
-        # see all businesses for retrieval, otherwise Slack/email/Excel
-        # ingest events would skip retrieval and produce only
-        # AMBIGUOUS/CREATE proposals (Codex chunk-5-step1 flag).
+        # Service accounts that hold `pipeline:read:all_businesses` see
+        # all businesses for retrieval. Codex chunk-5-step2 split this
+        # from `ingest:write` per least-privilege: a write-only ingest
+        # key shouldn't implicitly cross-read business data. Operator
+        # grants both scopes to the slack ingest service account.
+        # `tasks:read:all` is honored for back-compat with existing
+        # service accounts.
         row = await conn.fetchrow(
             "SELECT scopes FROM service_accounts WHERE id = $1::uuid",
             event["actor_service_account_id"],
         )
-        if row and "ingest:write" in (row["scopes"] or []):
+        scopes = (row["scopes"] if row else []) or []
+        if "pipeline:read:all_businesses" in scopes or "tasks:read:all" in scopes:
             return None
         return []
     # Fallback: no scoping derivable; refuse to mass-leak — empty.

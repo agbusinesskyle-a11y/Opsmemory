@@ -53,6 +53,7 @@ import asyncpg  # noqa: E402
 
 from api.app.db import register_jsonb_codec  # noqa: E402
 from api.app.reconciliation.pipeline import process_event  # noqa: E402
+from api.app.reconciliation.sources import SOURCES  # noqa: E402
 
 log = logging.getLogger("opsmemory.run_pipeline")
 
@@ -77,6 +78,18 @@ async def main_async(args: argparse.Namespace) -> int:
         max_size=2,
         setup=register_jsonb_codec,
     )
+    # Source allowlist for unfiltered claims. Without this, an event
+    # whose source isn't registered in reconciliation/sources.py would
+    # be marked 'failed' by pipeline.process_event and then re-claimed
+    # by the next worker run forever, with retry_count climbing
+    # unbounded (Codex chunk-5-step2 close blocker).
+    if args.source is not None:
+        # Operator explicitly asked for one source; let them, even if
+        # it's unregistered — they'll see the per-event failure reason.
+        allowed_sources: list[str] | None = [args.source]
+    else:
+        allowed_sources = sorted(SOURCES.keys())
+
     try:
         # Atomic claim: pick up to `limit` rows whose status is received,
         # failed, or stale-extracting; flip them to extracting in the same
@@ -92,7 +105,7 @@ async def main_async(args: argparse.Namespace) -> int:
                            processing_started_at = now()
                      WHERE id = (
                          SELECT id FROM ingest_events
-                          WHERE ($1::text IS NULL OR source = $1)
+                          WHERE source = ANY($1::text[])
                             AND (
                                   status IN ('received', 'failed')
                                OR (status = 'extracting'
@@ -104,7 +117,7 @@ async def main_async(args: argparse.Namespace) -> int:
                        )
                     RETURNING id::text AS id, source::text AS source
                     """,
-                    args.source,
+                    allowed_sources,
                     stale_minutes,
                 )
                 if not row:

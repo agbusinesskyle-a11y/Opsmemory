@@ -27,9 +27,6 @@ class SourceConfig:
     # no due_at hint. None disables the recency fallback (older sources
     # like meeting recaps can match against tasks of any age).
     retrieval_recency_fallback_days: int | None
-    # Whether the extract prompt expects per-message context fields
-    # (channel/user/thread) substituted alongside the body.
-    expects_context: bool = False
 
 
 SOURCES: dict[str, SourceConfig] = {
@@ -43,7 +40,6 @@ SOURCES: dict[str, SourceConfig] = {
         choose_prompt="task_choose.v1",
         retrieval_due_window_days=30,
         retrieval_recency_fallback_days=None,
-        expects_context=False,
     ),
     "slack_message": SourceConfig(
         source="slack_message",
@@ -53,7 +49,6 @@ SOURCES: dict[str, SourceConfig] = {
         # Slack messages are present-tense and noisy — bound retrieval
         # to recently-active tasks when the candidate has no due_at.
         retrieval_recency_fallback_days=14,
-        expects_context=True,
     ),
 }
 

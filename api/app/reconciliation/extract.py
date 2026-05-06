@@ -42,8 +42,11 @@ async def extract(
         md = source_metadata or {}
 
         def ctx(key: str) -> str:
+            # Codex chunk-5-step2: literal "unknown" reads as a real
+            # token to the model. "(not provided)" disambiguates that
+            # this is a missing context field, not a value.
             v = md.get(key)
-            return str(v) if v else "unknown"
+            return str(v) if v else "(not provided)"
 
         prompt = (body
                   .replace("{{MESSAGE_BODY}}", raw_content)
