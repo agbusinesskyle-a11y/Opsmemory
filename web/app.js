@@ -49,6 +49,20 @@ const state = {
     // hitting Save would clobber the new SOP with the prior SOP's
     // template buffer).
     editing: null,              // null | { sopId, versionNo, templates, saving, saveError, publishError, pending, dirty }
+    // UI 3/3: collapsible Create SOP form.
+    creating: null,             // null | { businessSlug, name, description, pending, error }
+  },
+  // UI 3/3: Anchors section below the SOP list. Independent filters
+  // per Codex (don't couple to SOP list filters).
+  anchors: {
+    items: [],
+    total: 0,
+    statusFilter: 'scheduled',  // 'scheduled' | 'fired' | 'cancelled' | 'all'
+    businessFilter: 'all',
+    expanded: false,            // anchors section visibility (collapsed by default)
+    scheduling: null,           // null | { businessSlug, sopId, kind, scheduledFor, notes, sopOptions, pending, error }
+    fireResult: null,           // null | { anchorId, reviewItemsCreated, instanceId }
+    loadError: null,
   },
   // Sync indicator state. The header pill reads from these.
   sync: {
@@ -214,6 +228,47 @@ async function publishSopVersion(sopId, versionNo, body) {
   return await api('/v1/sops/' + encodeURIComponent(sopId) +
                     '/versions/' + encodeURIComponent(versionNo) + '/publish',
                    { method: 'POST', body: body || {} });
+}
+
+// ---------- Create SOP / Anchors / Fire (chunk 7 step 4 UI 3/3) ----------
+
+async function createSop(body) {
+  return await api('/v1/sops', { method: 'POST', body });
+}
+
+async function loadAnchors(filters) {
+  const params = new URLSearchParams();
+  if (filters.businessFilter && filters.businessFilter !== 'all') {
+    params.set('business_slug', filters.businessFilter);
+  }
+  if (filters.statusFilter && filters.statusFilter !== 'all') {
+    params.set('state', filters.statusFilter);
+  }
+  params.set('limit', '100');
+  const data = await api('/v1/anchor_events?' + params.toString());
+  return { items: data.items || [], total: data.total || 0 };
+}
+
+async function createAnchor(body) {
+  return await api('/v1/anchor_events', { method: 'POST', body });
+}
+
+async function fireAnchor(anchorId) {
+  return await api('/v1/anchor_events/' + encodeURIComponent(anchorId) + '/fire',
+                   { method: 'POST', body: {} });
+}
+
+async function loadActiveSopsForBusiness(businessSlug) {
+  // Codex chunk-7-step4-ui2 plan note: don't blindly source the SOP
+  // dropdown from current state.sops.items (current filters can omit
+  // valid active SOPs). Fetch a fresh active-only list scoped to the
+  // selected business.
+  const params = new URLSearchParams();
+  params.set('status', 'active');
+  if (businessSlug) params.set('business_slug', businessSlug);
+  params.set('limit', '200');
+  const data = await api('/v1/sops?' + params.toString());
+  return data.items || [];
 }
 
 // ---------- Client mutations (Chunk 6 step 1 contract + step 3 outbox) ----------
@@ -737,6 +792,175 @@ function renderSopList() {
   `;
 }
 
+// ---------- Create SOP form (UI 3/3) ----------
+
+function renderCreateSopForm() {
+  const c = state.sops.creating;
+  if (!c) {
+    return `
+      <div class="sop-create-bar">
+        <button class="sop-create-open">+ New SOP</button>
+      </div>
+    `;
+  }
+  const businessOptions = state.businesses.map(b => `
+    <option value="${escapeHtml(b.slug)}"${c.businessSlug === b.slug ? ' selected' : ''}>${escapeHtml(b.name)}</option>
+  `).join('');
+  const errorBlock = c.error
+    ? `<div class="error sop-edit-err">${escapeHtml(c.error)}</div>`
+    : '';
+  const pendingDisabled = c.pending ? 'disabled' : '';
+  return `
+    <div class="sop-create-form">
+      ${errorBlock}
+      <div class="sop-create-row">
+        <select id="sop-create-biz" ${pendingDisabled}>
+          <option value="">Select business…</option>
+          ${businessOptions}
+        </select>
+        <input id="sop-create-name" type="text" maxlength="256"
+               placeholder="SOP name (required)" value="${escapeHtml(c.name || '')}" ${pendingDisabled}>
+      </div>
+      <textarea id="sop-create-desc" rows="2" maxlength="8192"
+                placeholder="Description (optional)" ${pendingDisabled}>${escapeHtml(c.description || '')}</textarea>
+      <div class="sop-create-actions">
+        <button class="sop-create-submit" ${pendingDisabled}>${c.pending ? 'Creating…' : 'Create SOP'}</button>
+        <button class="sop-create-cancel" ${pendingDisabled}>Cancel</button>
+      </div>
+    </div>
+  `;
+}
+
+// ---------- Anchors section (UI 3/3) ----------
+
+function renderAnchorsSection() {
+  const a = state.anchors;
+  if (!a.expanded) {
+    return `
+      <div class="anchors-toggle">
+        <button class="anchors-open">Show anchors (${a.total})</button>
+      </div>
+    `;
+  }
+  // Filter row.
+  const businessOptions = [
+    `<option value="all"${a.businessFilter === 'all' ? ' selected' : ''}>All businesses</option>`,
+    ...state.businesses.map(b =>
+      `<option value="${escapeHtml(b.slug)}"${a.businessFilter === b.slug ? ' selected' : ''}>${escapeHtml(b.name)}</option>`
+    ),
+  ].join('');
+  const fireResult = a.fireResult
+    ? `<div class="fire-result">
+         Fired anchor — ${escapeHtml(String(a.fireResult.reviewItemsCreated))} review items created.
+         <button class="goto-review">Go to Review</button>
+       </div>`
+    : '';
+  const loadErr = a.loadError
+    ? `<div class="error">${escapeHtml(a.loadError)}</div>`
+    : '';
+  const items = a.items.length
+    ? `<ul class="anchor-list">${a.items.map(renderAnchorRow).join('')}</ul>`
+    : `<div class="empty-state">No anchors match the current filters.</div>`;
+  const scheduleForm = renderScheduleAnchorForm();
+  return `
+    <div class="anchors-section">
+      <div class="anchors-head">
+        <h2>Anchors</h2>
+        <button class="anchors-close">Hide</button>
+      </div>
+      <div class="filters">
+        <div class="status-tabs">
+          <button class="tab anchor-status-tab${a.statusFilter === 'scheduled' ? ' active' : ''}" data-anchor-status="scheduled">Scheduled</button>
+          <button class="tab anchor-status-tab${a.statusFilter === 'fired' ? ' active' : ''}" data-anchor-status="fired">Fired</button>
+          <button class="tab anchor-status-tab${a.statusFilter === 'cancelled' ? ' active' : ''}" data-anchor-status="cancelled">Cancelled</button>
+          <button class="tab anchor-status-tab${a.statusFilter === 'all' ? ' active' : ''}" data-anchor-status="all">All</button>
+        </div>
+        <select class="business-filter" id="anchor-business-filter">${businessOptions}</select>
+      </div>
+      ${fireResult}
+      ${loadErr}
+      ${scheduleForm}
+      ${items}
+    </div>
+  `;
+}
+
+function renderAnchorRow(anchor) {
+  const stateClass = (anchor.state || 'scheduled');
+  const sopName = (() => {
+    const s = state.sops.items.find(x => x.id === anchor.sop_id);
+    return s ? s.name : anchor.sop_id;
+  })();
+  const businessName = (state.businesses.find(b => b.id === anchor.business_id) || {}).name || anchor.business_id;
+  const fireBtn = (anchor.state === 'scheduled')
+    ? `<button class="anchor-fire" data-anchor-id="${escapeHtml(anchor.id)}">Fire</button>`
+    : '';
+  return `
+    <li class="anchor-row ${stateClass}" data-anchor-id="${escapeHtml(anchor.id)}">
+      <div class="anchor-head">
+        <span class="anchor-kind">${escapeHtml(anchor.kind)}</span>
+        <span class="biz-pill">${escapeHtml(businessName)}</span>
+        <span class="state-pill ${stateClass}">${escapeHtml(anchor.state)}</span>
+        ${fireBtn}
+      </div>
+      <div class="anchor-meta muted">
+        <span>${escapeHtml(sopName)}</span>
+        <span>scheduled ${escapeHtml(fmtDate(anchor.scheduled_for))}</span>
+        ${anchor.fired_at ? ` · fired ${escapeHtml(fmtRelative(anchor.fired_at))}` : ''}
+      </div>
+      ${anchor.notes ? `<div class="anchor-notes">${escapeHtml(anchor.notes)}</div>` : ''}
+    </li>
+  `;
+}
+
+function renderScheduleAnchorForm() {
+  const s = state.anchors.scheduling;
+  if (!s) {
+    return `
+      <div class="schedule-bar">
+        <button class="anchor-schedule-open">+ Schedule anchor</button>
+      </div>
+    `;
+  }
+  const businessOptions = [
+    `<option value="">Select business…</option>`,
+    ...state.businesses.map(b =>
+      `<option value="${escapeHtml(b.slug)}"${s.businessSlug === b.slug ? ' selected' : ''}>${escapeHtml(b.name)}</option>`
+    ),
+  ].join('');
+  const sopOptionsHtml = (s.sopOptions || []).map(o =>
+    `<option value="${escapeHtml(o.id)}"${s.sopId === o.id ? ' selected' : ''}>${escapeHtml(o.name)}</option>`
+  ).join('');
+  const errorBlock = s.error
+    ? `<div class="error sop-edit-err">${escapeHtml(s.error)}</div>`
+    : '';
+  const pendingDisabled = s.pending ? 'disabled' : '';
+  return `
+    <div class="anchor-schedule-form">
+      ${errorBlock}
+      <div class="sop-create-row">
+        <select id="anchor-sched-biz" ${pendingDisabled}>${businessOptions}</select>
+        <select id="anchor-sched-sop" ${pendingDisabled}>
+          <option value="">${s.businessSlug ? 'Select SOP…' : 'Pick a business first'}</option>
+          ${sopOptionsHtml}
+        </select>
+      </div>
+      <div class="sop-create-row">
+        <input id="anchor-sched-kind" type="text" maxlength="64"
+               placeholder="Kind (e.g. redhot_opening)" value="${escapeHtml(s.kind || '')}" ${pendingDisabled}>
+        <input id="anchor-sched-when" type="datetime-local"
+               value="${escapeHtml(s.scheduledForLocal || '')}" ${pendingDisabled}>
+      </div>
+      <textarea id="anchor-sched-notes" rows="2" maxlength="4096"
+                placeholder="Notes (optional)" ${pendingDisabled}>${escapeHtml(s.notes || '')}</textarea>
+      <div class="sop-create-actions">
+        <button class="anchor-sched-submit" ${pendingDisabled}>${s.pending ? 'Scheduling…' : 'Schedule'}</button>
+        <button class="anchor-sched-cancel" ${pendingDisabled}>Cancel</button>
+      </div>
+    </div>
+  `;
+}
+
 function render() {
   const root = document.getElementById('root');
   if (!root) return;
@@ -749,7 +973,9 @@ function render() {
     root.innerHTML = `
       ${renderHeader()}
       ${renderSopFilters()}
+      ${renderCreateSopForm()}
       <div id="sops-area">${renderSopList()}</div>
+      ${renderAnchorsSection()}
     `;
   } else {
     root.innerHTML = `
@@ -1290,6 +1516,254 @@ function attachEventHandlers() {
       await discardConflict(btn.dataset.key);
     });
   });
+
+  // ===== UI 3/3: Create SOP / Anchors / Schedule / Fire =====
+
+  // ---- Create SOP form ----
+  document.querySelectorAll('.sop-create-open').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.sops.creating = {
+        businessSlug: '',
+        name: '',
+        description: '',
+        pending: false,
+        error: null,
+      };
+      render();
+    });
+  });
+  document.querySelectorAll('.sop-create-cancel').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.sops.creating = null;
+      render();
+    });
+  });
+  const sopCreateBiz = document.getElementById('sop-create-biz');
+  if (sopCreateBiz) {
+    sopCreateBiz.addEventListener('change', () => {
+      if (state.sops.creating) state.sops.creating.businessSlug = sopCreateBiz.value;
+    });
+  }
+  const sopCreateName = document.getElementById('sop-create-name');
+  if (sopCreateName) {
+    sopCreateName.addEventListener('input', () => {
+      if (state.sops.creating) state.sops.creating.name = sopCreateName.value;
+    });
+  }
+  const sopCreateDesc = document.getElementById('sop-create-desc');
+  if (sopCreateDesc) {
+    sopCreateDesc.addEventListener('input', () => {
+      if (state.sops.creating) state.sops.creating.description = sopCreateDesc.value;
+    });
+  }
+  document.querySelectorAll('.sop-create-submit').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!state.sops.creating) return;
+      const c = state.sops.creating;
+      if (!c.businessSlug || !c.name.trim()) {
+        c.error = 'Business and name are required.';
+        render();
+        return;
+      }
+      c.pending = true;
+      c.error = null;
+      render();
+      try {
+        const created = await createSop({
+          business_slug: c.businessSlug,
+          name: c.name.trim(),
+          description: c.description.trim() || null,
+        });
+        state.sops.creating = null;
+        await refreshSops();
+        // Auto-expand the new SOP so the user can immediately
+        // create a draft version.
+        state.sops.expandedId = created.id;
+        try {
+          state.sops.expandedDetail = await loadSopDetail(created.id);
+        } catch { /* fine — empty detail; user can click again */ }
+        render();
+      } catch (err) {
+        c.pending = false;
+        c.error = formatSopError('create SOP', err);
+        render();
+      }
+    });
+  });
+
+  // ---- Anchors section toggle + filters ----
+  document.querySelectorAll('.anchors-open').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      state.anchors.expanded = true;
+      await refreshAnchors();
+    });
+  });
+  document.querySelectorAll('.anchors-close').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.anchors.expanded = false;
+      state.anchors.scheduling = null;
+      state.anchors.fireResult = null;
+      render();
+    });
+  });
+  document.querySelectorAll('.anchor-status-tab').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      state.anchors.statusFilter = btn.dataset.anchorStatus;
+      await refreshAnchors();
+    });
+  });
+  const anchorBizFilter = document.getElementById('anchor-business-filter');
+  if (anchorBizFilter) {
+    anchorBizFilter.addEventListener('change', async () => {
+      state.anchors.businessFilter = anchorBizFilter.value;
+      await refreshAnchors();
+    });
+  }
+
+  // ---- Schedule anchor form ----
+  document.querySelectorAll('.anchor-schedule-open').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.anchors.scheduling = {
+        businessSlug: '',
+        sopId: '',
+        kind: '',
+        scheduledForLocal: '',
+        notes: '',
+        sopOptions: [],
+        pending: false,
+        error: null,
+      };
+      render();
+    });
+  });
+  document.querySelectorAll('.anchor-sched-cancel').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.anchors.scheduling = null;
+      render();
+    });
+  });
+  const anchorSchedBiz = document.getElementById('anchor-sched-biz');
+  if (anchorSchedBiz) {
+    anchorSchedBiz.addEventListener('change', async () => {
+      if (!state.anchors.scheduling) return;
+      const slug = anchorSchedBiz.value;
+      state.anchors.scheduling.businessSlug = slug;
+      state.anchors.scheduling.sopId = '';
+      state.anchors.scheduling.sopOptions = [];
+      if (slug) {
+        try {
+          const sops = await loadActiveSopsForBusiness(slug);
+          if (state.anchors.scheduling
+              && state.anchors.scheduling.businessSlug === slug) {
+            state.anchors.scheduling.sopOptions = sops;
+          }
+        } catch (err) {
+          if (state.anchors.scheduling) {
+            state.anchors.scheduling.error = formatSopError('load SOPs for business', err);
+          }
+        }
+      }
+      render();
+    });
+  }
+  const anchorSchedSop = document.getElementById('anchor-sched-sop');
+  if (anchorSchedSop) {
+    anchorSchedSop.addEventListener('change', () => {
+      if (state.anchors.scheduling) state.anchors.scheduling.sopId = anchorSchedSop.value;
+    });
+  }
+  const anchorSchedKind = document.getElementById('anchor-sched-kind');
+  if (anchorSchedKind) {
+    anchorSchedKind.addEventListener('input', () => {
+      if (state.anchors.scheduling) state.anchors.scheduling.kind = anchorSchedKind.value;
+    });
+  }
+  const anchorSchedWhen = document.getElementById('anchor-sched-when');
+  if (anchorSchedWhen) {
+    anchorSchedWhen.addEventListener('input', () => {
+      if (state.anchors.scheduling) state.anchors.scheduling.scheduledForLocal = anchorSchedWhen.value;
+    });
+  }
+  const anchorSchedNotes = document.getElementById('anchor-sched-notes');
+  if (anchorSchedNotes) {
+    anchorSchedNotes.addEventListener('input', () => {
+      if (state.anchors.scheduling) state.anchors.scheduling.notes = anchorSchedNotes.value;
+    });
+  }
+  document.querySelectorAll('.anchor-sched-submit').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const s = state.anchors.scheduling;
+      if (!s) return;
+      if (!s.businessSlug || !s.sopId || !s.kind.trim() || !s.scheduledForLocal) {
+        s.error = 'Business, SOP, kind, and scheduled time are required.';
+        render();
+        return;
+      }
+      // datetime-local has no timezone. The server requires a tz-aware
+      // ISO string (per _parse_iso_timestamp). Convert via Date so the
+      // browser's local timezone is the operator's intent, then send
+      // the equivalent ISO with offset.
+      let scheduledIso;
+      try {
+        const d = new Date(s.scheduledForLocal);
+        if (Number.isNaN(d.getTime())) throw new Error('bad date');
+        scheduledIso = d.toISOString();  // always Z (UTC)
+      } catch {
+        s.error = 'Invalid scheduled date/time.';
+        render();
+        return;
+      }
+      s.pending = true;
+      s.error = null;
+      render();
+      try {
+        await createAnchor({
+          business_slug: s.businessSlug,
+          sop_id: s.sopId,
+          kind: s.kind.trim(),
+          scheduled_for: scheduledIso,
+          notes: s.notes.trim() || null,
+        });
+        state.anchors.scheduling = null;
+        await refreshAnchors();
+      } catch (err) {
+        s.pending = false;
+        s.error = formatSopError('schedule anchor', err);
+        render();
+      }
+    });
+  });
+
+  // ---- Fire anchor ----
+  document.querySelectorAll('.anchor-fire').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const anchorId = btn.dataset.anchorId;
+      if (!window.confirm('Fire this anchor? This materializes review items for every template — irreversible.')) return;
+      try {
+        const result = await fireAnchor(anchorId);
+        state.anchors.fireResult = {
+          anchorId: result.anchor_event_id,
+          reviewItemsCreated: result.review_items_created,
+          instanceId: result.sop_instance_id,
+        };
+        await refreshAnchors();
+      } catch (err) {
+        state.anchors.loadError = formatSopError('fire anchor', err);
+        render();
+      }
+    });
+  });
+
+  // ---- Go to Review (post-fire) ----
+  document.querySelectorAll('.goto-review').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      state.view = 'review';
+      state.review.actionError = null;
+      state.anchors.fireResult = null;
+      await refreshReviewItems();
+    });
+  });
 }
 
 async function refreshTasks() {
@@ -1332,6 +1806,21 @@ async function refreshSops() {
     state.sops.loadError = err.message || 'Failed to load SOPs.';
     render();
   }
+}
+
+async function refreshAnchors() {
+  state.anchors.loadError = null;
+  try {
+    const { items, total } = await loadAnchors({
+      statusFilter: state.anchors.statusFilter,
+      businessFilter: state.anchors.businessFilter,
+    });
+    state.anchors.items = items;
+    state.anchors.total = total;
+  } catch (err) {
+    state.anchors.loadError = formatSopError('load anchors', err);
+  }
+  render();
 }
 
 function formatActionError(verb, err) {
