@@ -307,10 +307,18 @@ async def send_one(
     )
 
     # Step 2: load the subscription (fresh — status could have
-    # changed since claim).
+    # changed since claim, AND ownership could have flipped:
+    # the POST endpoint does ON CONFLICT (endpoint) DO UPDATE
+    # SET user_id = EXCLUDED.user_id, so a re-registration on
+    # the same browser/endpoint by a different user would
+    # reassign the row. Codex chunk-10-step5c34-close: fetch
+    # both status and user_id and reject any mismatch so
+    # user A's queued digest can never ship to user B's
+    # device.
     sub_row = await conn.fetchrow(
         """
         SELECT id::text          AS id,
+               user_id::text     AS user_id,
                endpoint          AS endpoint,
                p256dh_key        AS p256dh_key,
                auth_key          AS auth_key,
@@ -337,6 +345,32 @@ async def send_one(
             http_status=None,
             code="unsubscribed",
             detail="subscription not active at send time",
+            delivery_id=delivery_id,
+        )
+    if sub_row["user_id"] != user_id:
+        # Ownership flipped between claim and send. Refuse.
+        # The other user's pref will fire its own digest the
+        # next cycle; this one becomes a non-leaking audit row.
+        log.warning("sender_ownership_mismatch", extra={
+            "delivery_id": delivery_id,
+            "user_id_claimed": user_id,
+            "user_id_now": sub_row["user_id"],
+            "subscription_id": web_push_subscription_id,
+        })
+        await _mark_failed(
+            conn,
+            delivery_id=delivery_id,
+            http_status=None,
+            code="ownership_changed",
+            detail=(f"subscription reassigned from {user_id} to "
+                    f"{sub_row['user_id']} between claim and send"),
+            provider=provider_from_endpoint(sub_row["endpoint"]),
+        )
+        return SendResult(
+            status="failed",
+            http_status=None,
+            code="ownership_changed",
+            detail="subscription reassigned to different user",
             delivery_id=delivery_id,
         )
 
