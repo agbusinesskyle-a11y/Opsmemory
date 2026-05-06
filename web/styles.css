@@ -1019,7 +1019,8 @@ ul.businesses li {
 .settings-actions-cell { white-space: nowrap; }
 .settings-edit-open,
 .settings-edit-save,
-.settings-edit-cancel {
+.settings-edit-cancel,
+.settings-revoke {
   padding: 4px 12px;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1032,7 +1033,17 @@ ul.businesses li {
 .settings-edit-save { background: rgba(0, 150, 0, 0.15); }
 .settings-edit-save:disabled,
 .settings-edit-cancel:disabled,
-.settings-edit-open:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-edit-open:disabled,
+.settings-revoke:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-revoke {
+  background: var(--error-bg);
+  color: var(--error-fg);
+  border-color: var(--error-border);
+}
+.settings-revoke:hover:not(:disabled) {
+  background: var(--error-fg);
+  color: var(--bg);
+}
 .settings-drawer > td {
   background: rgba(120, 120, 120, 0.05);
   padding: 12px 16px;

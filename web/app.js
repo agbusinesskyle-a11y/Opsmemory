@@ -95,6 +95,11 @@ const state = {
     // pendingChannel. Per-draft pending + save-handler guard is
     // enough.
     editing: {},                  // { [channel]: draft } — see _seedSettingsDraft
+    // Sub-(b) commit 2: per-device revoke. Codex chunk-10-step3b2
+    // plan-review: per-row pending map; revoke errors display as
+    // a single inline pill near the subscription table.
+    subscriptionRevokes: {},      // { [subscriptionId]: true } when DELETE is in flight
+    subscriptionRevokeError: null,
   },
 };
 
@@ -1097,6 +1102,12 @@ async function patchNotificationPref(channel, body) {
   });
 }
 
+async function deletePushSubscription(id) {
+  return await api(`/v1/notifications/web_push/subscriptions/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
 async function loadVapidPublicKey() {
   // Treat 503 as "server doesn't have VAPID configured" — that's a
   // valid state, not an error. Per
@@ -1113,6 +1124,10 @@ async function loadVapidPublicKey() {
 async function refreshSettings() {
   state.settings.loading = true;
   state.settings.loadError = null;
+  // Codex chunk-10-step3b2: a fresh refresh clears the revoke
+  // error pill (any pending revokes keep their per-row pending
+  // flag and complete independently).
+  state.settings.subscriptionRevokeError = null;
 
   state.settings.pushApiAvailable = detectPushApiAvailable();
   state.settings.permissionState = readNotificationPermission();
@@ -1271,14 +1286,22 @@ function renderSettingsWebPushSection() {
     ? '<span class="settings-pill badge-granted">subscribed</span>'
     : '<span class="settings-pill badge-default">not subscribed</span>';
 
-  const subRows = (s.subscriptions || []).map(sub => `
+  const revokes = s.subscriptionRevokes || {};
+  const subRows = (s.subscriptions || []).map(sub => {
+    const pending = !!revokes[sub.id];
+    return `
     <tr>
       <td>${escapeHtml(sub.device_label || '(unlabeled device)')}</td>
       <td><code class="settings-keyfrag" title="${escapeHtml(sub.endpoint || '')}">${escapeHtml(_shortenKey(sub.endpoint))}</code></td>
       <td><span class="settings-pill badge-${sub.status === 'active' ? 'granted' : 'default'}">${escapeHtml(sub.status)}</span></td>
       <td class="muted">${escapeHtml(sub.last_seen_at || sub.created_at || '')}</td>
+      <td class="settings-actions-cell">
+        <button class="settings-revoke" data-subscription-id="${escapeHtml(sub.id)}"
+                ${pending ? 'disabled' : ''}>${pending ? 'Revoking…' : 'Revoke'}</button>
+      </td>
     </tr>
-  `).join('');
+    `;
+  }).join('');
   // Codex chunk-10-step3a-close (i): table caption + scope="col"
   // for screen-reader navigation. Codex (e): show full endpoint in
   // the cell title for a hover tooltip — first 8 chars of an FCM URL
@@ -1291,10 +1314,14 @@ function renderSettingsWebPushSection() {
            <th scope="col">Endpoint</th>
            <th scope="col">Status</th>
            <th scope="col">Last seen</th>
+           <th scope="col">Actions</th>
          </tr></thead>
          <tbody>${subRows}</tbody>
        </table>`
     : '<p class="muted">No active subscriptions on file.</p>';
+  const revokeErrorBlock = s.subscriptionRevokeError
+    ? `<div class="settings-row-error">${escapeHtml(s.subscriptionRevokeError)}</div>`
+    : '';
 
   return `
     <section class="settings-section">
@@ -1305,8 +1332,9 @@ function renderSettingsWebPushSection() {
       ${_renderSettingsLine('Server VAPID key', vapidStatus)}
       ${_renderSettingsLine('This browser', browserSubStatus)}
       <h4>Active subscriptions</h4>
+      ${revokeErrorBlock}
       ${subsTable}
-      <p class="muted">Enable / disable controls land in the next update.</p>
+      <p class="muted">Enable controls land in the next update.</p>
     </section>
   `;
 }
@@ -2322,6 +2350,94 @@ function attachEventHandlers() {
         // focus-eating issue (change fires on blur for selects).
         render();
       }
+    });
+  });
+
+  // Codex chunk-10-step3b2: per-device Revoke flow. Per-row
+  // pending map keys on subscription id; window.confirm gates
+  // the destructive action; matches the SOP "Discard edits?"
+  // pattern. Saved state in subscriptionRevokes is consulted by
+  // both the renderer (button label/disabled) and the click
+  // handler (idempotent guard).
+  document.querySelectorAll('.settings-revoke').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const subId = btn.dataset.subscriptionId;
+      if (!subId) return;
+      // Find the row before any state mutation so we can match
+      // local browserSubscription endpoint after server success.
+      const sub = (state.settings.subscriptions || []).find(s => s.id === subId);
+      if (!sub) return;
+      const revokes = state.settings.subscriptionRevokes || {};
+      if (revokes[subId]) return;  // already in flight
+      if (!window.confirm('Revoke this device? It will stop receiving push notifications.')) return;
+      // Re-check after confirm (user may have clicked Revoke
+      // twice while the confirm dialog was open).
+      if (revokes[subId]) return;
+
+      const localEndpoint = state.settings.browserSubscription
+        ? state.settings.browserSubscription.endpoint
+        : null;
+      const isLocalDevice = !!(sub.endpoint && localEndpoint && sub.endpoint === localEndpoint);
+
+      state.settings.subscriptionRevokes = { ...revokes, [subId]: true };
+      state.settings.subscriptionRevokeError = null;
+      render();
+
+      let serverOk = false;
+      try {
+        await deletePushSubscription(subId);
+        serverOk = true;
+      } catch (err) {
+        // Codex chunk-10-step3b2 plan-review (c): server-DELETE
+        // failure shows the error pill and leaves the row.
+        let msg = (err && err.message) || 'Revoke failed.';
+        const detail = err && err.body && err.body.detail;
+        if (typeof detail === 'string') msg = detail;
+        else if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+          msg = detail.reason || detail.detail || detail.code || msg;
+        }
+        state.settings.subscriptionRevokeError = msg;
+      }
+
+      if (serverOk) {
+        // Codex chunk-10-step3b2 (c): refetch is the primary path
+        // to keep multi-tab state honest. If refetch FAILS, splice
+        // out the revoked row locally — but DON'T phrase that as
+        // a delete failure, since the server delete succeeded.
+        try {
+          const subsResp = await loadPushSubscriptions();
+          state.settings.subscriptions = (subsResp && subsResp.items) || [];
+        } catch (refetchErr) {
+          state.settings.subscriptions = (state.settings.subscriptions || [])
+            .filter(s => s.id !== subId);
+          state.settings.subscriptionRevokeError =
+            'Revoked, but the device list failed to refresh. Reload the page to verify.';
+        }
+        // Best-effort local unsubscribe + SW state re-probe.
+        if (isLocalDevice) {
+          try {
+            if (state.settings.browserSubscription
+                && typeof state.settings.browserSubscription.unsubscribe === 'function') {
+              await state.settings.browserSubscription.unsubscribe();
+            }
+          } catch (unsubErr) {
+            console.warn('[opsmemory] local unsubscribe() failed', unsubErr);
+          }
+          try {
+            const probe = await _readServiceWorkerSubscription(2000);
+            state.settings.serviceWorkerReady = !!probe.ready;
+            state.settings.browserSubscription = probe.subscription || null;
+          } catch (probeErr) {
+            state.settings.browserSubscription = null;
+          }
+        }
+      }
+
+      // Always clear the per-row pending flag.
+      const after = { ...state.settings.subscriptionRevokes };
+      delete after[subId];
+      state.settings.subscriptionRevokes = after;
+      render();
     });
   });
 
