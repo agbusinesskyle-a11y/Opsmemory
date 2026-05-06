@@ -142,7 +142,7 @@ def normalize_candidate(raw: dict, *, now: datetime | None = None) -> dict:
     # to keep downstream consumers simple.
     raw_is_poster = raw.get("owner_is_poster")
     owner_is_poster = bool(raw_is_poster) if isinstance(raw_is_poster, bool) else False
-    return {
+    out = {
         "summary": summary,
         "owner_display": owner_display,
         "owner_slack_user_ids": owner_slack_user_ids,
@@ -155,6 +155,15 @@ def normalize_candidate(raw: dict, *, now: datetime | None = None) -> dict:
         "source_timestamp": raw.get("source_timestamp"),
         "dedup_key": _dedup_key(summary, businesses, owner_display),
     }
+    # File-drop CSV provenance (Chunk 9 step 2): pass parser_kind +
+    # row metadata through so review_items.candidate_facts shows
+    # which row a candidate came from. Only set when the upstream
+    # extractor populated them; non-CSV sources don't carry these.
+    for prov_key in ("parser_kind", "row_number", "raw_owner",
+                      "raw_due", "raw_priority", "filename"):
+        if prov_key in raw and raw[prov_key] is not None:
+            out[prov_key] = raw[prov_key]
+    return out
 
 
 def normalize_candidates(candidates: list[dict], *, now: datetime | None = None) -> list[dict]:

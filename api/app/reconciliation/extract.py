@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .file_drop_parser import looks_like_csv, parse_csv_candidates
 from .llm_client import run_step
 from .prompts import load_prompt
 from .sources import SourceConfig
@@ -34,10 +35,37 @@ async def extract(
     context fields. Missing fields are substituted as the literal
     string 'unknown' so the prompt template stays well-formed.
     """
+    # File-drop CSV path (Chunk 9 step 2): if the content looks
+    # CSV-shaped, parse deterministically and skip the LLM entirely.
+    # Free-form file content falls through to the LLM extract using
+    # file_drop_extract.v1 with metadata substitutions.
+    if source_config.source == "file_drop":
+        if looks_like_csv(raw_content):
+            candidates = parse_csv_candidates(raw_content)
+            if candidates:
+                # No LlmCall — return None for the audit row pointer.
+                return candidates, None
+            # CSV-shaped but unparseable (e.g. no recognizable summary
+            # column) -> fall through to the LLM path with the same
+            # file_drop prompt; better than returning zero candidates.
+
     template, body, digest = load_prompt(source_config.extract_prompt)
 
     if source_config.source == "meeting_recap":
         prompt = body.replace("{{RECAP_BODY}}", raw_content)
+    elif source_config.source == "file_drop":
+        md = source_metadata or {}
+
+        def ctx(key: str) -> str:
+            v = md.get(key)
+            return str(v) if v else "(not provided)"
+
+        prompt = (body
+                  .replace("{{FILE_BODY}}", raw_content)
+                  .replace("{{FILENAME}}", ctx("filename"))
+                  .replace("{{MIME_TYPE}}", ctx("mime_type"))
+                  .replace("{{MODIFIED_TIME}}", ctx("modified_time"))
+                  .replace("{{BUSINESS_SLUG}}", ctx("business_slug")))
     elif source_config.source == "slack_message":
         md = source_metadata or {}
 

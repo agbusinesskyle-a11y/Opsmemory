@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .extract import extract
+from .file_drop_resolve import resolve_file_drop_context
 from .normalize import normalize_candidates
 from .retrieve import retrieve_candidates
 from .choose import choose_action
@@ -186,6 +187,15 @@ async def process_event(conn, event_id: str) -> dict:
         for cand in normalized:
             await resolve_slack_context(
                 conn, cand,
+                source_metadata=event["source_metadata"],
+            )
+    # File-drop: deterministic business slug from ingest metadata
+    # (Chunk 9 step 2). No LLM business inference; n8n's
+    # folder->business mapping is the source of truth.
+    elif event["source"] == "file_drop":
+        for cand in normalized:
+            resolve_file_drop_context(
+                cand,
                 source_metadata=event["source_metadata"],
             )
 

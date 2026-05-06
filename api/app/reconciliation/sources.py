@@ -60,6 +60,20 @@ SOURCES: dict[str, SourceConfig] = {
         # to recently-active tasks when the candidate has no due_at.
         retrieval_recency_fallback_days=14,
     ),
+    "file_drop": SourceConfig(
+        source="file_drop",
+        # CSV-shaped files bypass this prompt (deterministic parse via
+        # file_drop_parser.parse_csv_candidates). Free-form text uses
+        # this prompt with metadata substitutions.
+        extract_prompt="file_drop_extract.v1",
+        choose_prompt="task_choose.v1",
+        retrieval_due_window_days=30,
+        # Codex chunk-9-step1 STEP 2 PLAN: 30, not 14. File drops are
+        # structured task lists and can include stale-but-real work
+        # (a year-old vendor checklist re-imported). 14d would create
+        # duplicate tasks.
+        retrieval_recency_fallback_days=30,
+    ),
 }
 
 
