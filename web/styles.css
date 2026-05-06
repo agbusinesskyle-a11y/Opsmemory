@@ -509,3 +509,131 @@ ul.businesses li {
 }
 .task-conflict .conflict-retry:hover { background: rgba(0, 100, 200, 0.15); }
 .task-conflict .conflict-discard:hover { background: var(--error-bg); }
+
+/* ---- SOPs view (chunk 7 step 4 first UI commit) ---- */
+.sop-list {
+  list-style: none;
+  margin: 0;
+  padding: 12px 16px;
+}
+.sop-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--tile);
+  cursor: pointer;
+}
+.sop-item.expanded {
+  cursor: default;
+  background: var(--bg);
+}
+.sop-item.archived { opacity: 0.7; }
+.sop-item-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.sop-latest { font-size: 12px; }
+.sop-detail {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.sop-description {
+  margin-bottom: 12px;
+  font-size: 14px;
+}
+.sop-detail h3 { margin: 8px 0 6px 0; font-size: 14px; }
+.sop-version-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.sop-version {
+  border-left: 3px solid var(--border);
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  background: var(--tile);
+  cursor: pointer;
+  border-radius: 0 4px 4px 0;
+}
+.sop-version.expanded { background: var(--bg); cursor: default; }
+.sop-version.published { border-left-color: rgba(0, 150, 0, 0.45); }
+.sop-version.draft { border-left-color: rgba(220, 140, 0, 0.45); }
+.sop-version.superseded { border-left-color: var(--muted); opacity: 0.85; }
+.sop-version-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+}
+.version-no {
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-weight: 600;
+}
+.state-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--pill-bg);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.state-pill.published { background: rgba(0, 150, 0, 0.20); color: #2a8c2a; }
+.state-pill.draft { background: rgba(220, 140, 0, 0.20); color: #c87a00; }
+.state-pill.superseded { background: var(--pill-bg); color: var(--muted); }
+.state-pill.active { background: rgba(0, 150, 0, 0.20); color: #2a8c2a; }
+.state-pill.archived { background: var(--pill-bg); color: var(--muted); }
+.sop-version-changelog {
+  margin-top: 4px;
+  padding-left: 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.sop-templates {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--tile);
+  border-radius: 4px;
+}
+.sop-templates h4 {
+  margin: 0 0 6px 0;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+}
+.sop-template-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.sop-template {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.sop-template:last-child { border-bottom: none; }
+.sop-template-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.sop-template .seq {
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 18px;
+}
+.sop-template .summary { font-size: 14px; flex: 1; }
+.priority-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(0, 100, 200, 0.20);
+  color: #0064c8;
+  text-transform: uppercase;
+}
+.sop-template-meta { font-size: 12px; margin-top: 2px; }
+.sop-template-desc { font-size: 13px; margin-top: 4px; color: var(--fg); }

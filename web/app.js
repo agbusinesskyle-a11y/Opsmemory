@@ -21,7 +21,7 @@ const state = {
   },
   expandedTaskId: null,
   expandedTaskDetail: null,
-  view: 'tasks',                // 'tasks' | 'review' (review admin-only)
+  view: 'tasks',                // 'tasks' | 'review' | 'sops' (review/sops admin-only)
   review: {
     items: [],
     total: 0,
@@ -30,6 +30,18 @@ const state = {
     expandedDetail: null,
     pendingAction: null,        // 'approve' | 'reject' | null while a write is in flight
     actionError: null,
+  },
+  // SOPs view (chunk 7 step 4 first UI commit — read-only).
+  sops: {
+    items: [],
+    total: 0,
+    statusFilter: 'active',     // 'active' | 'archived' | 'all'
+    businessFilter: 'all',      // 'all' | <slug>
+    expandedId: null,           // SOP id whose detail is loaded
+    expandedDetail: null,       // { sop, versions[] }
+    selectedVersionNo: null,    // version_no whose templates are loaded
+    selectedVersionDetail: null, // { version, template_tasks[] }
+    loadError: null,
   },
   // Sync indicator state. The header pill reads from these.
   sync: {
@@ -156,6 +168,30 @@ async function rejectReview(reviewId, reason) {
                    { method: 'POST', body });
 }
 
+// ---------- SOPs (chunk 7 step 4 — admin-only browse) ----------
+
+async function loadSops(filters) {
+  const params = new URLSearchParams();
+  if (filters.businessFilter && filters.businessFilter !== 'all') {
+    params.set('business_slug', filters.businessFilter);
+  }
+  if (filters.statusFilter && filters.statusFilter !== 'all') {
+    params.set('status', filters.statusFilter);
+  }
+  params.set('limit', '100');
+  const data = await api('/v1/sops?' + params.toString());
+  return { items: data.items || [], total: data.total || 0 };
+}
+
+async function loadSopDetail(sopId) {
+  return await api('/v1/sops/' + encodeURIComponent(sopId));
+}
+
+async function loadSopVersionDetail(sopId, versionNo) {
+  return await api('/v1/sops/' + encodeURIComponent(sopId) +
+                    '/versions/' + encodeURIComponent(versionNo));
+}
+
 // ---------- Client mutations (Chunk 6 step 1 contract + step 3 outbox) ----------
 
 async function postToggleDone(taskId, body) {
@@ -239,6 +275,9 @@ function renderHeader() {
       <button class="view-tab${state.view === 'tasks' ? ' active' : ''}" data-view="tasks">Tasks</button>
       ${isAdmin
         ? `<button class="view-tab${state.view === 'review' ? ' active' : ''}" data-view="review">Review</button>`
+        : ''}
+      ${isAdmin
+        ? `<button class="view-tab${state.view === 'sops' ? ' active' : ''}" data-view="sops">SOPs</button>`
         : ''}
       <span class="sync-slot">${renderSyncBadge()}</span>
     </div>
@@ -464,6 +503,130 @@ function renderReviewList() {
   `;
 }
 
+function renderSopFilters() {
+  const businessOptions = [
+    `<option value="all"${state.sops.businessFilter === 'all' ? ' selected' : ''}>All businesses</option>`,
+    ...state.businesses.map(b =>
+      `<option value="${escapeHtml(b.slug)}"${state.sops.businessFilter === b.slug ? ' selected' : ''}>${escapeHtml(b.name)}</option>`
+    ),
+  ].join('');
+  return `
+    <div class="filters">
+      <div class="status-tabs">
+        <button class="tab sop-status-tab${state.sops.statusFilter === 'active' ? ' active' : ''}" data-sop-status="active">Active</button>
+        <button class="tab sop-status-tab${state.sops.statusFilter === 'archived' ? ' active' : ''}" data-sop-status="archived">Archived</button>
+        <button class="tab sop-status-tab${state.sops.statusFilter === 'all' ? ' active' : ''}" data-sop-status="all">All</button>
+      </div>
+      <select class="business-filter" id="sop-business-filter">${businessOptions}</select>
+    </div>
+  `;
+}
+
+function renderSopVersionRow(version, expanded) {
+  const stateClass = (version.state || 'draft').replace('_', '-');
+  const publishedLine = version.published_at
+    ? `<span class="muted">published ${escapeHtml(fmtRelative(version.published_at))}</span>`
+    : '';
+  let templatesBlock = '';
+  if (expanded) {
+    const detail = state.sops.selectedVersionDetail;
+    if (!detail) {
+      templatesBlock = `<div class="sop-templates muted">Loading templates…</div>`;
+    } else {
+      const templates = detail.template_tasks || [];
+      if (!templates.length) {
+        templatesBlock = `<div class="sop-templates"><span class="muted">No templates in this version.</span></div>`;
+      } else {
+        const rows = templates.map(t => `
+          <li class="sop-template">
+            <div class="sop-template-head">
+              <span class="seq">${escapeHtml(String(t.seq_no))}</span>
+              <span class="summary">${escapeHtml(t.summary)}</span>
+              ${t.priority ? `<span class="priority-pill">${escapeHtml(t.priority)}</span>` : ''}
+            </div>
+            <div class="sop-template-meta muted">
+              ${t.due_offset_days != null ? `due ${escapeHtml(String(t.due_offset_days))}d` : 'no offset'}
+              ${t.category ? ` · ${escapeHtml(t.category)}` : ''}
+              ${t.owner_role ? ` · role ${escapeHtml(t.owner_role)}` : ''}
+              ${t.dependency_text ? ` · ⏸ ${escapeHtml(t.dependency_text)}` : ''}
+            </div>
+            ${t.description ? `<div class="sop-template-desc">${escapeHtml(t.description)}</div>` : ''}
+          </li>
+        `).join('');
+        templatesBlock = `
+          <div class="sop-templates">
+            <h4>Templates (${templates.length})</h4>
+            <ul class="sop-template-list">${rows}</ul>
+          </div>
+        `;
+      }
+    }
+  }
+  return `
+    <li class="sop-version ${stateClass}${expanded ? ' expanded' : ''}" data-version-no="${escapeHtml(String(version.version_no))}">
+      <div class="sop-version-head">
+        <span class="version-no">v${escapeHtml(String(version.version_no))}</span>
+        <span class="state-pill ${stateClass}">${escapeHtml(version.state)}</span>
+        ${publishedLine}
+      </div>
+      ${version.change_log ? `<div class="sop-version-changelog">${escapeHtml(version.change_log)}</div>` : ''}
+      ${templatesBlock}
+    </li>
+  `;
+}
+
+function renderSopItem(sop) {
+  const expanded = state.sops.expandedId === sop.id;
+  const detail = expanded ? state.sops.expandedDetail : null;
+  const businessName = (state.businesses.find(b => b.id === sop.business_id) || {}).name || sop.business_id;
+  const latestLabel = sop.latest_version_no != null
+    ? `latest v${sop.latest_version_no}`
+    : '<span class="muted">no published version</span>';
+  let detailBlock = '';
+  if (expanded) {
+    if (state.sops.loadError) {
+      detailBlock = `<div class="error">${escapeHtml(state.sops.loadError)}</div>`;
+    } else if (!detail) {
+      detailBlock = `<div class="muted">Loading versions…</div>`;
+    } else {
+      const versions = detail.versions || [];
+      const versionRows = versions.length
+        ? versions.map(v =>
+            renderSopVersionRow(v, state.sops.selectedVersionNo === v.version_no)
+          ).join('')
+        : '<li class="muted">No versions yet.</li>';
+      detailBlock = `
+        <div class="sop-detail">
+          ${detail.sop.description ? `<div class="sop-description">${escapeHtml(detail.sop.description)}</div>` : ''}
+          <h3>Versions</h3>
+          <ul class="sop-version-list">${versionRows}</ul>
+        </div>
+      `;
+    }
+  }
+  return `
+    <li class="sop-item ${escapeHtml(sop.status)}${expanded ? ' expanded' : ''}" data-sop-id="${escapeHtml(sop.id)}">
+      <div class="sop-item-head">
+        <strong>${escapeHtml(sop.name)}</strong>
+        <span class="biz-pill">${escapeHtml(businessName)}</span>
+        <span class="state-pill ${escapeHtml(sop.status)}">${escapeHtml(sop.status)}</span>
+        <span class="muted sop-latest">${latestLabel}</span>
+      </div>
+      ${detailBlock}
+    </li>
+  `;
+}
+
+function renderSopList() {
+  if (!state.sops.items.length) {
+    return `<div class="empty-state">No SOPs match the current filters.</div>`;
+  }
+  return `
+    <div class="task-count">${state.sops.total} SOP${state.sops.total === 1 ? '' : 's'}</div>
+    <ul class="sop-list">${state.sops.items.map(renderSopItem).join('')}</ul>
+  `;
+}
+
 function render() {
   const root = document.getElementById('root');
   if (!root) return;
@@ -471,6 +634,12 @@ function render() {
     root.innerHTML = `
       ${renderHeader()}
       <div id="review-area">${renderReviewList()}</div>
+    `;
+  } else if (state.view === 'sops') {
+    root.innerHTML = `
+      ${renderHeader()}
+      ${renderSopFilters()}
+      <div id="sops-area">${renderSopList()}</div>
     `;
   } else {
     root.innerHTML = `
@@ -502,9 +671,91 @@ function attachEventHandlers() {
       state.review.actionError = null;
       if (v === 'review') {
         await refreshReviewItems();
+      } else if (v === 'sops') {
+        state.sops.loadError = null;
+        await refreshSops();
       } else {
         render();
       }
+    });
+  });
+
+  // ----- SOPs view handlers -----
+  document.querySelectorAll('.sop-status-tab').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      state.sops.statusFilter = btn.dataset.sopStatus;
+      state.sops.expandedId = null;
+      state.sops.expandedDetail = null;
+      state.sops.selectedVersionNo = null;
+      state.sops.selectedVersionDetail = null;
+      await refreshSops();
+    });
+  });
+  const sopBizFilter = document.getElementById('sop-business-filter');
+  if (sopBizFilter) {
+    sopBizFilter.addEventListener('change', async () => {
+      state.sops.businessFilter = sopBizFilter.value;
+      state.sops.expandedId = null;
+      state.sops.expandedDetail = null;
+      state.sops.selectedVersionNo = null;
+      state.sops.selectedVersionDetail = null;
+      await refreshSops();
+    });
+  }
+  document.querySelectorAll('.sop-item').forEach(li => {
+    li.addEventListener('click', async (e) => {
+      // Don't bubble through nested version clicks (handled below).
+      if (e.target.closest('.sop-version')) return;
+      if (e.target.closest('button')) return;
+      const sopId = li.dataset.sopId;
+      if (state.sops.expandedId === sopId) {
+        state.sops.expandedId = null;
+        state.sops.expandedDetail = null;
+        state.sops.selectedVersionNo = null;
+        state.sops.selectedVersionDetail = null;
+      } else {
+        state.sops.expandedId = sopId;
+        state.sops.expandedDetail = null;
+        state.sops.selectedVersionNo = null;
+        state.sops.selectedVersionDetail = null;
+        state.sops.loadError = null;
+        render();
+        try {
+          const detail = await loadSopDetail(sopId);
+          if (state.sops.expandedId !== sopId) return;
+          state.sops.expandedDetail = detail;
+        } catch (err) {
+          if (state.sops.expandedId !== sopId) return;
+          state.sops.loadError = err.message || 'Failed to load SOP detail.';
+        }
+      }
+      render();
+    });
+  });
+  document.querySelectorAll('.sop-version').forEach(li => {
+    li.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (e.target.closest('button')) return;
+      const versionNo = parseInt(li.dataset.versionNo, 10);
+      const sopId = state.sops.expandedId;
+      if (!sopId) return;
+      if (state.sops.selectedVersionNo === versionNo) {
+        state.sops.selectedVersionNo = null;
+        state.sops.selectedVersionDetail = null;
+      } else {
+        state.sops.selectedVersionNo = versionNo;
+        state.sops.selectedVersionDetail = null;
+        render();
+        try {
+          const detail = await loadSopVersionDetail(sopId, versionNo);
+          if (state.sops.selectedVersionNo !== versionNo) return;
+          state.sops.selectedVersionDetail = detail;
+        } catch (err) {
+          if (state.sops.selectedVersionNo !== versionNo) return;
+          state.sops.loadError = err.message || 'Failed to load version templates.';
+        }
+      }
+      render();
     });
   });
 
@@ -692,6 +943,21 @@ async function refreshReviewItems() {
     render();
   } catch (err) {
     renderError(err);
+  }
+}
+
+async function refreshSops() {
+  try {
+    const { items, total } = await loadSops({
+      statusFilter: state.sops.statusFilter,
+      businessFilter: state.sops.businessFilter,
+    });
+    state.sops.items = items;
+    state.sops.total = total;
+    render();
+  } catch (err) {
+    state.sops.loadError = err.message || 'Failed to load SOPs.';
+    render();
   }
 }
 
