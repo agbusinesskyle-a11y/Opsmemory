@@ -38,13 +38,16 @@ claimed row dict. Public surface:
   send_one(conn, *, ...)   ship one delivery row end-to-end and
                             update audit state.
 
-Sentinel values for testing without pywebpush installed (e.g. on
-Windows where cryptography wheels can be flaky): see
-SENDER_FAKE_OK in send_one.
+The pywebpush import is lazy: this module loads cleanly on
+systems without the wheel (Windows dev, smoke tests). The
+runner / endpoint preflight ensures the wheel exists before
+claiming any rows, so missing pywebpush in --send mode fails
+fast rather than per-row.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -52,6 +55,33 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
+
+
+# Hard timeout on the upstream HTTP call. Push services usually
+# respond in <1s; 15s is generous and still finite. A stuck
+# provider can't deadlock the runner / API.
+DEFAULT_SEND_TIMEOUT_SECONDS = 15
+
+
+def preflight_sender(env: dict[str, str] | None = None) -> "VapidConfig":
+    """Validate that everything send_one needs is available BEFORE
+    the caller starts claiming rows. Codex chunk-10-step5c2-close:
+    a missing pywebpush wheel previously surfaced as per-row
+    code='config' failures; now it raises during preflight so the
+    runner exits 1 cleanly.
+
+    Returns the loaded VapidConfig so the caller doesn't have to
+    re-load it.
+    """
+    vapid = load_vapid_config(env)
+    try:
+        from pywebpush import webpush  # noqa: F401  # presence check
+    except ImportError as exc:
+        raise RuntimeError(
+            "pywebpush is not installed; install api/requirements.txt "
+            "(pywebpush==2.0.0) before running --send."
+        ) from exc
+    return vapid
 
 
 log = logging.getLogger("opsmemory.notifications.sender")
@@ -128,21 +158,44 @@ def _classify_http(status: int) -> tuple[str, str]:
     return "failed", "transient"
 
 
-async def _do_send(
+# Sentinel result kinds returned by _do_send so the audit-write
+# step can distinguish a real upstream HTTP status (use
+# _classify_http) from a transport-layer failure (force
+# 'transient') from a local key/encoding bug (force
+# 'bad_request' so an operator notices).
+@dataclass
+class _RawSendOutcome:
+    kind: str            # 'http' | 'transport' | 'local'
+    http_status: int | None
+    body_text: str
+
+
+def _do_send_sync(
     *,
     subscription_info: dict,
     payload_bytes: bytes,
     vapid: VapidConfig,
     ttl: int,
-) -> tuple[int, str]:
-    """Perform the encrypt + HTTP POST via pywebpush. Returns
-    (http_status, response_body_text). Wrapped in its own helper
-    so tests / dry-run callers can monkeypatch this seam without
-    touching the surrounding audit logic.
+    timeout: float,
+) -> _RawSendOutcome:
+    """Synchronous pywebpush call. send_one wraps this in
+    asyncio.to_thread so the asyncio event loop doesn't block on
+    the HTTP round trip (Codex chunk-10-step5c2-close (a)).
+
+    Codex chunk-10-step5c2-close also called out the WebPushException
+    classification: pure transport failures (DNS, connection refused,
+    read timeout) come from `requests` directly and DON'T always go
+    through WebPushException. Catch those explicitly and tag them
+    'transport' so the audit-write maps to code='transient'.
+    A WebPushException with no .response can be a local key/encoding
+    bug (e.g. malformed p256dh) — tag 'local' for code='bad_request'.
     """
-    # Imported lazily so the rest of the module loads on systems
-    # without pywebpush (Windows dev, smoke tests).
     from pywebpush import WebPushException, webpush  # type: ignore
+    from requests.exceptions import (  # type: ignore
+        ConnectionError as RConnectionError,
+        Timeout as RTimeout,
+        RequestException,
+    )
 
     try:
         resp = webpush(
@@ -151,25 +204,67 @@ async def _do_send(
             vapid_private_key=vapid.private_key,
             vapid_claims={"sub": vapid.subject},
             ttl=ttl,
+            timeout=timeout,
         )
-        body_text = ""
-        try:
-            body_text = (resp.text or "")[:512]
-        except Exception:
-            pass
-        return resp.status_code, body_text
     except WebPushException as exc:
-        # pywebpush raises on non-2xx. Pull the upstream status if
-        # the response is attached.
-        status = 500
-        body_text = str(exc)[:512]
         if exc.response is not None:
-            status = exc.response.status_code
+            body_text = ""
             try:
                 body_text = (exc.response.text or "")[:512]
             except Exception:
                 pass
-        return status, body_text
+            return _RawSendOutcome(
+                kind="http",
+                http_status=exc.response.status_code,
+                body_text=body_text,
+            )
+        # No response attached: pywebpush raised before the HTTP
+        # call (key/encoding bug locally) OR the requests layer
+        # raised a transport error and pywebpush wrapped it. Treat
+        # as 'local' (operator-actionable bad_request).
+        return _RawSendOutcome(
+            kind="local", http_status=None, body_text=str(exc)[:512],
+        )
+    except (RTimeout, RConnectionError) as exc:
+        return _RawSendOutcome(
+            kind="transport", http_status=None, body_text=f"{type(exc).__name__}: {str(exc)[:256]}",
+        )
+    except RequestException as exc:
+        return _RawSendOutcome(
+            kind="transport", http_status=None, body_text=f"{type(exc).__name__}: {str(exc)[:256]}",
+        )
+
+    body_text = ""
+    try:
+        body_text = (resp.text or "")[:512]
+    except Exception:
+        pass
+    return _RawSendOutcome(
+        kind="http", http_status=resp.status_code, body_text=body_text,
+    )
+
+
+async def _do_send(
+    *,
+    subscription_info: dict,
+    payload_bytes: bytes,
+    vapid: VapidConfig,
+    ttl: int,
+    timeout: float = DEFAULT_SEND_TIMEOUT_SECONDS,
+) -> _RawSendOutcome:
+    """Async wrapper that hands the sync pywebpush call off to a
+    thread pool. Codex chunk-10-step5c2-close (a): blocking the
+    event loop on a network round-trip would wedge the API
+    process when the test endpoint runs.
+    """
+    return await asyncio.to_thread(
+        _do_send_sync,
+        subscription_info=subscription_info,
+        payload_bytes=payload_bytes,
+        vapid=vapid,
+        ttl=ttl,
+        timeout=timeout,
+    )
 
 
 async def send_one(
@@ -254,16 +349,20 @@ async def send_one(
     }
     provider = provider_from_endpoint(sub_row["endpoint"])
 
-    # Step 3: encrypt + POST.
+    # Step 3: encrypt + POST. Codex chunk-10-step5c2-close (a):
+    # the HTTP call now runs in a thread pool with a finite
+    # timeout. _do_send NEVER raises — it returns _RawSendOutcome
+    # carrying enough info for us to classify.
     payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     try:
-        http_status, body_text = await _do_send(
+        outcome = await _do_send(
             subscription_info=subscription_info,
             payload_bytes=payload_bytes,
             vapid=vapid,
             ttl=ttl,
         )
     except Exception as exc:
+        # Defensive — a programming error inside the helper itself.
         log.exception("sender_unexpected_error", extra={
             "delivery_id": delivery_id,
             "user_id": user_id,
@@ -283,9 +382,57 @@ async def send_one(
             detail=str(exc)[:256], delivery_id=delivery_id,
         )
 
-    # Step 4: classify and update.
+    # Step 4: classify based on outcome kind.
+    if outcome.kind == "transport":
+        # Codex chunk-10-step5c2-close: transport failures (DNS,
+        # connection refused, read timeout) classify as
+        # 'transient' so a future retry walker can filter them.
+        await _mark_failed(
+            conn, delivery_id=delivery_id,
+            http_status=None, code="transient",
+            detail=outcome.body_text, provider=provider,
+        )
+        log.info("sender_failed", extra={
+            "delivery_id": delivery_id, "user_id": user_id,
+            "pref_id": pref_id,
+            "subscription_id": web_push_subscription_id,
+            "provider": provider, "http_status": None,
+            "code": "transient",
+        })
+        return SendResult(
+            status="failed", http_status=None, code="transient",
+            detail=outcome.body_text, delivery_id=delivery_id,
+        )
+    if outcome.kind == "local":
+        # Local key/encoding bug — operator-actionable, not
+        # transient; don't retry-store.
+        await _mark_failed(
+            conn, delivery_id=delivery_id,
+            http_status=None, code="bad_request",
+            detail=outcome.body_text, provider=provider,
+        )
+        log.info("sender_failed", extra={
+            "delivery_id": delivery_id, "user_id": user_id,
+            "pref_id": pref_id,
+            "subscription_id": web_push_subscription_id,
+            "provider": provider, "http_status": None,
+            "code": "bad_request",
+        })
+        return SendResult(
+            status="failed", http_status=None, code="bad_request",
+            detail=outcome.body_text, delivery_id=delivery_id,
+        )
+
+    # outcome.kind == 'http': real HTTP status from the push service.
+    http_status = outcome.http_status or 0
+    body_text = outcome.body_text
     status, code = _classify_http(http_status)
     if status == "sent":
+        # Codex chunk-10-step5c2-close: bump last_seen_at on
+        # successful send so the operator/UI can tell which
+        # devices are healthy and reachable. The schema column at
+        # 0013_notifications.sql:115 was always meant for this;
+        # the sender just wasn't writing it.
         await conn.execute(
             """
             UPDATE notification_deliveries
@@ -296,6 +443,14 @@ async def send_one(
              WHERE id = $1::uuid
             """,
             delivery_id, provider,
+        )
+        await conn.execute(
+            """
+            UPDATE web_push_subscriptions
+               SET last_seen_at = now()
+             WHERE id = $1::uuid
+            """,
+            web_push_subscription_id,
         )
         log.info("sender_sent", extra={
             "delivery_id": delivery_id,
@@ -310,7 +465,7 @@ async def send_one(
             detail=None, delivery_id=delivery_id,
         )
 
-    # Step 5: failure path. 410/404 also expires the subscription.
+    # HTTP failure: 4xx or 5xx classified by _classify_http.
     await _mark_failed(
         conn,
         delivery_id=delivery_id,
@@ -320,6 +475,8 @@ async def send_one(
         provider=provider,
     )
     if code == "unsubscribed":
+        # 404 / 410 — also expire the subscription (gated on
+        # current status='active' so we don't clobber 'revoked').
         await conn.execute(
             """
             UPDATE web_push_subscriptions
@@ -334,6 +491,21 @@ async def send_one(
             "subscription_id": web_push_subscription_id,
             "http_status": http_status,
         })
+    elif code == "bad_request":
+        # Provider rejected the payload but the subscription
+        # itself contacted us — bump last_seen_at so a follow-up
+        # operator inspection can see the device was reachable.
+        # Per Codex chunk-10-step5c2-close: 'last_seen_at on
+        # successful send AND probably on non-404/410 provider
+        # contact.'
+        await conn.execute(
+            """
+            UPDATE web_push_subscriptions
+               SET last_seen_at = now()
+             WHERE id = $1::uuid
+            """,
+            web_push_subscription_id,
+        )
 
     log.info("sender_failed", extra={
         "delivery_id": delivery_id,
