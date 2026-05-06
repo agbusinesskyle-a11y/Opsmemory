@@ -26,7 +26,7 @@
 //   server sends Cache-Control: no-cache on /sw.js per main.py changes).
 //   Bumping BUILD invalidates old shell caches at activate time.
 
-const BUILD = 'c10s3b3-fix-sw-strand';
+const BUILD = 'c10s3c-push-handlers';
 const SHELL_CACHE = `opsmemory-shell-${BUILD}`;
 const TASKS_CACHE = `opsmemory-tasks-${BUILD}`;
 
@@ -223,4 +223,113 @@ async function _staleResponse(cache, req) {
     statusText: cached.statusText,
     headers: hdrs,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 10 step 3 sub-(c): Web Push handlers.
+// ---------------------------------------------------------------------------
+//
+// Payload contract (smallest possible — see api/app/v1_notifications.py
+// step 5 sender):
+//   { title, body, task_id?, url? }
+// All fields optional; the SW falls back to a generic notification when
+// the payload is empty or unparseable. Per Codex chunk-10-step3b3-close
+// SUB-(c) PLAN.
+
+self.addEventListener('push', function (event) {
+  event.waitUntil(_handlePush(event));
+});
+
+async function _handlePush(event) {
+  let payload = {};
+  if (event.data) {
+    try {
+      payload = event.data.json();
+    } catch (_e) {
+      // Defensive: server may have sent text/non-JSON. Try .text() and
+      // fall back to a generic notification rather than crashing the SW.
+      try {
+        const txt = event.data.text();
+        payload = { title: 'OpsMemory', body: txt };
+      } catch (_e2) {
+        payload = {};
+      }
+    }
+  }
+  const title = (typeof payload.title === 'string' && payload.title.length)
+    ? payload.title.slice(0, 200)
+    : 'OpsMemory';
+  const body = (typeof payload.body === 'string' && payload.body.length)
+    ? payload.body.slice(0, 600)
+    : 'New notification';
+  const data = {
+    task_id: typeof payload.task_id === 'string' ? payload.task_id : null,
+    url: typeof payload.url === 'string' ? payload.url : null,
+    received_at: new Date().toISOString(),
+  };
+  // Tag groups together notifications for the same task_id so a later
+  // push for the same task replaces the prior one rather than
+  // stacking. If no task_id, every push is its own tag.
+  const tag = data.task_id ? ('opsmemory-task-' + data.task_id) : ('opsmemory-' + Date.now());
+  await self.registration.showNotification(title, {
+    body,
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
+    tag,
+    data,
+    renotify: false,
+  });
+}
+
+self.addEventListener('notificationclick', function (event) {
+  event.notification.close();
+  event.waitUntil(_handleNotificationClick(event));
+});
+
+function _resolveSafeTargetUrl(data) {
+  // Codex chunk-10-step3b3-close SUB-(c) PLAN: only follow same-
+  // origin payload URLs. A push could in principle carry a hostile
+  // url:'https://attacker.example/...'; reject anything that isn't
+  // our own origin. If url is malformed, fall back to '/'.
+  const ourOrigin = self.location.origin;
+  if (data && typeof data.url === 'string' && data.url.length) {
+    try {
+      const u = new URL(data.url, ourOrigin);
+      if (u.origin === ourOrigin) return u.toString();
+    } catch (_e) { /* fall through */ }
+  }
+  if (data && typeof data.task_id === 'string' && data.task_id.length) {
+    // Sub-(c) commit 2 lights this up via /?task=<id> deep-link
+    // auto-expand. Until then the URL still loads the PWA shell
+    // and the user can find the task manually.
+    return ourOrigin + '/?task=' + encodeURIComponent(data.task_id);
+  }
+  return ourOrigin + '/';
+}
+
+async function _handleNotificationClick(event) {
+  const data = (event.notification && event.notification.data) || {};
+  const target = _resolveSafeTargetUrl(data);
+  const allClients = await self.clients.matchAll({
+    type: 'window',
+    includeUncontrolled: true,
+  });
+  // Prefer focusing an existing same-origin window; navigate it to
+  // the target if Client.navigate is available and URLs differ.
+  for (const client of allClients) {
+    try {
+      const cu = new URL(client.url);
+      if (cu.origin === self.location.origin) {
+        if (typeof client.navigate === 'function' && client.url !== target) {
+          try { await client.navigate(target); } catch (_e) { /* ignore */ }
+        }
+        return client.focus();
+      }
+    } catch (_e) { /* skip clients with unparseable URLs */ }
+  }
+  // No existing window: open a new one.
+  if (typeof self.clients.openWindow === 'function') {
+    return self.clients.openWindow(target);
+  }
+  return null;
 }
