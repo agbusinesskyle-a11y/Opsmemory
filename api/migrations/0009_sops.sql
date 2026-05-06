@@ -81,16 +81,18 @@ CREATE TABLE IF NOT EXISTS sops (
   updated_by uuid REFERENCES users(id) ON DELETE SET NULL,
 
   CHECK (length(name) BETWEEN 1 AND 256),
-  CHECK (jsonb_typeof(metadata) = 'object'),
-  -- Per business, SOP names should be unique enough for operator
-  -- readability; case-folded uniqueness later if needed. Soft uniqueness
-  -- via index, not constraint, so a renamed-and-archived SOP can
-  -- coexist with a same-named replacement.
-  UNIQUE (business_id, name)
+  CHECK (jsonb_typeof(metadata) = 'object')
 );
 
+-- Per Codex chunk-7-step1 review: the previous inline
+-- UNIQUE (business_id, name) didn't match the documented intent
+-- ("archived replacement can coexist"). Use a partial unique index
+-- scoped to active SOPs so an operator can archive 'RedHot Opening'
+-- and create a new active 'RedHot Opening' for the next year.
 CREATE INDEX IF NOT EXISTS sops_business_idx ON sops(business_id);
 CREATE INDEX IF NOT EXISTS sops_status_idx ON sops(status);
+CREATE UNIQUE INDEX IF NOT EXISTS sops_active_name_uidx
+  ON sops(business_id, name) WHERE status = 'active';
 
 -- =========================================================================
 -- sop_versions
@@ -125,9 +127,13 @@ CREATE TABLE IF NOT EXISTS sop_versions (
   CHECK (version_no >= 1),
   CHECK (jsonb_typeof(metadata) = 'object'),
   CHECK (
-    -- published rows must have a publisher + timestamp
-    (state <> 'published') OR
-    (published_at IS NOT NULL AND published_by IS NOT NULL)
+    -- Published rows must have a publish timestamp. The actor column
+    -- (published_by) is ON DELETE SET NULL, so it can NULL out when a
+    -- user is hard-deleted (chunk-1 design 7-day window). Requiring
+    -- it here would make user hard-delete fail with FK error.
+    -- application-layer code is responsible for setting published_by
+    -- on the publish path; the schema just guards the timestamp.
+    (state <> 'published') OR (published_at IS NOT NULL)
   ),
   UNIQUE (sop_id, version_no)
 );
@@ -176,9 +182,11 @@ CREATE TABLE IF NOT EXISTS sop_template_tasks (
   category text,
   priority text,
 
-  -- Owner role: 'admin', 'owner', 'unassigned'. Free text initially;
-  -- enforced by future application validation. Can be NULL meaning
-  -- "anyone can pick this up".
+  -- Owner role hint for materialization (e.g. 'admin', 'owner',
+  -- 'redhot_lead'). Free text — SOP assignment vocabulary is not the
+  -- same thing as auth role vocabulary, so no CHECK against the auth
+  -- enum. NULL means "anyone can pick this up" (do not use the
+  -- string 'unassigned' for that — NULL already encodes it).
   owner_role text,
   -- Optional explicit user override. When set, materialization assigns
   -- this user instead of resolving by role. ON DELETE SET NULL so
@@ -195,6 +203,11 @@ CREATE TABLE IF NOT EXISTS sop_template_tasks (
   CHECK (priority IS NULL OR length(priority) BETWEEN 1 AND 32),
   CHECK (owner_role IS NULL OR length(owner_role) BETWEEN 1 AND 64),
   CHECK (jsonb_typeof(metadata) = 'object'),
+  -- ±10 years bounds the offset to a sane range. A typoed 999999
+  -- would produce a task with due_at in the year 4754; this guards
+  -- against that without ruling out anchors with multi-year prep
+  -- windows (e.g. 2-year permitting cycles).
+  CHECK (due_offset_days IS NULL OR due_offset_days BETWEEN -3650 AND 3650),
   -- Stable order: each (version, seq_no) is one template.
   UNIQUE (sop_version_id, seq_no)
 );
@@ -243,12 +256,15 @@ CREATE TABLE IF NOT EXISTS anchor_events (
   CHECK (length(kind) BETWEEN 1 AND 64),
   CHECK (jsonb_typeof(metadata) = 'object'),
   CHECK (
-    -- 'fired' state requires fired_at + fired_by
-    (state <> 'fired') OR (fired_at IS NOT NULL AND fired_by IS NOT NULL)
+    -- 'fired' state requires the timestamp. fired_by is ON DELETE SET
+    -- NULL so a user hard-delete can null it without breaking the
+    -- state invariant.
+    (state <> 'fired') OR (fired_at IS NOT NULL)
   ),
   CHECK (
-    -- 'cancelled' state requires cancelled_at + cancelled_by
-    (state <> 'cancelled') OR (cancelled_at IS NOT NULL AND cancelled_by IS NOT NULL)
+    -- 'cancelled' state requires the timestamp; same reasoning for
+    -- cancelled_by.
+    (state <> 'cancelled') OR (cancelled_at IS NOT NULL)
   ),
   -- One scheduled anchor per (business, kind, scheduled_for) — prevents
   -- accidental dup-fire of the same opening day.
@@ -366,6 +382,147 @@ FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 DROP TRIGGER IF EXISTS trg_sop_generated_tasks_updated_at ON sop_generated_tasks;
 CREATE TRIGGER trg_sop_generated_tasks_updated_at BEFORE UPDATE ON sop_generated_tasks
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =========================================================================
+-- Tenant / parent integrity triggers (per Codex chunk-7-step1 review).
+--
+-- Plain FKs reference only the parent's primary key, which leaves four
+-- holes:
+--   1. sops.latest_version_id can point to another sop's version.
+--   2. anchor_events.business_id / sop_id can pair business A with
+--      business B's SOP.
+--   3. sop_instances.anchor_event_id / sop_version_id can pair an
+--      anchor with a version belonging to a different sop.
+--   4. sop_generated_tasks: instance + template from different versions.
+--
+-- Triggers are simpler than composite FKs here because some of the
+-- referenced columns participate in ON DELETE SET NULL, which composite
+-- FKs handle awkwardly (NULLing the second column would violate parent
+-- PK). The triggers are BEFORE INSERT/UPDATE so violations 23514-style
+-- error before any data lands.
+-- =========================================================================
+
+-- 1. sops.latest_version_id must belong to THIS sop.
+CREATE OR REPLACE FUNCTION sops_latest_version_belongs_check()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.latest_version_id IS NOT NULL THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM sop_versions
+      WHERE id = NEW.latest_version_id
+        AND sop_id = NEW.id
+    ) THEN
+      RAISE EXCEPTION
+        'sops.latest_version_id % does not belong to sop %',
+        NEW.latest_version_id, NEW.id
+        USING ERRCODE = 'foreign_key_violation';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_sops_latest_version_check ON sops;
+CREATE TRIGGER trg_sops_latest_version_check
+BEFORE INSERT OR UPDATE OF latest_version_id ON sops
+FOR EACH ROW EXECUTE FUNCTION sops_latest_version_belongs_check();
+
+-- 2. anchor_events: business_id must equal the SOP's business_id.
+CREATE OR REPLACE FUNCTION anchor_events_business_match_check()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  sop_business uuid;
+BEGIN
+  SELECT business_id INTO sop_business FROM sops WHERE id = NEW.sop_id;
+  IF sop_business IS NULL THEN
+    RAISE EXCEPTION
+      'anchor_events.sop_id % refers to a missing SOP', NEW.sop_id
+      USING ERRCODE = 'foreign_key_violation';
+  END IF;
+  IF sop_business <> NEW.business_id THEN
+    RAISE EXCEPTION
+      'anchor_events.business_id % does not match sops.business_id % for sop %',
+      NEW.business_id, sop_business, NEW.sop_id
+      USING ERRCODE = 'foreign_key_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_anchor_events_business_match ON anchor_events;
+CREATE TRIGGER trg_anchor_events_business_match
+BEFORE INSERT OR UPDATE OF business_id, sop_id ON anchor_events
+FOR EACH ROW EXECUTE FUNCTION anchor_events_business_match_check();
+
+-- 3. sop_instances: anchor's sop_id must equal version's sop_id.
+CREATE OR REPLACE FUNCTION sop_instances_sop_match_check()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  anchor_sop uuid;
+  version_sop uuid;
+BEGIN
+  SELECT sop_id INTO anchor_sop  FROM anchor_events  WHERE id = NEW.anchor_event_id;
+  SELECT sop_id INTO version_sop FROM sop_versions   WHERE id = NEW.sop_version_id;
+  IF anchor_sop IS NULL OR version_sop IS NULL THEN
+    RAISE EXCEPTION
+      'sop_instances refers to missing anchor (%) or version (%)',
+      NEW.anchor_event_id, NEW.sop_version_id
+      USING ERRCODE = 'foreign_key_violation';
+  END IF;
+  IF anchor_sop <> version_sop THEN
+    RAISE EXCEPTION
+      'sop_instances pairs anchor sop % with version sop %; mismatched',
+      anchor_sop, version_sop
+      USING ERRCODE = 'foreign_key_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_sop_instances_sop_match ON sop_instances;
+CREATE TRIGGER trg_sop_instances_sop_match
+BEFORE INSERT OR UPDATE OF anchor_event_id, sop_version_id ON sop_instances
+FOR EACH ROW EXECUTE FUNCTION sop_instances_sop_match_check();
+
+-- 4. sop_generated_tasks: template_task's version must equal instance's version.
+CREATE OR REPLACE FUNCTION sop_generated_tasks_version_match_check()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  instance_version uuid;
+  template_version uuid;
+BEGIN
+  SELECT sop_version_id INTO instance_version FROM sop_instances
+   WHERE id = NEW.sop_instance_id;
+  SELECT sop_version_id INTO template_version FROM sop_template_tasks
+   WHERE id = NEW.sop_template_task_id;
+  IF instance_version IS NULL OR template_version IS NULL THEN
+    RAISE EXCEPTION
+      'sop_generated_tasks refers to missing instance (%) or template (%)',
+      NEW.sop_instance_id, NEW.sop_template_task_id
+      USING ERRCODE = 'foreign_key_violation';
+  END IF;
+  IF instance_version <> template_version THEN
+    RAISE EXCEPTION
+      'sop_generated_tasks pairs instance version % with template from version %',
+      instance_version, template_version
+      USING ERRCODE = 'foreign_key_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_sop_generated_tasks_version_match ON sop_generated_tasks;
+CREATE TRIGGER trg_sop_generated_tasks_version_match
+BEFORE INSERT OR UPDATE OF sop_instance_id, sop_template_task_id ON sop_generated_tasks
+FOR EACH ROW EXECUTE FUNCTION sop_generated_tasks_version_match_check();
 
 -- =========================================================================
 -- Runtime grants (read-only this commit)
