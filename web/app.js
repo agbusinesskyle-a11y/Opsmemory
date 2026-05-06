@@ -1329,6 +1329,9 @@ function _renderPrefDrawer(channel, draft) {
         : '');
   return `
     <tr class="settings-drawer" data-drawer-channel="${escapeHtml(channel)}">
+      <!-- colspan must match the prefs table column count
+           (Channel/Status/Schedule/Settings/Actions = 5).
+           Update both if a column is added. -->
       <td colspan="5">
         <div class="settings-editor">
           <label class="settings-editor-field">
@@ -2264,32 +2267,62 @@ function attachEventHandlers() {
     });
   });
 
-  // Field-change listeners for the drawer. data-pref-field +
-  // data-channel identify the target draft.
-  document.querySelectorAll('[data-pref-field][data-channel]').forEach(el => {
-    const handler = () => {
+  // Field-change listeners for the drawer.
+  //
+  // Codex chunk-10-step3b1-close (blocker 1): re-rendering on every
+  // 'input' event for number fields destroys/recreates the focused
+  // element and can eat keystrokes / Save clicks. Mirror the SOP
+  // template editor pattern (web/app.js earlier in this same
+  // function): mutate state on 'input', do NOT render. Number /
+  // text 'input' events update the draft in-memory and toggle the
+  // Save button's disabled attribute directly via DOM. Only the
+  // checkbox + select fire 'change' (and only the kind select
+  // requires a re-render to show/hide the weekday dropdown).
+  function _refreshSaveButtonState(channel, draft) {
+    const saveBtn = document.querySelector(
+      `.settings-edit-save[data-channel="${CSS.escape(channel)}"]`
+    );
+    if (!saveBtn) return;
+    const validationErr = _validateSettingsDraft(draft);
+    saveBtn.disabled = draft.pending || !draft.dirty || !!validationErr;
+  }
+  document.querySelectorAll('input[data-pref-field][type="number"]').forEach(el => {
+    el.addEventListener('input', () => {
+      const channel = el.dataset.channel;
+      const field = el.dataset.prefField;
+      const draft = (state.settings.editing || {})[channel];
+      if (!draft || draft.pending) return;
+      const n = parseInt(el.value, 10);
+      const next = Number.isFinite(n) ? n : NaN;
+      if (draft[field] !== next) {
+        draft[field] = next;
+        draft.dirty = true;
+        draft.error = null;
+        _refreshSaveButtonState(channel, draft);
+      }
+    });
+  });
+  document.querySelectorAll('input[data-pref-field][type="checkbox"], select[data-pref-field]').forEach(el => {
+    el.addEventListener('change', () => {
       const channel = el.dataset.channel;
       const field = el.dataset.prefField;
       const draft = (state.settings.editing || {})[channel];
       if (!draft || draft.pending) return;
       let next;
       if (field === 'enabled') next = !!el.checked;
-      else if (field === 'scheduleKind' || field === 'weekday') next = el.value;
-      else if (field === 'hour' || field === 'minute') {
-        const n = parseInt(el.value, 10);
-        next = Number.isFinite(n) ? n : 0;
-      }
+      else next = el.value;
       if (draft[field] !== next) {
         draft[field] = next;
         draft.dirty = true;
         draft.error = null;
+        // scheduleKind toggles the visibility of the weekday <select>,
+        // so a re-render is required when kind changes. enabled
+        // checkbox + weekday select don't change layout, but
+        // re-rendering them is cheap and they don't suffer the
+        // focus-eating issue (change fires on blur for selects).
         render();
       }
-    };
-    el.addEventListener('change', handler);
-    if (el.tagName === 'INPUT' && el.type === 'number') {
-      el.addEventListener('input', handler);
-    }
+    });
   });
 
   document.querySelectorAll('.settings-edit-save').forEach(btn => {
@@ -2322,9 +2355,20 @@ function attachEventHandlers() {
         delete state.settings.editing[channel];
       } catch (err) {
         draft.pending = false;
-        draft.error = (err && err.body && err.body.detail)
-          ? (typeof err.body.detail === 'string' ? err.body.detail : JSON.stringify(err.body.detail))
-          : (err && err.message) || 'Save failed.';
+        // Codex chunk-10-step3b1-close (f): user-friendly message
+        // extraction. Pydantic 422 detail is a list of {type, loc,
+        // msg, ...} objects; show the first msg. Our hand-rolled
+        // 422s use {code, reason}.
+        let msg = (err && err.message) || 'Save failed.';
+        const detail = err && err.body && err.body.detail;
+        if (typeof detail === 'string') {
+          msg = detail;
+        } else if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+          msg = detail.reason || detail.detail || detail.code || msg;
+        } else if (Array.isArray(detail) && detail.length && detail[0].msg) {
+          msg = detail[0].msg;
+        }
+        draft.error = msg;
       }
       render();
     });

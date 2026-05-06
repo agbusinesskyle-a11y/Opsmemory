@@ -94,11 +94,15 @@ def _validate_schedule_object(schedule: dict) -> None:
         raise ValueError(
             f"schedule.kind must be one of {sorted(_SCHEDULE_KINDS)}; got {kind!r}"
         )
+    # Codex chunk-10-step3b1-close (blocker 2): bool is an int
+    # subclass in Python, so isinstance(True, int) is True. Use a
+    # strict type check so JSON `true`/`false` doesn't slip through
+    # as 1/0.
     hour = schedule.get("hour")
-    if not isinstance(hour, int) or not (0 <= hour <= 23):
+    if type(hour) is not int or not (0 <= hour <= 23):
         raise ValueError(f"schedule.hour must be int 0..23; got {hour!r}")
     minute = schedule.get("minute")
-    if not isinstance(minute, int) or not (0 <= minute <= 59):
+    if type(minute) is not int or not (0 <= minute <= 59):
         raise ValueError(f"schedule.minute must be int 0..59; got {minute!r}")
     tz = schedule.get("timezone")
     if not isinstance(tz, str) or not _TIMEZONE_RE.match(tz):
@@ -330,6 +334,23 @@ async def patch_pref(
                 body.settings if body.settings is not None
                 else (existing["settings"] if existing else defaults["settings"])
             )
+
+            # Codex chunk-10-step3b1-close (blocker 3): the body-level
+            # @field_validator only fires on body.schedule. If the
+            # caller sends just {enabled: true} and the existing DB
+            # row has a malformed schedule, the bad row would be
+            # preserved AND re-enabled. Validate the merged
+            # new_schedule before the write so a corrupt row can
+            # never be re-armed without the caller fixing it.
+            if not isinstance(new_schedule, dict):
+                raise HTTPException(status_code=422,
+                    detail={"code": "schedule_invalid",
+                            "reason": "schedule must be a JSON object"})
+            try:
+                _validate_schedule_object(new_schedule)
+            except ValueError as exc:
+                raise HTTPException(status_code=422,
+                    detail={"code": "schedule_invalid", "reason": str(exc)})
 
             if existing:
                 row = await conn.fetchrow(
