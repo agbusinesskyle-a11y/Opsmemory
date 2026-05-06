@@ -17,10 +17,15 @@ Auth:
   - Service principals must have the `ingest:write` scope.
 
 Idempotency:
-  - normalized_hash is unique. Re-posting identical content returns the
-    existing event_id with deduped=true and no new row.
+  - meeting_recap: normalized_hash is unique within the source via a
+    partial UNIQUE index (migration 0006). Re-posting identical recap
+    text returns the existing event_id with deduped=true.
   - source_external_id (when supplied) is unique per source. Posting the
-    same Slack message twice returns the existing event.
+    same Slack message ts twice returns the existing event.
+  - Slack does NOT participate in hash uniqueness (Codex chunk-5-step1
+    review: short repeated messages — "ok", "+1", "lgtm" — across
+    channels are legitimately distinct events). Slack idempotency is
+    by source_external_id alone.
 """
 
 from __future__ import annotations
@@ -47,6 +52,8 @@ router = APIRouter(prefix="/v1/ingest")
 # ---------------------------------------------------------------------------
 
 class MeetingRecapIngest(BaseModel):
+    model_config = {"extra": "forbid"}
+
     content: str = Field(..., min_length=10, max_length=200_000,
                          description="Raw meeting recap text. UTF-8.")
     source_external_id: str | None = Field(
@@ -234,21 +241,33 @@ async def ingest_meeting_recap(
 # Slack ts is "<seconds>.<microseconds>" — use as the per-message
 # external id along with team + channel for full uniqueness across
 # workspaces.
+_SLACK_ID_PATTERN = r"^[A-Z][A-Z0-9]{1,30}$"
+_SLACK_TS_PATTERN = r"^\d{8,12}\.\d{6}$"
+
+
 class SlackIngest(BaseModel):
-    team_id: str = Field(..., min_length=1, max_length=32,
+    model_config = {"extra": "forbid"}
+
+    team_id: str = Field(..., min_length=2, max_length=32, pattern=_SLACK_ID_PATTERN,
                           description="Slack workspace id (T-prefixed).")
-    channel_id: str = Field(..., min_length=1, max_length=32,
+    channel_id: str = Field(..., min_length=2, max_length=32, pattern=_SLACK_ID_PATTERN,
                               description="Slack channel id (C/G/D-prefixed).")
-    ts: str = Field(..., min_length=1, max_length=64,
+    ts: str = Field(..., min_length=8, max_length=32, pattern=_SLACK_TS_PATTERN,
                      description="Slack message timestamp (idempotency key).")
-    text: str = Field(..., min_length=1, max_length=200_000,
-                       description="Raw message text. UTF-8.")
-    user_id: str | None = Field(default=None, max_length=32,
+    text: str = Field(..., min_length=1, max_length=50_000,
+                       description="Raw message text. UTF-8. Slack caps at 40k.")
+    user_id: str | None = Field(default=None, max_length=32, pattern=_SLACK_ID_PATTERN,
                                   description="Slack user id of the poster.")
-    thread_ts: str | None = Field(default=None, max_length=64,
+    thread_ts: str | None = Field(default=None, max_length=32, pattern=_SLACK_TS_PATTERN,
                                     description="Parent ts if this is a thread reply.")
     channel_name: str | None = Field(default=None, max_length=128)
     user_name: str | None = Field(default=None, max_length=128)
+    team_domain: str | None = Field(default=None, max_length=128,
+                                       description="Workspace subdomain, e.g. 'kyleconway'.")
+    workspace_name: str | None = Field(default=None, max_length=128,
+                                          description="Display name of the workspace.")
+    enterprise_id: str | None = Field(default=None, max_length=32, pattern=_SLACK_ID_PATTERN,
+                                         description="Slack Enterprise Grid id, when applicable.")
     extra: dict[str, Any] = Field(default_factory=dict,
                                     description="Free-form context from n8n forward.")
 
@@ -269,8 +288,13 @@ async def ingest_slack_message(
     Idempotency:
       - source_external_id = '{team_id}:{channel_id}:{ts}' is unique
         per source via the partial UNIQUE index from migration 0003.
-      - normalized_hash + source = 'slack_message' is unique via the
-        source-scoped UNIQUE index from migration 0005.
+        This is the canonical Slack idempotency key; Slack retries the
+        webhook with the same ts on 5xx.
+      - Slack does NOT participate in normalized_hash uniqueness — short
+        repeated messages ("ok", "+1", "lgtm") across channels are
+        legitimately distinct. The (source, normalized_hash) UNIQUE
+        from 0005 was reverted in 0006 in favor of a meeting_recap-only
+        partial UNIQUE.
 
     Pipeline behavior in this commit:
       - The event lands as 'received'. The reconciliation worker
@@ -306,6 +330,9 @@ async def ingest_slack_message(
         "user_id": body.user_id,
         "channel_name": body.channel_name,
         "user_name": body.user_name,
+        "team_domain": body.team_domain,
+        "workspace_name": body.workspace_name,
+        "enterprise_id": body.enterprise_id,
         "extra": body.extra,
     }
 
@@ -313,9 +340,11 @@ async def ingest_slack_message(
 
     pool = request.app.state.db
     async with pool.acquire() as conn:
-        # Pre-check by source_external_id (the canonical Slack
-        # idempotency key) first — same Slack message ts repeating is
-        # the common case (Slack retries the webhook on 500s).
+        # Slack idempotency is by source_external_id ONLY (the
+        # canonical message ts). NO content-hash dedup — short
+        # repeated messages across channels are legitimately distinct
+        # events, and 0006 dropped the source-scoped hash UNIQUE for
+        # exactly this reason.
         existing = await conn.fetchrow(
             "SELECT id::text AS id, status::text AS status FROM ingest_events "
             "WHERE source = 'slack_message' AND source_external_id = $1",
@@ -327,22 +356,6 @@ async def ingest_slack_message(
                 "status": existing["status"],
                 "deduped": True,
                 "dedup_key": "source_external_id",
-            }
-
-        # Source-scoped content-hash dedup: same canonical text from
-        # the same workspace+channel posted under a different ts is
-        # almost certainly a duplicate edit/repost.
-        existing_hash = await conn.fetchrow(
-            "SELECT id::text AS id, status::text AS status FROM ingest_events "
-            "WHERE source = 'slack_message' AND normalized_hash = $1",
-            hash_hex,
-        )
-        if existing_hash:
-            return {
-                "event_id": existing_hash["id"],
-                "status": existing_hash["status"],
-                "deduped": True,
-                "dedup_key": "content_hash",
             }
 
         try:
@@ -366,14 +379,10 @@ async def ingest_slack_message(
                 request_id,
             )
         except asyncpg.UniqueViolationError:
+            # Only source_external_id is UNIQUE for Slack now.
             existing = await conn.fetchrow(
-                "SELECT id::text AS id, status::text AS status, "
-                "       (normalized_hash = $1) AS by_hash "
-                "FROM ingest_events "
-                "WHERE source = 'slack_message' "
-                "  AND (normalized_hash = $1 OR source_external_id = $2) "
-                "LIMIT 1",
-                hash_hex,
+                "SELECT id::text AS id, status::text AS status FROM ingest_events "
+                "WHERE source = 'slack_message' AND source_external_id = $1",
                 source_external_id,
             )
             if not existing:
@@ -382,7 +391,7 @@ async def ingest_slack_message(
                 "event_id": existing["id"],
                 "status": existing["status"],
                 "deduped": True,
-                "dedup_key": "content_hash" if existing["by_hash"] else "source_external_id",
+                "dedup_key": "source_external_id",
             }
 
     log.info(
