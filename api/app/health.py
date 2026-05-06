@@ -95,27 +95,47 @@ async def readyz(request: Request):
             return _not_ready(f"backup_{reason}", **extras)
         backup_age = extras.get("age_hours")
 
-    # 4. Restore status freshness (optional — only checked if file path env is set
-    #    AND the file exists. We don't fail readiness for missing restore status,
-    #    only stale restore status. This keeps Chunk 1 boot path simple while still
-    #    catching a long-broken restore loop in Chunk 1.5+.)
+    # 4. Restore status freshness.
+    #
+    # Two modes per Chunk 1.5 step 8:
+    #
+    #  - READYZ_REQUIRE_RESTORE=true  (production): missing/malformed/stale
+    #    restore status fails readiness. Use after the weekly restore-check
+    #    timer is enabled and producing fresh status JSON.
+    #
+    #  - READYZ_REQUIRE_RESTORE=false (default, backwards-compat): a present
+    #    restore_status.json is checked for staleness; missing/malformed is
+    #    tolerated. Lets the server boot even before the restore-check
+    #    timer has fired.
+    require_restore = os.environ.get("READYZ_REQUIRE_RESTORE", "false").lower() == "true"
     restore_age = None
-    restore_status_path = os.environ.get("RESTORE_STATUS_FILE")
-    if restore_status_path and Path(restore_status_path).exists():
-        max_age_h = int(os.environ.get("READYZ_RESTORE_MAX_AGE_HOURS", "192"))
-        try:
-            payload = json.loads(Path(restore_status_path).read_text())
-            completed_at = datetime.fromisoformat(
-                str(payload.get("completed_at", "")).replace("Z", "+00:00")
-            )
-            age = (datetime.now(timezone.utc) - completed_at).total_seconds() / 3600
-            if age > max_age_h:
-                return _not_ready("restore_stale", age_hours=round(age, 2),
-                                  max_age_hours=max_age_h)
-            restore_age = round(age, 2)
-        except Exception as exc:
-            log.warning("readyz_restore_unreadable", extra={"err": repr(exc)})
-            # Don't fail readiness on a malformed restore file; log and continue.
+    if require_restore:
+        reason, extras = _check_status_file(
+            "RESTORE_STATUS_FILE",
+            "/var/lib/opsmemory/backup/restore_status.json",
+            "READYZ_RESTORE_MAX_AGE_HOURS",
+            192,
+        )
+        if reason:
+            return _not_ready(f"restore_{reason}", **extras)
+        restore_age = extras.get("age_hours")
+    else:
+        restore_status_path = os.environ.get("RESTORE_STATUS_FILE")
+        if restore_status_path and Path(restore_status_path).exists():
+            max_age_h = int(os.environ.get("READYZ_RESTORE_MAX_AGE_HOURS", "192"))
+            try:
+                payload = json.loads(Path(restore_status_path).read_text())
+                completed_at = datetime.fromisoformat(
+                    str(payload.get("completed_at", "")).replace("Z", "+00:00")
+                )
+                age = (datetime.now(timezone.utc) - completed_at).total_seconds() / 3600
+                if age > max_age_h:
+                    return _not_ready("restore_stale", age_hours=round(age, 2),
+                                      max_age_hours=max_age_h)
+                restore_age = round(age, 2)
+            except Exception as exc:
+                log.warning("readyz_restore_unreadable", extra={"err": repr(exc)})
+                # Soft mode: don't fail readiness on a malformed restore file.
 
     return {
         "ok": True,
@@ -123,6 +143,7 @@ async def readyz(request: Request):
         "migration": "0001_initial",
         "backup_check": "enabled" if require_backup else "skipped",
         "backup_age_hours": backup_age,
+        "restore_check": "required" if require_restore else "soft",
         "restore_age_hours": restore_age,
     }
 
