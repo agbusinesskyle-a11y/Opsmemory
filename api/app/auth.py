@@ -194,7 +194,7 @@ async def _load_user(
             WHERE id = $1
             """,
             row["identity_id"],
-            json.dumps(claim_subset),
+            claim_subset,
             sub,
         )
 

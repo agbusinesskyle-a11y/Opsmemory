@@ -19,7 +19,6 @@ Workflow guarantees:
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -34,9 +33,12 @@ log = logging.getLogger("opsmemory.reconciliation.pipeline")
 
 
 async def _record_llm_call(conn, *, ingest_event_id: str, review_item_id: str | None, call) -> None:
-    """Persist one llm_calls row from an LlmCall dataclass."""
-    response_json = json.dumps(call.response) if call.response is not None else None
-    request_json = json.dumps(call.request_body) if call.request_body else None
+    """Persist one llm_calls row from an LlmCall dataclass.
+
+    Pool's jsonb codec handles encoding — pass raw Python dicts, not
+    pre-serialized strings, or asyncpg double-encodes (chunk-4-step2
+    Codex blocker).
+    """
     await conn.execute(
         """
         INSERT INTO llm_calls
@@ -55,8 +57,8 @@ async def _record_llm_call(conn, *, ingest_event_id: str, review_item_id: str | 
         call.model,
         call.prompt_template,
         call.prompt_hash,
-        request_json,
-        response_json,
+        call.request_body,
+        call.response,
         call.input_tokens,
         call.output_tokens,
         call.cost_usd,
@@ -267,14 +269,14 @@ async def process_event(conn, event_id: str) -> dict:
             event_id,
             decision["action"],
             decision.get("target_task_id"),
-            json.dumps(proposed_patch),
-            json.dumps(cand),
-            json.dumps(retrieved),
+            proposed_patch,
+            cand,
+            retrieved,
             decision["confidence"],
             decision["reason"],
             base_task_version,
-            json.dumps(base_field_versions),
-            json.dumps(validation_errors),
+            base_field_versions,
+            validation_errors,
         )
         review_count += 1
 

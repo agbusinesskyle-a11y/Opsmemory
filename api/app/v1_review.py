@@ -280,8 +280,10 @@ async def _persist_apply_failure(pool, review_item_id: str, *,
     or operator could legitimately have rejected, approved, or
     superseded the same review_item. The guard refuses to demote a row
     that has left the actionable queue, preserving terminal states.
+
+    Pool's jsonb codec encodes raw Python dicts; pass error_payload as
+    a dict, not a json.dumps() string (chunk-4-step2 Codex blocker).
     """
-    import json as _json
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -297,7 +299,7 @@ async def _persist_apply_failure(pool, review_item_id: str, *,
                     """,
                     review_item_id,
                     new_status,
-                    _json.dumps(error_payload),
+                    error_payload,
                 )
                 # asyncpg returns "UPDATE N" — N=0 means the guard refused.
                 if result.endswith(" 0"):

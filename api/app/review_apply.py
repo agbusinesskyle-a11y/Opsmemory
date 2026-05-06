@@ -388,7 +388,7 @@ async def _apply_create_task(
         """,
         task_id,
         f"review:{review_item_id}",
-        json.dumps(new_value),
+        new_value,
         actor_user_id,
         actor_service_id,
         actor_type,
@@ -416,8 +416,8 @@ async def _apply_create_task(
             actor_user_id,
             actor_service_id,
             f"create from review_item {review_item_id}",
-            json.dumps({"review_item_id": review_item_id,
-                        "ingest_event_id": ingest_event_id}),
+            {"review_item_id": review_item_id,
+             "ingest_event_id": ingest_event_id},
         )
 
     return task_id
@@ -580,8 +580,8 @@ async def _apply_update_task(
             target_task_id,
             f"review:{review_item_id}:{fname}",
             fname,
-            json.dumps(old_val),
-            json.dumps(new_val),
+            old_val,
+            new_val,
             actor_user_id,
             actor_service_id,
             actor_type,
@@ -626,14 +626,35 @@ async def _apply_complete_task(
       - task_already_done (current status is 'done')
       - task_version_moved
     """
-    complete = proposed_patch.get("complete") or {}
+    # Strict patch-shape validation. Symmetric with UPDATE_TASK's allowlist.
+    complete = proposed_patch.get("complete")
+    if complete is None:
+        complete = {}
+    if not isinstance(complete, dict):
+        raise ApplyValidationError([{
+            "code": "complete_invalid",
+            "message": "proposed_patch.complete must be an object",
+        }])
+    extra = [k for k in complete.keys() if k != "completion_note"]
+    if extra:
+        raise ApplyValidationError([{
+            "code": "complete_field_unknown",
+            "message": f"unknown complete keys: {extra}",
+        }])
     completion_note = complete.get("completion_note")
+    if completion_note is not None and not isinstance(completion_note, str):
+        raise ApplyValidationError([{
+            "code": "completion_note_invalid",
+            "message": "completion_note must be a string or null",
+        }])
 
     task_row = await conn.fetchrow(
         """
         SELECT id::text AS id, status::text AS status,
                deletion_state::text AS deletion_state,
-               completion_note, completed_at::text AS completed_at,
+               completion_note,
+               completed_at::text AS completed_at,
+               completed_by::text AS completed_by,
                version
         FROM tasks WHERE id = $1::uuid FOR UPDATE
         """,
@@ -705,7 +726,8 @@ async def _apply_complete_task(
     history_rows = (
         ("status", task_row["status"], "done"),
         ("completed_at", task_row["completed_at"], new_completed_at),
-        ("completed_by", None, str(reviewer_id) if reviewer_id else None),
+        ("completed_by", task_row["completed_by"],
+         str(reviewer_id) if reviewer_id else None),
         ("completion_note", task_row["completion_note"], completion_note),
     )
     for fname, old_val, new_val in history_rows:
@@ -725,8 +747,8 @@ async def _apply_complete_task(
             target_task_id,
             f"review:{review_item_id}:{fname}",
             fname,
-            json.dumps(old_val),
-            json.dumps(new_val),
+            old_val,
+            new_val,
             actor_user_id,
             actor_service_id,
             actor_type,
@@ -759,8 +781,8 @@ async def _apply_complete_task(
             actor_user_id,
             actor_service_id,
             f"complete from review_item {review_item_id}",
-            json.dumps({"review_item_id": review_item_id,
-                        "ingest_event_id": ingest_event_id}),
+            {"review_item_id": review_item_id,
+             "ingest_event_id": ingest_event_id},
         )
 
     return target_task_id

@@ -179,7 +179,7 @@ async def ingest_meeting_recap(
                 body.source_external_id,
                 canonical,
                 hash_hex,
-                __import__("json").dumps(body.source_metadata),
+                body.source_metadata,
                 actor_type,
                 actor_user_id,
                 actor_service_id,
