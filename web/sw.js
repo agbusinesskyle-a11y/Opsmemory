@@ -26,7 +26,7 @@
 //   server sends Cache-Control: no-cache on /sw.js per main.py changes).
 //   Bumping BUILD invalidates old shell caches at activate time.
 
-const BUILD = 'a357632-sops-tab-fix1';
+const BUILD = 'a357632-sops-author';
 const SHELL_CACHE = `opsmemory-shell-${BUILD}`;
 const TASKS_CACHE = `opsmemory-tasks-${BUILD}`;
 

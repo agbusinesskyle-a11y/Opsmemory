@@ -31,7 +31,7 @@ const state = {
     pendingAction: null,        // 'approve' | 'reject' | null while a write is in flight
     actionError: null,
   },
-  // SOPs view (chunk 7 step 4 first UI commit — read-only).
+  // SOPs view (chunk 7 step 4 — admin-only).
   sops: {
     items: [],
     total: 0,
@@ -42,6 +42,10 @@ const state = {
     selectedVersionNo: null,    // version_no whose templates are loaded
     selectedVersionDetail: null, // { version, template_tasks[] }
     loadError: null,
+    // UI 2/3: inline authoring. When non-null, the SOP detail
+    // renders an editable template table for state.sops.editing.versionNo
+    // instead of the read-only list.
+    editing: null,              // null | { versionNo, templates: [...], saving, saveError, publishError, pending }
   },
   // Sync indicator state. The header pill reads from these.
   sync: {
@@ -190,6 +194,23 @@ async function loadSopDetail(sopId) {
 async function loadSopVersionDetail(sopId, versionNo) {
   return await api('/v1/sops/' + encodeURIComponent(sopId) +
                     '/versions/' + encodeURIComponent(versionNo));
+}
+
+async function createSopDraftVersion(sopId, body) {
+  return await api('/v1/sops/' + encodeURIComponent(sopId) + '/versions',
+                   { method: 'POST', body: body || {} });
+}
+
+async function saveSopTemplates(sopId, versionNo, templates) {
+  return await api('/v1/sops/' + encodeURIComponent(sopId) +
+                    '/versions/' + encodeURIComponent(versionNo) + '/templates',
+                   { method: 'PATCH', body: { templates } });
+}
+
+async function publishSopVersion(sopId, versionNo, body) {
+  return await api('/v1/sops/' + encodeURIComponent(sopId) +
+                    '/versions/' + encodeURIComponent(versionNo) + '/publish',
+                   { method: 'POST', body: body || {} });
 }
 
 // ---------- Client mutations (Chunk 6 step 1 contract + step 3 outbox) ----------
@@ -522,13 +543,69 @@ function renderSopFilters() {
   `;
 }
 
+function renderSopTemplateEditor() {
+  // Inline editor for state.sops.editing.templates. seq_no = array index.
+  const templates = state.sops.editing.templates || [];
+  const saveDisabled = state.sops.editing.pending ? 'disabled' : '';
+  const rows = templates.map((t, idx) => `
+    <li class="sop-template-edit" data-edit-idx="${idx}">
+      <div class="sop-template-edit-head">
+        <span class="seq">${idx}</span>
+        <input class="t-summary" data-field="summary" type="text" maxlength="4096"
+               placeholder="Summary (required)" value="${escapeHtml(t.summary || '')}">
+        <button class="t-remove" data-edit-idx="${idx}" title="Remove">×</button>
+      </div>
+      <div class="sop-template-edit-row">
+        <input class="t-offset" data-field="due_offset_days" type="number"
+               min="-3650" max="3650" placeholder="Days from anchor"
+               value="${t.due_offset_days == null ? '' : escapeHtml(String(t.due_offset_days))}">
+        <input class="t-category" data-field="category" type="text" maxlength="64"
+               placeholder="Category" value="${escapeHtml(t.category || '')}">
+        <input class="t-priority" data-field="priority" type="text" maxlength="32"
+               placeholder="Priority" value="${escapeHtml(t.priority || '')}">
+        <input class="t-owner-role" data-field="owner_role" type="text" maxlength="64"
+               placeholder="Owner role" value="${escapeHtml(t.owner_role || '')}">
+      </div>
+      <input class="t-dep" data-field="dependency_text" type="text" maxlength="2048"
+             placeholder="Dependency text (optional)" value="${escapeHtml(t.dependency_text || '')}">
+      <textarea class="t-desc" data-field="description" rows="2" maxlength="8192"
+                placeholder="Description (optional)">${escapeHtml(t.description || '')}</textarea>
+    </li>
+  `).join('');
+
+  const errorBlock = state.sops.editing.saveError
+    ? `<div class="error sop-edit-err">${escapeHtml(state.sops.editing.saveError)}</div>`
+    : '';
+  const publishErrBlock = state.sops.editing.publishError
+    ? `<div class="error sop-edit-err">${escapeHtml(state.sops.editing.publishError)}</div>`
+    : '';
+
+  return `
+    <div class="sop-edit-pane">
+      ${errorBlock}
+      ${publishErrBlock}
+      <ul class="sop-template-edit-list">${rows}</ul>
+      <div class="sop-edit-actions">
+        <button class="sop-edit-add-row" ${saveDisabled}>+ Add row</button>
+        <button class="sop-edit-save" ${saveDisabled}>${state.sops.editing.pending === 'save' ? 'Saving…' : 'Save templates'}</button>
+        <button class="sop-edit-publish" ${saveDisabled}>${state.sops.editing.pending === 'publish' ? 'Publishing…' : 'Publish'}</button>
+        <button class="sop-edit-cancel" ${saveDisabled}>Discard edits</button>
+      </div>
+    </div>
+  `;
+}
+
 function renderSopVersionRow(version, expanded) {
   const stateClass = (version.state || 'draft').replace('_', '-');
   const publishedLine = version.published_at
     ? `<span class="muted">published ${escapeHtml(fmtRelative(version.published_at))}</span>`
     : '';
+  const isEditing = state.sops.editing
+                  && state.sops.editing.versionNo === version.version_no;
   let templatesBlock = '';
-  if (expanded) {
+  if (expanded && isEditing) {
+    templatesBlock = renderSopTemplateEditor();
+  } else if (expanded) {
     const detail = state.sops.selectedVersionDetail;
     if (!detail) {
       templatesBlock = `<div class="sop-templates muted">Loading templates…</div>`;
@@ -562,12 +639,18 @@ function renderSopVersionRow(version, expanded) {
       }
     }
   }
+  // Per-version "Edit draft" button — only shown for draft versions
+  // when not already editing.
+  const editButton = (expanded && version.state === 'draft' && !isEditing)
+    ? `<button class="sop-version-edit" data-version-no="${escapeHtml(String(version.version_no))}">Edit draft</button>`
+    : '';
   return `
-    <li class="sop-version ${stateClass}${expanded ? ' expanded' : ''}" data-version-no="${escapeHtml(String(version.version_no))}">
+    <li class="sop-version ${stateClass}${expanded ? ' expanded' : ''}${isEditing ? ' editing' : ''}" data-version-no="${escapeHtml(String(version.version_no))}">
       <div class="sop-version-head">
         <span class="version-no">v${escapeHtml(String(version.version_no))}</span>
         <span class="state-pill ${stateClass}">${escapeHtml(version.state)}</span>
         ${publishedLine}
+        ${editButton}
       </div>
       ${version.change_log ? `<div class="sop-version-changelog">${escapeHtml(version.change_log)}</div>` : ''}
       ${templatesBlock}
@@ -595,9 +678,20 @@ function renderSopItem(sop) {
             renderSopVersionRow(v, state.sops.selectedVersionNo === v.version_no)
           ).join('')
         : '<li class="muted">No versions yet.</li>';
+      // "Create draft" button: visible when this SOP has no
+      // outstanding draft and the SOP is active. The schema's
+      // one-draft-per-sop partial UNIQUE rejects a second concurrent
+      // create with 409, so the UI gates it visually as well.
+      const hasDraft = versions.some(v => v.state === 'draft');
+      const isActive = (detail.sop.status === 'active');
+      const editing = !!state.sops.editing;
+      const createDraftBtn = (isActive && !hasDraft && !editing)
+        ? `<button class="sop-create-draft" data-sop-id="${escapeHtml(detail.sop.id)}">+ Create draft version</button>`
+        : '';
       detailBlock = `
         <div class="sop-detail">
           ${detail.sop.description ? `<div class="sop-description">${escapeHtml(detail.sop.description)}</div>` : ''}
+          <div class="sop-detail-actions">${createDraftBtn}</div>
           <h3>Versions</h3>
           <ul class="sop-version-list">${versionRows}</ul>
         </div>
@@ -742,10 +836,200 @@ function attachEventHandlers() {
       render();
     });
   });
+  // ----- SOP authoring (UI 2/3) -----
+  document.querySelectorAll('.sop-create-draft').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const sopId = btn.dataset.sopId;
+      try {
+        const newVersion = await createSopDraftVersion(sopId, {});
+        // Refresh the SOP detail so the new draft row appears, then
+        // open it in edit mode.
+        const detail = await loadSopDetail(sopId);
+        state.sops.expandedDetail = detail;
+        state.sops.selectedVersionNo = newVersion.version_no;
+        state.sops.selectedVersionDetail = { version: newVersion, template_tasks: [] };
+        state.sops.editing = {
+          versionNo: newVersion.version_no,
+          templates: [],
+          saving: false,
+          saveError: null,
+          publishError: null,
+          pending: null,
+        };
+        render();
+      } catch (err) {
+        state.sops.loadError = err.message || 'Failed to create draft version.';
+        render();
+      }
+    });
+  });
+
+  document.querySelectorAll('.sop-version-edit').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const versionNo = parseInt(btn.dataset.versionNo, 10);
+      const sopId = state.sops.expandedId;
+      // Use existing template list as the editing baseline.
+      const detail = state.sops.selectedVersionDetail;
+      const baseline = (detail && detail.template_tasks)
+        ? detail.template_tasks.map(t => ({
+            summary: t.summary || '',
+            description: t.description || '',
+            due_offset_days: t.due_offset_days,
+            dependency_text: t.dependency_text || '',
+            category: t.category || '',
+            priority: t.priority || '',
+            owner_role: t.owner_role || '',
+          }))
+        : [];
+      state.sops.editing = {
+        versionNo,
+        templates: baseline,
+        saving: false,
+        saveError: null,
+        publishError: null,
+        pending: null,
+      };
+      render();
+    });
+  });
+
+  // Capture template-row input changes into state.sops.editing.templates.
+  document.querySelectorAll('.sop-template-edit input, .sop-template-edit textarea').forEach(input => {
+    input.addEventListener('input', () => {
+      if (!state.sops.editing) return;
+      const li = input.closest('.sop-template-edit');
+      if (!li) return;
+      const idx = parseInt(li.dataset.editIdx, 10);
+      const field = input.dataset.field;
+      if (!field || !state.sops.editing.templates[idx]) return;
+      let value = input.value;
+      if (field === 'due_offset_days') {
+        value = (value === '') ? null : parseInt(value, 10);
+        if (Number.isNaN(value)) value = null;
+      } else if (value === '') {
+        value = null;  // empty string -> null for optional fields
+      }
+      state.sops.editing.templates[idx][field] = value;
+      // No re-render: input keeps focus.
+    });
+  });
+
+  document.querySelectorAll('.t-remove').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!state.sops.editing) return;
+      const idx = parseInt(btn.dataset.editIdx, 10);
+      state.sops.editing.templates.splice(idx, 1);
+      render();
+    });
+  });
+
+  document.querySelectorAll('.sop-edit-add-row').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!state.sops.editing) return;
+      state.sops.editing.templates.push({
+        summary: '',
+        description: '',
+        due_offset_days: null,
+        dependency_text: '',
+        category: '',
+        priority: '',
+        owner_role: '',
+      });
+      render();
+    });
+  });
+
+  document.querySelectorAll('.sop-edit-cancel').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.sops.editing = null;
+      render();
+    });
+  });
+
+  document.querySelectorAll('.sop-edit-save').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!state.sops.editing) return;
+      const sopId = state.sops.expandedId;
+      const versionNo = state.sops.editing.versionNo;
+      // Drop empty rows (a user added a row then didn't fill it).
+      const cleaned = state.sops.editing.templates
+        .filter(t => (t.summary || '').trim().length > 0)
+        // Coerce empty strings -> null for optional fields the server
+        // expects to be either real strings or absent.
+        .map(t => ({
+          summary: t.summary.trim(),
+          description: t.description ? t.description.trim() : null,
+          due_offset_days: t.due_offset_days,
+          dependency_text: t.dependency_text ? t.dependency_text.trim() : null,
+          category: t.category ? t.category.trim() : null,
+          priority: t.priority ? t.priority.trim() : null,
+          owner_role: t.owner_role ? t.owner_role.trim() : null,
+        }));
+      state.sops.editing.pending = 'save';
+      state.sops.editing.saveError = null;
+      render();
+      try {
+        await saveSopTemplates(sopId, versionNo, cleaned);
+        // Reload version detail so the read-only template panel
+        // matches what's now on the server.
+        const fresh = await loadSopVersionDetail(sopId, versionNo);
+        state.sops.selectedVersionDetail = fresh;
+        state.sops.editing.templates = cleaned;
+        state.sops.editing.pending = null;
+      } catch (err) {
+        state.sops.editing.pending = null;
+        state.sops.editing.saveError = formatActionError('save templates', err);
+      }
+      render();
+    });
+  });
+
+  document.querySelectorAll('.sop-edit-publish').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!state.sops.editing) return;
+      const sopId = state.sops.expandedId;
+      const versionNo = state.sops.editing.versionNo;
+      const ok = window.confirm(
+        `Publish v${versionNo}? Any prior published version will be superseded. Templates become immutable after publish.`
+      );
+      if (!ok) return;
+      const changeLog = window.prompt('Change log (optional):', '') || '';
+      state.sops.editing.pending = 'publish';
+      state.sops.editing.publishError = null;
+      render();
+      try {
+        await publishSopVersion(sopId, versionNo,
+                                 changeLog.trim() ? { change_log: changeLog.trim() } : {});
+        // Refresh: SOP detail now shows the new published version
+        // + previous published version moved to superseded.
+        const detail = await loadSopDetail(sopId);
+        state.sops.expandedDetail = detail;
+        state.sops.selectedVersionDetail = await loadSopVersionDetail(sopId, versionNo);
+        state.sops.editing = null;
+        await refreshSops();  // pick up the new latest_version_no on the list row
+      } catch (err) {
+        state.sops.editing.pending = null;
+        state.sops.editing.publishError = formatActionError('publish', err);
+        render();
+      }
+    });
+  });
+
   document.querySelectorAll('.sop-version').forEach(li => {
     li.addEventListener('click', async (e) => {
       e.stopPropagation();
+      // Don't toggle the version on button / input / textarea clicks
+      // (the editor lives inside .sop-version when editing).
       if (e.target.closest('button')) return;
+      if (e.target.closest('input, textarea, select')) return;
+      if (e.target.closest('.sop-edit-pane')) return;
       const versionNo = parseInt(li.dataset.versionNo, 10);
       const sopId = state.sops.expandedId;
       if (!sopId) return;

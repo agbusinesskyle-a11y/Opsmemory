@@ -637,3 +637,105 @@ ul.businesses li {
 }
 .sop-template-meta { font-size: 12px; margin-top: 2px; }
 .sop-template-desc { font-size: 13px; margin-top: 4px; color: var(--fg); }
+
+/* ---- SOP authoring editor (UI 2/3) ---- */
+.sop-detail-actions {
+  margin-bottom: 10px;
+}
+.sop-create-draft, .sop-version-edit {
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: rgba(0, 100, 200, 0.15);
+  color: var(--fg);
+  font-size: 13px;
+  cursor: pointer;
+}
+.sop-create-draft:hover, .sop-version-edit:hover {
+  background: rgba(0, 100, 200, 0.25);
+}
+.sop-version-edit { margin-left: auto; font-size: 12px; padding: 2px 8px; }
+.sop-version.editing { background: var(--bg); cursor: default; }
+
+.sop-edit-pane {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--tile);
+  border-radius: 4px;
+}
+.sop-template-edit-list {
+  list-style: none;
+  margin: 0 0 10px 0;
+  padding: 0;
+}
+.sop-template-edit {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sop-template-edit:last-child { border-bottom: none; }
+.sop-template-edit input, .sop-template-edit textarea {
+  font-size: 13px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: inherit;
+}
+.sop-template-edit textarea { min-height: 38px; resize: vertical; }
+.sop-template-edit-head {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.sop-template-edit-head .seq {
+  min-width: 18px;
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+.sop-template-edit-head .t-summary { flex: 1; }
+.sop-template-edit-head .t-remove {
+  background: var(--tile);
+  border: 1px solid var(--border);
+  color: var(--error-fg);
+  border-radius: 3px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-weight: 700;
+}
+.sop-template-edit-head .t-remove:hover { background: var(--error-bg); }
+.sop-template-edit-row {
+  display: flex;
+  gap: 6px;
+}
+.sop-template-edit-row input { flex: 1; min-width: 0; }
+.sop-edit-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.sop-edit-add-row, .sop-edit-save, .sop-edit-publish, .sop-edit-cancel {
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  font-size: 13px;
+  cursor: pointer;
+  background: var(--tile);
+  color: var(--fg);
+}
+.sop-edit-save { background: rgba(0, 150, 0, 0.18); }
+.sop-edit-save:hover:not([disabled]) { background: rgba(0, 150, 0, 0.30); }
+.sop-edit-publish {
+  background: rgba(0, 100, 200, 0.20);
+  font-weight: 600;
+}
+.sop-edit-publish:hover:not([disabled]) { background: rgba(0, 100, 200, 0.30); }
+.sop-edit-cancel:hover:not([disabled]) { background: var(--error-bg); }
+.sop-edit-actions button[disabled] { opacity: 0.5; cursor: wait; }
+.sop-edit-err { margin-bottom: 8px; }
+.sop-load-error { margin: 12px 16px; }
