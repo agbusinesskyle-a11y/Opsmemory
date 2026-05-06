@@ -84,7 +84,12 @@ def looks_like_csv(content: str) -> bool:
     return "," in first_line
 
 
-def parse_csv_candidates(content: str, *, max_rows: int = 200) -> list[dict]:
+def parse_csv_candidates(
+    content: str,
+    *,
+    max_rows: int = 200,
+    filename: str | None = None,
+) -> list[dict]:
     """Parse a CSV file body into a list of candidate dicts.
 
     Each candidate matches the LLM extract's output shape so the
@@ -96,9 +101,24 @@ def parse_csv_candidates(content: str, *, max_rows: int = 200) -> list[dict]:
     that we stop reading; an XL spreadsheet can have thousands of
     rows but a single import shouldn't queue thousands of review
     items in one event.
+
+    `filename` (when provided) gets stamped onto every candidate so
+    the review UI can render "this task came from row 42 of
+    permit_checklist_2026.csv" (Codex chunk-9-step2 (g) — the
+    docstring previously mentioned filename but the parser never
+    set it).
+
+    csv.Error during parsing returns [] so the caller can fall
+    back to the LLM extract path (Codex chunk-9-step2 (b) — was
+    propagating to pipeline.py and marking the event 'failed'
+    instead of attempting the prompt).
     """
     candidates: list[dict] = []
-    reader = csv.DictReader(io.StringIO(content))
+    try:
+        reader = csv.DictReader(io.StringIO(content))
+    except csv.Error:
+        log.warning("file_drop_parser_dictreader_init_failed")
+        return []
     if reader.fieldnames is None:
         return candidates
     headers = list(reader.fieldnames)
@@ -115,7 +135,13 @@ def parse_csv_candidates(content: str, *, max_rows: int = 200) -> list[dict]:
     priority_key = _match_first(headers, _PRIORITY_ALIASES)
     dependency_key = _match_first(headers, _DEPENDENCY_ALIASES)
 
-    for row_no, row in enumerate(reader, start=2):  # row 1 = header
+    try:
+        rows_iter = list(enumerate(reader, start=2))  # row 1 = header
+    except csv.Error:
+        log.warning("file_drop_parser_dictreader_iter_failed")
+        return []
+
+    for row_no, row in rows_iter:  # row 1 = header
         if row_no > max_rows + 1:
             log.info("file_drop_parser_truncated", extra={
                 "max_rows": max_rows, "stopped_at": row_no,
@@ -144,6 +170,7 @@ def parse_csv_candidates(content: str, *, max_rows: int = 200) -> list[dict]:
             # passes these through; review UI can render them.
             "parser_kind": "csv",
             "row_number": row_no,
+            "filename": filename,
             "raw_owner": (row.get(owner_key) or "") if owner_key else None,
             "raw_due": (row.get(due_key) or "") if due_key else None,
             "raw_priority": (row.get(priority_key) or "").strip() if priority_key else None,

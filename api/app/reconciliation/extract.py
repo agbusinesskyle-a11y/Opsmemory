@@ -41,13 +41,18 @@ async def extract(
     # file_drop_extract.v1 with metadata substitutions.
     if source_config.source == "file_drop":
         if looks_like_csv(raw_content):
-            candidates = parse_csv_candidates(raw_content)
+            md = source_metadata or {}
+            candidates = parse_csv_candidates(
+                raw_content,
+                filename=md.get("filename"),
+            )
             if candidates:
                 # No LlmCall — return None for the audit row pointer.
                 return candidates, None
             # CSV-shaped but unparseable (e.g. no recognizable summary
-            # column) -> fall through to the LLM path with the same
-            # file_drop prompt; better than returning zero candidates.
+            # column, or csv.Error during read) -> fall through to the
+            # LLM path with the same file_drop prompt; better than
+            # returning zero candidates.
 
     template, body, digest = load_prompt(source_config.extract_prompt)
 
