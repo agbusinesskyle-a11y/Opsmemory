@@ -47,6 +47,7 @@ Auth + identity model (per Codex chunk-7-close STEP 8 PLAN):
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any
 
@@ -97,13 +98,14 @@ def _section(text: str) -> dict:
 
 
 def _help_blocks() -> dict:
+    days = _stale_days()
     return _ephemeral([
         _section(
             "*OpsMemory tasks*\n"
             "• `/tasks <owner>` — list open tasks assigned to that owner.\n"
             "  Pass a Slack mention (`/tasks @kyle`) or a name substring "
             "(`/tasks Joanna`).\n"
-            "• `/tasks stale` — _coming soon (chunk 8 step 2)_.\n"
+            f"• `/tasks stale` — open tasks not touched in {days}+ days.\n"
             "• `/tasks <category>` — _coming soon (chunk 8 step 3)_."
         ),
     ])
@@ -271,6 +273,86 @@ async def _resolve_owner_arg(
     return ({"id": rows[0]["id"], "display_name": rows[0]["display_name"]}, None)
 
 
+def _stale_days() -> int:
+    """SLACK_TASKS_STALE_DAYS env var. Default 14 per Codex chunk-8-step1
+    STEP 2 PLAN. Bounded to 1..3650 so a typo can't run open queries
+    against tasks that haven't been touched since the year 4754.
+    """
+    raw = os.environ.get("SLACK_TASKS_STALE_DAYS", "").strip()
+    if not raw:
+        return 14
+    try:
+        n = int(raw)
+    except ValueError:
+        return 14
+    if n < 1:
+        return 1
+    if n > 3650:
+        return 3650
+    return n
+
+
+async def _query_stale_tasks(
+    conn,
+    caller_visible_biz: list[str] | None,
+    *,
+    days: int,
+    limit: int = 25,
+) -> list[dict]:
+    """Open active tasks not touched in `days` days, scoped to caller's
+    visible businesses. Oldest first (Codex: stable ordering on id
+    breaks ties). Owner with empty visible list returns no tasks.
+    """
+    where = [
+        "t.status = 'open'",
+        "t.deletion_state = 'active'",
+        "t.last_activity_at < now() - make_interval(days => $1::int)",
+    ]
+    params: list[Any] = [days]
+    if caller_visible_biz is not None:
+        # Owner with no memberships gets no tasks (consistent with
+        # the rest of the codebase).
+        if not caller_visible_biz:
+            return []
+        params.append(caller_visible_biz)
+        where.append(
+            f"EXISTS (SELECT 1 FROM task_businesses tb "
+            f"        WHERE tb.task_id = t.id "
+            f"          AND tb.business_id::text = ANY(${len(params)}::text[]))"
+        )
+    sql = f"""
+        SELECT t.id::text                AS id,
+               t.summary                 AS summary,
+               t.due_at::text            AS due_at,
+               t.dependency_text         AS dependency_text,
+               t.last_activity_at::text  AS last_activity_at,
+               array_agg(DISTINCT b.slug::text) AS businesses
+        FROM tasks t
+        LEFT JOIN task_businesses tb2 ON tb2.task_id = t.id
+        LEFT JOIN businesses b        ON b.id = tb2.business_id
+        WHERE {' AND '.join(where)}
+        GROUP BY t.id
+        ORDER BY t.last_activity_at ASC, t.id
+        LIMIT {limit}
+    """
+    rows = await conn.fetch(sql, *params)
+    return [dict(r) for r in rows]
+
+
+def _format_stale_line(t: Any) -> str:
+    """Stale list line — same shape as owner-tasks but leads with
+    'last touched' instead of due."""
+    parts = [f"• *{_md_escape(t['summary'])}*"]
+    if t.get("last_activity_at"):
+        parts.append(f"_last touched {_md_escape(str(t['last_activity_at'])[:10])}_")
+    bizs = t.get("businesses") or []
+    if bizs:
+        parts.append("[" + ", ".join(_md_escape(b) for b in bizs) + "]")
+    if t.get("dependency_text"):
+        parts.append(f"⏸ {_md_escape(t['dependency_text'])}")
+    return " ".join(parts)
+
+
 async def _query_owner_tasks(
     conn,
     owner_user_id: str,
@@ -364,15 +446,39 @@ async def slack_tasks(
 
         # First token = sub-command (or owner argument).
         head = text.split(maxsplit=1)[0].lower()
+        caller_visible_biz = _visible_business_ids(caller)
+
         if head == "stale":
-            return _ephemeral([_section(
-                "_`/tasks stale` ships in chunk 8 step 2._"
-            )])
+            days = _stale_days()
+            tasks = await _query_stale_tasks(
+                conn, caller_visible_biz, days=days,
+            )
+            if not tasks:
+                return _ephemeral([_section(
+                    f"No open tasks have been untouched for "
+                    f"{days}+ day{'s' if days != 1 else ''} in your "
+                    "visible businesses."
+                )])
+            header = (
+                f"*Stale tasks* — {len(tasks)} not touched in "
+                f"{days}+ day{'s' if days != 1 else ''}, oldest first:"
+            )
+            body_block = "\n".join(_format_stale_line(t) for t in tasks)
+            log.info("slack_tasks_stale_query", extra={
+                "team_id": body.team_id,
+                "caller_id": caller["id"],
+                "days": days,
+                "task_count": len(tasks),
+            })
+            return _ephemeral([
+                _section(header),
+                _section(body_block),
+            ])
+
         if head in ("help", "?"):
             return _help_blocks()
 
         # Default: treat the entire text as the owner argument.
-        caller_visible_biz = _visible_business_ids(caller)
         owner, err = await _resolve_owner_arg(
             conn, body.team_id, text, caller_visible_biz,
         )
