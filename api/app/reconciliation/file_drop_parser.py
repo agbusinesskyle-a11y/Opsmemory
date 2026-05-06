@@ -89,44 +89,47 @@ def parse_csv_candidates(
     *,
     max_rows: int = 200,
     filename: str | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], str]:
     """Parse a CSV file body into a list of candidate dicts.
+
+    Returns a tri-state tuple (candidates, kind) per Codex chunk-9-close
+    review:
+      kind = 'parsed_candidates' — CSV parsed; >=1 valid row found.
+      kind = 'parsed_empty'      — CSV parsed cleanly with a
+                                    recognized summary header, but
+                                    every row had a blank summary.
+                                    Caller should NOT fall back to
+                                    the LLM (it would re-run the
+                                    same content as opaque text and
+                                    burn an LLM call for known noise).
+      kind = 'unrecognized'      — No recognizable summary column,
+                                    OR csv.Error during parsing.
+                                    Caller MAY fall back to the LLM
+                                    extract path.
 
     Each candidate matches the LLM extract's output shape so the
     rest of the pipeline (normalize, retrieve, choose, validate)
-    consumes them uniformly. parser_kind, row_number, raw fields
-    are stamped into candidate_facts via extra keys.
+    consumes them uniformly. parser_kind, row_number, raw fields,
+    filename are stamped into candidate_facts via extra keys.
 
     `max_rows` caps how many rows are emitted as candidates. Beyond
     that we stop reading; an XL spreadsheet can have thousands of
     rows but a single import shouldn't queue thousands of review
     items in one event.
-
-    `filename` (when provided) gets stamped onto every candidate so
-    the review UI can render "this task came from row 42 of
-    permit_checklist_2026.csv" (Codex chunk-9-step2 (g) — the
-    docstring previously mentioned filename but the parser never
-    set it).
-
-    csv.Error during parsing returns [] so the caller can fall
-    back to the LLM extract path (Codex chunk-9-step2 (b) — was
-    propagating to pipeline.py and marking the event 'failed'
-    instead of attempting the prompt).
     """
     candidates: list[dict] = []
     try:
         reader = csv.DictReader(io.StringIO(content))
     except csv.Error:
         log.warning("file_drop_parser_dictreader_init_failed")
-        return []
+        return [], "unrecognized"
     if reader.fieldnames is None:
-        return candidates
+        return candidates, "unrecognized"
     headers = list(reader.fieldnames)
     summary_key = _match_first(headers, _SUMMARY_ALIASES)
     if summary_key is None:
-        # No recognizable summary column. Treat as not-parseable —
-        # caller falls back to LLM extract.
-        return []
+        # No recognizable summary column. Caller may LLM-fallback.
+        return [], "unrecognized"
 
     description_key = _match_first(headers, _DESCRIPTION_ALIASES)
     due_key = _match_first(headers, _DUE_ALIASES)
@@ -139,7 +142,7 @@ def parse_csv_candidates(
         rows_iter = list(enumerate(reader, start=2))  # row 1 = header
     except csv.Error:
         log.warning("file_drop_parser_dictreader_iter_failed")
-        return []
+        return [], "unrecognized"
 
     for row_no, row in rows_iter:  # row 1 = header
         if row_no > max_rows + 1:
@@ -182,7 +185,7 @@ def parse_csv_candidates(
             if candidate.get(k) == "":
                 candidate[k] = None
         candidates.append(candidate)
-    return candidates
+    return candidates, ("parsed_candidates" if candidates else "parsed_empty")
 
 
 def _row_quote(row: dict, headers: list[str]) -> str:

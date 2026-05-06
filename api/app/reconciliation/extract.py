@@ -42,17 +42,21 @@ async def extract(
     if source_config.source == "file_drop":
         if looks_like_csv(raw_content):
             md = source_metadata or {}
-            candidates = parse_csv_candidates(
+            candidates, parse_kind = parse_csv_candidates(
                 raw_content,
                 filename=md.get("filename"),
             )
-            if candidates:
-                # No LlmCall — return None for the audit row pointer.
+            if parse_kind == "parsed_candidates":
+                # CSV parsed cleanly with usable rows. No LlmCall.
                 return candidates, None
-            # CSV-shaped but unparseable (e.g. no recognizable summary
-            # column, or csv.Error during read) -> fall through to the
-            # LLM path with the same file_drop prompt; better than
-            # returning zero candidates.
+            if parse_kind == "parsed_empty":
+                # CSV parsed cleanly with a recognized header but
+                # every row was blank. Don't waste an LLM call on
+                # known-empty content (Codex chunk-9-close fix).
+                return [], None
+            # parse_kind == "unrecognized": no summary column, or
+            # csv.Error. Fall through to LLM extract — the file may
+            # be free-form text that LLM can still parse.
 
     template, body, digest = load_prompt(source_config.extract_prompt)
 

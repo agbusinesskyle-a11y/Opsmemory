@@ -24,23 +24,29 @@ admin approves them in the Review tab.
 ### 1. Bootstrap a service account
 
 OpsMemory authenticates the n8n forwarder via a dedicated service
-account holding `ingest:write` scope. Run on the OpsMemory deploy box:
+account holding TWO scopes:
+
+- `ingest:write` — required to POST `/v1/ingest/file_drop`.
+- `pipeline:read:all_businesses` — required so the reconciliation
+  pipeline (worker) can run retrieval/validation against the same
+  businesses the ingest references. Without this, file_drop events
+  ingest successfully but every candidate produces zero retrieval
+  hits + business-mismatch validation errors. The auto-merge gate
+  is OFF in chunk 9 so review queues fill with noise; once auto-
+  merge flips on, missing this scope means tasks never auto-create.
+
+Run on the OpsMemory deploy box:
 
 ```bash
 python3 scripts/bootstrap_service_account.py \
   --name n8n-file-drop \
   --description "n8n Drive file-drop bridge" \
-  --scopes ingest:write
+  --scopes ingest:write,pipeline:read:all_businesses
 ```
 
 The script prints the raw key ONCE. Store it in n8n's credential
 manager as `OPSMEMORY_FILE_DROP_KEY`. It will be sent as the
 `X-OpsMemory-Service-Key` header on every forward.
-
-> Codex chunk-9-close note: the service account does NOT need
-> `pipeline:read:all_businesses`. The pipeline's deterministic
-> resolver (`file_drop_resolve.py`) reads the business slug from the
-> ingest's source_metadata, so retrieval is already scoped.
 
 ### 2. Folder → business mapping
 
