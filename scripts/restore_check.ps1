@@ -2,19 +2,27 @@
 # OpsMemory — verify the most recent backup by restoring to a test DB and
 # running smoke checks.
 #
-# Chunk 1 ships this script. Cron timer that runs it weekly is deferred
-# to Chunk 1.5. For Chunk 1, run this once manually to prove the
-# backup → restore loop works.
+# --source local    (default) read from $BACKUP_ROOT on the local machine
+# --source spark2   rsync from $BACKUP_SPARK2_TARGET, restore from the copy
+# --source b2       rclone copy from $B2_BUCKET, restore from the copy
 #
-# Required env:
-#   RESTORE_TEST_ADMIN_URL  DSN with privilege to CREATE/DROP DATABASE
-#                           (e.g. postgres://postgres:pw@host:5432/postgres)
-# Optional env:
-#   BACKUP_ROOT             default /var/backups/opsmemory/action_tracker
-#   RESTORE_TEST_DB         default action_tracker_restore_test
-#   KEEP_RESTORE_DB         "true" leaves the restored DB in place for inspection
-#   RESTORE_STATUS_FILE     default /var/lib/opsmemory/backup/restore_status.json
-#   BACKUP_ALERT_WEBHOOK_URL  failure notifications
+# Designed to be run from any machine that has the GPG private key to
+# do a full restore. From Spark #1 (no private key by design) it falls
+# back to encrypted-structure-only verification when reading
+# .dump.gpg files.
+#
+# Optional env (script reads from environment):
+#   POSTGRES_CONTAINER       default 'postgres'
+#   ACTION_TRACKER_DB_ROLE   default 'opsmemory_owner'  (unused here; restore_check uses admin)
+#   BACKUP_ROOT              default /var/backups/opsmemory/action_tracker
+#   RESTORE_TEST_ADMIN_USER  default 'openbrain'
+#   RESTORE_TEST_ADMIN_DB    default 'openbrain'
+#   RESTORE_TEST_DB          default 'action_tracker_restore_test'
+#   KEEP_RESTORE_DB          "true" leaves the restored DB in place for inspection
+#   RESTORE_STATUS_FILE      default /var/lib/opsmemory/backup/restore_status.json
+#   BACKUP_ALERT_WEBHOOK_URL failure notifications
+#   BACKUP_SPARK2_TARGET     rsync target (used when --source spark2)
+#   B2_BUCKET, B2_KEY_ID, B2_APPLICATION_KEY  used when --source b2
 #
 # Exit codes:
 #   0  success
@@ -24,6 +32,14 @@
 #   4  pg_restore failed
 #   5  smoke check failed
 #   6  status write failed
+#   7  GPG verify/decrypt failed
+#   8  remote source fetch failed (--source spark2 / b2)
+
+[CmdletBinding()]
+param(
+    [ValidateSet("local", "spark2", "b2")]
+    [string]$Source = "local"
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -45,12 +61,6 @@ function Send-FailureAlert($Reason, $Detail) {
 }
 
 # ---- Config -------------------------------------------------------------
-$AdminUrl = $env:RESTORE_TEST_ADMIN_URL
-if (-not $AdminUrl) {
-    Write-Error "RESTORE_TEST_ADMIN_URL is required"
-    exit 1
-}
-
 $BackupRoot = $env:BACKUP_ROOT
 if (-not $BackupRoot) { $BackupRoot = "/var/backups/opsmemory/action_tracker" }
 
@@ -68,15 +78,70 @@ $KeepDb = ($env:KEEP_RESTORE_DB -eq "true")
 $StatusFile = $env:RESTORE_STATUS_FILE
 if (-not $StatusFile) { $StatusFile = "/var/lib/opsmemory/backup/restore_status.json" }
 
+# ---- Source selection: local, spark2, b2 ------------------------------
+# When fetching from remote, we copy the entire backup tree to a temp
+# directory and treat that as $BackupRoot for the rest of the script.
+# Cleanup happens via $RemoteFetchTempDir at exit.
+$RemoteFetchTempDir = $null
+$EffectiveBackupRoot = $BackupRoot
+
+if ($Source -eq "spark2") {
+    $Spark2Target = $env:BACKUP_SPARK2_TARGET
+    if (-not $Spark2Target) {
+        Write-Error "Source=spark2 but BACKUP_SPARK2_TARGET is empty"
+        exit 1
+    }
+    $RemoteFetchTempDir = "/tmp/opsmemory-restore-spark2-$(Get-Random)"
+    New-Item -ItemType Directory -Path $RemoteFetchTempDir -Force | Out-Null
+    Write-Host "[$(Get-Date -Format o)] rsync $Spark2Target -> $RemoteFetchTempDir/"
+    & rsync -av "${Spark2Target}/" "$RemoteFetchTempDir/"
+    if ($LASTEXITCODE -ne 0) {
+        Send-FailureAlert "spark2_fetch_failed" "exit=$LASTEXITCODE target=$Spark2Target"
+        Write-Error "rsync from Spark #2 failed (exit $LASTEXITCODE)"
+        exit 8
+    }
+    $EffectiveBackupRoot = $RemoteFetchTempDir
+}
+elseif ($Source -eq "b2") {
+    $B2Bucket = $env:B2_BUCKET
+    $B2KeyId = $env:B2_KEY_ID
+    $B2AppKey = $env:B2_APPLICATION_KEY
+    if (-not $B2Bucket -or -not $B2KeyId -or -not $B2AppKey) {
+        Write-Error "Source=b2 requires B2_BUCKET + B2_KEY_ID + B2_APPLICATION_KEY"
+        exit 1
+    }
+    if (-not (Get-Command rclone -ErrorAction SilentlyContinue)) {
+        Write-Error "rclone not found in PATH"
+        exit 1
+    }
+    $RemoteFetchTempDir = "/tmp/opsmemory-restore-b2-$(Get-Random)"
+    New-Item -ItemType Directory -Path $RemoteFetchTempDir -Force | Out-Null
+    Write-Host "[$(Get-Date -Format o)] rclone copy b2:$B2Bucket/action_tracker/ -> $RemoteFetchTempDir/"
+    & rclone --config /dev/null `
+             --b2-account $B2KeyId `
+             --b2-key $B2AppKey `
+             --transfers 4 `
+             copy ":b2:$B2Bucket/action_tracker/" $RemoteFetchTempDir
+    if ($LASTEXITCODE -ne 0) {
+        Send-FailureAlert "b2_fetch_failed" "exit=$LASTEXITCODE bucket=$B2Bucket"
+        Write-Error "rclone copy from B2 failed (exit $LASTEXITCODE)"
+        exit 8
+    }
+    $EffectiveBackupRoot = $RemoteFetchTempDir
+}
+
 # ---- Find most recent dump (.dump or .dump.gpg) -----------------------
-$LatestDump = Get-ChildItem -Path $BackupRoot -Recurse -ErrorAction SilentlyContinue |
+$LatestDump = Get-ChildItem -Path $EffectiveBackupRoot -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like "*.dump" -or $_.Name -like "*.dump.gpg" } |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 
 if (-not $LatestDump) {
-    $msg = "no backup dump found under $BackupRoot"
+    $msg = "no backup dump found under $EffectiveBackupRoot (source=$Source)"
     Send-FailureAlert "no_backup" $msg
+    if ($RemoteFetchTempDir -and (Test-Path $RemoteFetchTempDir)) {
+        Remove-Item -Recurse -Force $RemoteFetchTempDir
+    }
     Write-Error $msg
     exit 2
 }
@@ -179,6 +244,7 @@ if ($VerificationMode -eq "encrypted-structure-only") {
         completed_at      = $CompletedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
         duration_seconds  = [int]($CompletedAt - $StartedAt).TotalSeconds
         ok                = $true
+        source            = $Source
         verification_mode = $VerificationMode
         dump_path         = $LatestDump.FullName
         dump_age_hours    = $DumpAgeHours
@@ -188,6 +254,9 @@ if ($VerificationMode -eq "encrypted-structure-only") {
     $StatusDir = Split-Path -Parent $StatusFile
     New-Item -ItemType Directory -Path $StatusDir -Force | Out-Null
     [IO.File]::WriteAllText($StatusFile, $Status)
+    if ($RemoteFetchTempDir -and (Test-Path $RemoteFetchTempDir)) {
+        Remove-Item -Recurse -Force $RemoteFetchTempDir
+    }
     Write-Host "[$(Get-Date -Format o)] structure-only verify complete; status=$StatusFile"
     return
 }
@@ -282,6 +351,11 @@ if ($DecryptedTempFile -and (Test-Path $DecryptedTempFile)) {
     Remove-Item $DecryptedTempFile -Force
 }
 
+# Clean up the remote-fetch temp directory (if --source spark2 or b2).
+if ($RemoteFetchTempDir -and (Test-Path $RemoteFetchTempDir)) {
+    Remove-Item -Recurse -Force $RemoteFetchTempDir
+}
+
 # ---- Status JSON --------------------------------------------------------
 $StatusDir = Split-Path -Parent $StatusFile
 New-Item -ItemType Directory -Path $StatusDir -Force | Out-Null
@@ -293,6 +367,7 @@ $Status = [ordered]@{
     completed_at      = $CompletedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
     duration_seconds  = [int]($CompletedAt - $StartedAt).TotalSeconds
     ok                = $true
+    source            = $Source
     verification_mode = $VerificationMode
     dump_path         = $LatestDump.FullName
     dump_age_hours    = $DumpAgeHours

@@ -38,4 +38,4 @@ if ! flock -w 60 200; then
   exit 11
 fi
 
-exec "$PWSH" "$SCRIPT" "$@"
+exec "$PWSH" -File "$SCRIPT" "$@"
