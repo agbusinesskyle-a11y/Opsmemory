@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
@@ -174,25 +175,33 @@ async def list_tasks(
     status_filter: str | None = Query(default=None, alias="status",
                                        pattern="^(open|done)$"),
     business_slug: str | None = Query(default=None, max_length=64),
-    assigned_to_user_id: str | None = Query(default=None),
+    assigned_to_user_id: UUID | None = Query(default=None),
     include_deleted: bool = Query(default=False),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict:
     """List tasks visible to the caller, with optional filters."""
+    # Admin-gate include_deleted (Codex chunk-2-close fix). Owners must not
+    # see soft-deleted tasks even within their own businesses.
+    if include_deleted and not (principal.principal_type == "user" and principal.role == "admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="include_deleted requires admin role",
+        )
+
     pool = request.app.state.db
     visible = visible_business_ids(principal)
     if visible is not None and not visible:
         return {"tasks": [], "total": 0, "limit": limit, "offset": offset}
 
     where: list[str] = []
-    params: list[Any] = []
+    where_params: list[Any] = []  # only the WHERE-clause binds; reused by count_sql
     pidx = 0
 
     def add_param(value: Any) -> str:
         nonlocal pidx
         pidx += 1
-        params.append(value)
+        where_params.append(value)
         return f"${pidx}"
 
     if not include_deleted:
@@ -207,10 +216,10 @@ async def list_tasks(
             f"WHERE tb.task_id = t.id AND b.slug = {add_param(business_slug)}::citext)"
         )
 
-    if assigned_to_user_id:
+    if assigned_to_user_id is not None:
         where.append(
             f"EXISTS (SELECT 1 FROM task_assignees ta WHERE ta.task_id = t.id "
-            f"AND ta.user_id = {add_param(assigned_to_user_id)}::uuid)"
+            f"AND ta.user_id = {add_param(str(assigned_to_user_id))}::uuid)"
         )
 
     if visible is not None:
@@ -222,6 +231,18 @@ async def list_tasks(
         )
 
     where_clause = "WHERE " + " AND ".join(where) if where else ""
+
+    # The list query has its own LIMIT/OFFSET binds; the count query uses
+    # only the WHERE binds. Snapshot the WHERE binds BEFORE adding the
+    # LIMIT/OFFSET binds so the count query references the right slice
+    # (Codex chunk-2-close fix: previously used `params[:-2]` which was
+    # brittle to future param-order changes).
+    count_params = list(where_params)
+    list_params = list(where_params)
+    list_params.append(limit)
+    limit_idx = pidx + 1
+    list_params.append(offset)
+    offset_idx = pidx + 2
 
     sql = f"""
         SELECT t.id::text AS id, t.summary, t.description,
@@ -242,14 +263,13 @@ async def list_tasks(
         FROM tasks t
         {where_clause}
         ORDER BY t.last_activity_at DESC NULLS LAST
-        LIMIT {add_param(limit)} OFFSET {add_param(offset)}
+        LIMIT ${limit_idx} OFFSET ${offset_idx}
     """
     count_sql = f"SELECT count(*) FROM tasks t {where_clause}"
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, *params)
-        # count_sql uses the same params except for limit/offset (last 2)
-        total = await conn.fetchval(count_sql, *params[:-2]) if where else await conn.fetchval(count_sql)
+        rows = await conn.fetch(sql, *list_params)
+        total = await conn.fetchval(count_sql, *count_params)
 
     tasks = [_serialize_task(dict(r)) for r in rows]
     return {"tasks": tasks, "total": total, "limit": limit, "offset": offset}
@@ -257,22 +277,32 @@ async def list_tasks(
 
 @router.get("/tasks/{task_id}")
 async def get_task(
-    task_id: str,
+    task_id: UUID,
     request: Request,
     principal: Principal = Depends(require_principal),
+    include_deleted: bool = Query(default=False),
 ) -> dict:
+    # Admin-gate include_deleted on detail too (Codex chunk-2-close fix).
+    if include_deleted and not (principal.principal_type == "user" and principal.role == "admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="include_deleted requires admin role",
+        )
+
+    task_id_str = str(task_id)
     pool = request.app.state.db
     visible = visible_business_ids(principal)
     if visible is not None and not visible:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
 
+    # Active filter unless admin opts in — owner-visible tasks must hide
+    # the trash to match list semantics.
+    active_clause = "" if include_deleted else " AND t.deletion_state = 'active'"
+
     async with pool.acquire() as conn:
-        # Visibility-scoped fetch — owner can only retrieve a task whose
-        # businesses include one of theirs. Returning 404 (not 403) for
-        # invisible tasks avoids leaking existence.
         if visible is None:
             row = await conn.fetchrow(
-                """
+                f"""
                 SELECT t.id::text AS id, t.summary, t.description,
                        t.status::text AS status, t.due_at::text AS due_at,
                        t.category, t.priority,
@@ -289,13 +319,13 @@ async def get_task(
                        t.created_at::text AS created_at,
                        t.updated_at::text AS updated_at
                 FROM tasks t
-                WHERE t.id = $1::uuid
+                WHERE t.id = $1::uuid{active_clause}
                 """,
-                task_id,
+                task_id_str,
             )
         else:
             row = await conn.fetchrow(
-                """
+                f"""
                 SELECT t.id::text AS id, t.summary, t.description,
                        t.status::text AS status, t.due_at::text AS due_at,
                        t.category, t.priority,
@@ -312,14 +342,14 @@ async def get_task(
                        t.created_at::text AS created_at,
                        t.updated_at::text AS updated_at
                 FROM tasks t
-                WHERE t.id = $1::uuid
+                WHERE t.id = $1::uuid{active_clause}
                   AND EXISTS (
                     SELECT 1 FROM task_businesses tb
                     WHERE tb.task_id = t.id
                       AND tb.business_id::text = ANY($2::text[])
                   )
                 """,
-                task_id,
+                task_id_str,
                 visible,
             )
 
@@ -327,8 +357,8 @@ async def get_task(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
 
         task = _serialize_task(dict(row))
-        task["assignees"] = await _fetch_assignees(conn, task_id)
-        task["businesses"] = await _fetch_task_businesses(conn, task_id)
-        task["field_versions"] = await _fetch_field_versions(conn, task_id)
+        task["assignees"] = await _fetch_assignees(conn, task_id_str)
+        task["businesses"] = await _fetch_task_businesses(conn, task_id_str)
+        task["field_versions"] = await _fetch_field_versions(conn, task_id_str)
 
     return {"task": task}

@@ -18,9 +18,12 @@ Chunk 2 ruleset (read-only):
     - May NOT read /v1/users (403)
 
   Service (role='service'):
-    - Default-deny. Per-account scopes will gate endpoint access in
-      later chunks. For Chunk 2: services can SELECT-list tasks but
-      not /v1/users without an explicit scope.
+    - Default-deny on task visibility — visible_business_ids returns []
+      so /v1/tasks and /v1/tasks/{id} are empty/404 for all service
+      principals. Per-account scopes (e.g. `tasks:read:all`,
+      `ingest:write`, `businesses:read`) widen this in Chunk 3+ when
+      the bootstrap CLI starts issuing keys with explicit scope lists.
+    - /v1/users is admin-only regardless of scope.
 """
 
 from __future__ import annotations

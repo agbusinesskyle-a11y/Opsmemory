@@ -123,8 +123,8 @@ Schema rooted in identity + provenance + lifecycle.
   - `schema_migrations` — SELECT only
   - `users`, `user_identities`, `businesses`, `business_memberships`, `service_accounts` — SELECT + UPDATE only
   - `task_state_transitions` — SELECT + INSERT only
-  - Future tables get a default of SELECT/INSERT/UPDATE; DELETE on any new table must be granted explicitly per-table.
-  Cannot DROP, never DELETEs from any current Chunk 1 table — soft-delete is via `deleted_at` UPDATE.
+  - **Future tables**: each migration grants per-table explicitly. The 0001 broad default-privileges grant was REVOKED in 0002 per Codex's review (it would have silently made every new table writable). Migrations from 0002 onward never set `ALTER DEFAULT PRIVILEGES`; they always grant per-table.
+  Cannot DROP, never DELETEs from any current Chunk 1/2 table — soft-delete is via `deleted_at` UPDATE.
 
 ### Database isolation
 

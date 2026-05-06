@@ -257,8 +257,14 @@ function attachEventHandlers() {
         render();  // immediate re-render with loading state
         try {
           const detail = await loadTaskDetail(taskId);
+          // Race guard: if the user clicked a different task while this
+          // fetch was in flight, don't render stale detail under the new
+          // selection. Codex chunk-2-close: was rendering A's detail
+          // under B if A's request finished after B was clicked.
+          if (state.expandedTaskId !== taskId) return;
           state.expandedTaskDetail = detail;
         } catch (err) {
+          if (state.expandedTaskId !== taskId) return;
           renderError(err);
           return;
         }
