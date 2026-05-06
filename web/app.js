@@ -1052,6 +1052,7 @@ async function _readServiceWorkerSubscription(timeoutMs) {
   if (!('serviceWorker' in navigator)) {
     return { ready: false, subscription: null };
   }
+  let timeoutHandle = null;
   const readyPromise = navigator.serviceWorker.ready.then(reg => {
     if (!reg || !reg.pushManager) return { ready: true, subscription: null };
     return reg.pushManager.getSubscription().then(sub => ({
@@ -1059,11 +1060,19 @@ async function _readServiceWorkerSubscription(timeoutMs) {
     }));
   });
   const timeoutPromise = new Promise(resolve => {
-    setTimeout(() => resolve({ ready: false, subscription: null, timedOut: true }), timeoutMs);
+    timeoutHandle = setTimeout(
+      () => resolve({ ready: false, subscription: null, timedOut: true }),
+      timeoutMs,
+    );
   });
   try {
-    return await Promise.race([readyPromise, timeoutPromise]);
+    const result = await Promise.race([readyPromise, timeoutPromise]);
+    // Codex chunk-10-step3a-close: clear the late timer so it
+    // doesn't fire after a winning ready.
+    if (timeoutHandle != null) clearTimeout(timeoutHandle);
+    return result;
   } catch (err) {
+    if (timeoutHandle != null) clearTimeout(timeoutHandle);
     return { ready: false, subscription: null, error: err };
   }
 }
@@ -1155,10 +1164,13 @@ function _renderScheduleSummary(schedule) {
     return escapeHtml(`daily ${h}:${m} ${tz}`);
   }
   if (kind === 'weekly') {
-    const days = Array.isArray(schedule.days) ? schedule.days.join(',') : '';
+    // Backend contract: schedule.weekday is a single string
+    // ('mon'|'tue'|...) per api/app/v1_notifications.py _DEFAULT_PREFS.
+    // Codex chunk-10-step3a-close (2): match the actual contract.
+    const weekday = (typeof schedule.weekday === 'string') ? schedule.weekday : '???';
     const h = (schedule.hour != null) ? String(schedule.hour).padStart(2, '0') : '??';
     const m = (schedule.minute != null) ? String(schedule.minute).padStart(2, '0') : '00';
-    return escapeHtml(`weekly [${days}] ${h}:${m} ${tz}`);
+    return escapeHtml(`weekly ${weekday} ${h}:${m} ${tz}`);
   }
   return escapeHtml(JSON.stringify(schedule));
 }
@@ -1169,7 +1181,10 @@ function _renderSettingsLine(label, value) {
 
 function renderSettingsWebPushSection() {
   const s = state.settings;
-  if (s.pushApiAvailable === false) {
+  // Codex chunk-10-step3a-close (1): use strict !== true so a null
+  // value (pre-probe) doesn't fall through to the supported branch
+  // and lie about the browser.
+  if (s.pushApiAvailable !== true) {
     return `
       <section class="settings-section">
         <h3>Web Push</h3>
@@ -1191,14 +1206,24 @@ function renderSettingsWebPushSection() {
   const subRows = (s.subscriptions || []).map(sub => `
     <tr>
       <td>${escapeHtml(sub.device_label || '(unlabeled device)')}</td>
-      <td><code class="settings-keyfrag">${escapeHtml(_shortenKey(sub.endpoint))}</code></td>
+      <td><code class="settings-keyfrag" title="${escapeHtml(sub.endpoint || '')}">${escapeHtml(_shortenKey(sub.endpoint))}</code></td>
       <td><span class="settings-pill badge-${sub.status === 'active' ? 'granted' : 'default'}">${escapeHtml(sub.status)}</span></td>
       <td class="muted">${escapeHtml(sub.last_seen_at || sub.created_at || '')}</td>
     </tr>
   `).join('');
+  // Codex chunk-10-step3a-close (i): table caption + scope="col"
+  // for screen-reader navigation. Codex (e): show full endpoint in
+  // the cell title for a hover tooltip — first 8 chars of an FCM URL
+  // is otherwise useless.
   const subsTable = s.subscriptions && s.subscriptions.length
     ? `<table class="settings-table">
-         <thead><tr><th>Device</th><th>Endpoint</th><th>Status</th><th>Last seen</th></tr></thead>
+         <caption class="settings-table-caption">Active web push subscriptions for your account</caption>
+         <thead><tr>
+           <th scope="col">Device</th>
+           <th scope="col">Endpoint</th>
+           <th scope="col">Status</th>
+           <th scope="col">Last seen</th>
+         </tr></thead>
          <tbody>${subRows}</tbody>
        </table>`
     : '<p class="muted">No active subscriptions on file.</p>';
@@ -1241,7 +1266,13 @@ function renderSettingsPrefsSection() {
   }).join('');
   const table = s.prefs && s.prefs.length
     ? `<table class="settings-table">
-         <thead><tr><th>Channel</th><th>Status</th><th>Schedule</th><th>Settings</th></tr></thead>
+         <caption class="settings-table-caption">Notification preferences by channel</caption>
+         <thead><tr>
+           <th scope="col">Channel</th>
+           <th scope="col">Status</th>
+           <th scope="col">Schedule</th>
+           <th scope="col">Settings</th>
+         </tr></thead>
          <tbody>${rows}</tbody>
        </table>`
     : '<p class="muted">No preferences loaded.</p>';
@@ -1297,10 +1328,12 @@ function attachEventHandlers() {
         await refreshSops();
       } else if (v === 'settings') {
         state.settings.loadError = null;
-        // Render the loading shell first, then load on demand.
-        // Codex chunk-10-step3a: refreshSettings reports its own
-        // errors inline (loadError pill) rather than replacing the
-        // shell via renderError().
+        // Codex chunk-10-step3a-close (1): set loading=true BEFORE
+        // the initial render so the loading-shell branch in
+        // renderSettings() actually fires. Without this the click
+        // briefly shows uninitialized "Web Push: not supported"
+        // because pushApiAvailable is still null.
+        state.settings.loading = true;
         render();
         await refreshSettings();
       } else {

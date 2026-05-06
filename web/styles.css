@@ -1007,6 +1007,15 @@ ul.businesses li {
   letter-spacing: 0.5px;
 }
 .settings-row-default { opacity: 0.65; }
+.settings-table-caption {
+  caption-side: top;
+  text-align: left;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding-bottom: 4px;
+}
 .settings-error {
   background: var(--error-bg);
   color: var(--error-fg);
