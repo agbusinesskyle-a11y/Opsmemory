@@ -1,14 +1,14 @@
 """OpsMemory v1 review queue API.
 
-Endpoints (Chunk 4 step 1 — admin-only, CREATE_TASK end-to-end):
+Endpoints (Chunk 4):
 
   GET   /v1/review                  list pending+needs_changes review items
   GET   /v1/review/{id}             read one review item with full detail
   POST  /v1/review/{id}/approve     transactionally apply the proposed_patch
   POST  /v1/review/{id}/reject      mark as rejected with optional reason
-
-UPDATE_TASK and COMPLETE_TASK approve flows + PATCH (edit proposed_patch)
-land in the next commit. PWA review tab lands in the commit after that.
+  PATCH /v1/review/{id}             edit proposed_patch (typed body),
+                                    re-validate, re-snapshot base versions,
+                                    return updated review item
 
 Authz: admin-only first pass per Codex chunk-3-close plan. Owner
 reviewers (where they have business membership in the candidate's
@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from .auth import Principal, require_principal
 from .authz import require_admin
+from .reconciliation.validate import validate_decision
 from .review_apply import (
     ApplyConflict,
     ApplyNotImplemented,
@@ -44,6 +45,36 @@ router = APIRouter(prefix="/v1/review")
 
 class RejectBody(BaseModel):
     reason: str | None = Field(default=None, max_length=2048)
+
+
+class _CreatePatch(BaseModel):
+    summary: str = Field(..., min_length=1, max_length=4096)
+    due_at: str | None = Field(default=None, max_length=64)
+    category: str | None = Field(default=None, max_length=64)
+    dependency_text: str | None = Field(default=None, max_length=2048)
+    businesses: list[str] = Field(..., min_length=1, max_length=8)
+
+
+class _UpdatePatch(BaseModel):
+    summary: str | None = Field(default=None, min_length=1, max_length=4096)
+    due_at: str | None = Field(default=None, max_length=64)
+    category: str | None = Field(default=None, max_length=64)
+    dependency_text: str | None = Field(default=None, max_length=2048)
+
+
+class _CompletePatch(BaseModel):
+    completion_note: str | None = Field(default=None, max_length=4096)
+
+
+class PatchBody(BaseModel):
+    """Typed patch envelope. Exactly one of create/update/complete must
+    be set, and it must match the review_item's existing proposed_action.
+    Action change is not supported in this endpoint.
+    """
+    create: _CreatePatch | None = None
+    update: _UpdatePatch | None = None
+    complete: _CompletePatch | None = None
+    edit_reason: str | None = Field(default=None, max_length=2048)
 
 
 # ---------------------------------------------------------------------------
@@ -388,4 +419,221 @@ async def reject_review_item(
         "status": "rejected",
         "rejection_reason": body.reason,
         "deduped": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PATCH /v1/review/{id} — typed edit
+# ---------------------------------------------------------------------------
+
+@router.patch("/{review_item_id}")
+async def patch_review_item(
+    review_item_id: uuid.UUID,
+    body: PatchBody,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Admin-only. Edit the proposed_patch with a typed body.
+
+    The body must contain exactly one of create / update / complete,
+    and that key must match the review_item's existing proposed_action.
+    Changing the action is not supported here — different target rules,
+    different base-version capture, different validation.
+
+    Side-effects:
+      - Replaces proposed_patch with the rebuilt JSON envelope.
+      - For UPDATE_TASK and COMPLETE_TASK: re-snapshots
+        base_task_version + base_field_versions against the current
+        target task (so subsequent approval is checked against the
+        edited-time-zero state, not the original review-time state).
+      - Re-runs validate_decision() and stores the result in
+        validation_errors.
+      - Resets the apply-side state: status='pending', clears
+        last_apply_error / reviewer_id / reviewed_at / applied_at /
+        applied_task_id / apply_mutation_id / rejection_reason.
+      - Stamps edited_at, edited_by, edit_reason.
+    """
+    require_admin(principal)
+
+    # Body shape: exactly one of create/update/complete.
+    populated = [k for k in ("create", "update", "complete")
+                 if getattr(body, k) is not None]
+    if len(populated) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "patch_envelope_invalid",
+                    "detail": "exactly one of create/update/complete required",
+                    "got": populated},
+        )
+    body_action_key = populated[0]
+    expected_action = {
+        "create": "CREATE_TASK",
+        "update": "UPDATE_TASK",
+        "complete": "COMPLETE_TASK",
+    }[body_action_key]
+
+    rid = str(review_item_id)
+    pool = request.app.state.db
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT id::text                AS id,
+                       ingest_event_id::text   AS ingest_event_id,
+                       proposed_action         AS proposed_action,
+                       target_task_id::text    AS target_task_id,
+                       candidate_facts         AS candidate_facts,
+                       confidence              AS confidence,
+                       status::text            AS status
+                FROM review_items
+                WHERE id = $1::uuid
+                FOR UPDATE
+                """,
+                rid,
+            )
+            if not row:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="review_item not found",
+                )
+            if row["status"] not in ("pending", "needs_changes"):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"code": "non_actionable_state",
+                            "detail": f"cannot edit from status {row['status']!r}"},
+                )
+            if row["proposed_action"] != expected_action:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={"code": "patch_action_mismatch",
+                            "detail": (f"review_item proposed_action is "
+                                       f"{row['proposed_action']!r}; PATCH body "
+                                       f"key {body_action_key!r} maps to "
+                                       f"{expected_action!r}")},
+                )
+
+            # Build the new proposed_patch envelope from the typed body.
+            patch_value = getattr(body, body_action_key).model_dump(
+                exclude_none=False
+            )
+            new_proposed_patch = {body_action_key: patch_value}
+
+            # Build a synthetic candidate for re-validation. CREATE pulls
+            # summary + businesses straight from the edit. UPDATE/COMPLETE
+            # keep the existing candidate_facts.businesses (the patch
+            # doesn't change scope) but reflect any edited summary.
+            candidate_facts = row["candidate_facts"]
+            if isinstance(candidate_facts, str):
+                # Defensive — codec should have decoded already.
+                import json as _json
+                candidate_facts = _json.loads(candidate_facts)
+            if not isinstance(candidate_facts, dict):
+                candidate_facts = {}
+
+            if body_action_key == "create":
+                synth_candidate = dict(candidate_facts)
+                synth_candidate["summary"] = patch_value["summary"]
+                synth_candidate["businesses"] = patch_value["businesses"]
+                synth_candidate["due_at"] = patch_value.get("due_at")
+                synth_candidate["category"] = patch_value.get("category")
+                synth_candidate["dependency_text"] = patch_value.get("dependency_text")
+            else:
+                synth_candidate = dict(candidate_facts)
+                # UPDATE may edit summary; reflect it for downstream validators
+                # that read candidate.summary length checks.
+                if body_action_key == "update":
+                    if patch_value.get("summary") is not None:
+                        synth_candidate["summary"] = patch_value["summary"]
+                    if patch_value.get("due_at") is not None:
+                        synth_candidate["due_at"] = patch_value["due_at"]
+
+            # Re-snapshot base versions for UPDATE/COMPLETE so the next
+            # approve compares against the post-edit state, not the
+            # original review-time state.
+            new_base_task_version: int | None = None
+            new_base_field_versions: dict = {}
+            target_id = row["target_task_id"]
+            if expected_action in ("UPDATE_TASK", "COMPLETE_TASK") and target_id:
+                t = await conn.fetchrow(
+                    "SELECT version FROM tasks WHERE id = $1::uuid",
+                    target_id,
+                )
+                if t:
+                    new_base_task_version = t["version"]
+                fv = await conn.fetch(
+                    "SELECT field_name, version FROM task_field_versions "
+                    "WHERE task_id = $1::uuid",
+                    target_id,
+                )
+                new_base_field_versions = {
+                    r["field_name"]: r["version"] for r in fv
+                }
+
+            # Reviewer authz scope (admin -> None for pure unscoped).
+            actor_business_slugs = (
+                None if principal.role == "admin"
+                else [b["slug"] for b in principal.businesses]
+            )
+
+            # Re-run validation with the new patch.
+            decision = {
+                "action": expected_action,
+                "target_task_id": target_id,
+                "confidence": float(row["confidence"] or 0),
+                "reason": "post-PATCH revalidation",
+            }
+            validation_errors = await validate_decision(
+                conn, synth_candidate, decision,
+                actor_business_slugs=actor_business_slugs,
+            )
+
+            # Apply the edit + reset apply-side state. Pool's jsonb codec
+            # encodes raw Python dicts/lists.
+            reviewer_id = principal.id if principal.principal_type == "user" else None
+            await conn.execute(
+                """
+                UPDATE review_items
+                   SET proposed_patch        = $2::jsonb,
+                       candidate_facts       = $3::jsonb,
+                       base_task_version     = $4,
+                       base_field_versions   = $5::jsonb,
+                       validation_errors     = $6::jsonb,
+                       status                = 'pending',
+                       last_apply_error      = '{}'::jsonb,
+                       reviewer_id           = NULL,
+                       reviewed_at           = NULL,
+                       applied_at            = NULL,
+                       applied_task_id       = NULL,
+                       apply_mutation_id     = NULL,
+                       rejection_reason      = NULL,
+                       edited_at             = now(),
+                       edited_by             = $7::uuid,
+                       edit_reason           = $8
+                 WHERE id = $1::uuid
+                """,
+                rid,
+                new_proposed_patch,
+                synth_candidate,
+                new_base_task_version,
+                new_base_field_versions,
+                validation_errors,
+                reviewer_id,
+                body.edit_reason,
+            )
+
+    log.info("review_item_patched", extra={
+        "review_item_id": rid,
+        "edited_by": principal.id,
+        "action": expected_action,
+        "validation_errors": len(validation_errors),
+    })
+    return {
+        "review_item_id": rid,
+        "status": "pending",
+        "proposed_action": expected_action,
+        "proposed_patch": new_proposed_patch,
+        "validation_errors": validation_errors,
+        "base_task_version": new_base_task_version,
+        "base_field_versions": new_base_field_versions,
+        "edited_at_now": True,
     }
