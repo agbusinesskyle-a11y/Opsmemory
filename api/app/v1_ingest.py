@@ -78,6 +78,11 @@ def canonicalize(content: str) -> str:
 
     Conservative — keeps the original semantics (paragraphs, bullets,
     numbers) but produces a stable bytes-form for SHA-256.
+
+    NOTE: This collapses internal whitespace (e.g. "a    b" -> "a b"),
+    which is correct for free-form text (meeting recaps, Slack messages)
+    but WRONG for CSV / structured data where cell contents may carry
+    meaningful whitespace runs. Use canonicalize_file_drop() for those.
     """
     text = content.replace("\r\n", "\n").replace("\r", "\n")
     # Collapse trailing whitespace per line (don't change line counts)
@@ -85,8 +90,73 @@ def canonicalize(content: str) -> str:
     return text.strip("\n")
 
 
+def canonicalize_file_drop(content: str) -> str:
+    """Canonicalizer for file_drop content. Codex chunk-9-step1 close-fix:
+    canonicalize() collapses horizontal whitespace, which would mutate
+    CSV cells like ``"a,b   c,d"`` -> ``"a,b c,d"`` BEFORE the parser
+    sees them. Preserve internal whitespace; normalize only line endings
+    + strip outer blank lines so the SHA-256 is deterministic.
+    """
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+    return text.strip("\n")
+
+
 def content_hash(canonical: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _parse_drive_modified_time(raw: str) -> str:
+    """Parse Drive's RFC3339 modifiedTime to a canonical UTC ISO string.
+
+    Codex chunk-9-step1 close-fix: modified_time is part of the
+    source_external_id ('drive:{file_id}:{modified_time}'). Accepting
+    arbitrary text would let n8n misconfiguration persist bad
+    idempotency keys forever. Require tz-aware ISO; canonicalize to
+    UTC so '2026-05-06T08:00:00-07:00' and '2026-05-06T15:00:00Z'
+    don't produce two different keys for the same instant.
+
+    Raises HTTPException(400, ...) on failure.
+    """
+    from datetime import datetime as _dt
+    s = (raw or "").strip()
+    if not s:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "modified_time_required",
+                    "field": "modified_time"},
+        )
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = _dt.fromisoformat(s)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "modified_time_invalid",
+                    "field": "modified_time", "got": raw},
+        )
+    if dt.tzinfo is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "modified_time_naive",
+                    "field": "modified_time",
+                    "detail": "include a timezone offset"},
+        )
+    # Canonicalize to UTC and strip microseconds so the external id
+    # is deterministic regardless of how Drive serializes precision.
+    return dt.astimezone(__import__("datetime").timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _looks_like_zip_or_xlsx(content: str) -> bool:
+    """Cheap binary-bytes-as-text sniff. XLSX is a ZIP container
+    starting with 'PK\\x03\\x04'. n8n is supposed to convert XLSX to
+    CSV before posting; if raw bytes leak through, we'd canonicalize
+    garbage and queue an unparseable event. 415 instead.
+    """
+    if not content:
+        return False
+    head = content[:8]
+    return head.startswith("PK\x03\x04") or head.startswith("PK\x05\x06") or head.startswith("PK\x07\x08")
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +591,27 @@ async def ingest_file_drop(
         )
     require_scope(principal, SCOPE_INGEST_WRITE)
 
-    canonical = canonicalize(body.file_content)
+    # Codex chunk-9-step1 close-fix: reject bytes that look like a
+    # ZIP / XLSX container BEFORE canonicalization. n8n is supposed to
+    # convert binary formats to text; if raw bytes leak through,
+    # surface 415 instead of queuing garbage.
+    if _looks_like_zip_or_xlsx(body.file_content):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail={"code": "binary_content_unsupported",
+                    "detail": "file_content looks like a ZIP/XLSX binary; "
+                              "n8n should convert to CSV before posting"},
+        )
+
+    # Codex chunk-9-step1 close-fix: parse + canonicalize modified_time
+    # so source_external_id is deterministic across timezones / Drive
+    # serialization variants.
+    canonical_modified_time = _parse_drive_modified_time(body.modified_time)
+
+    # Codex chunk-9-step1 close-fix: file_drop content gets a
+    # CSV-safe normalizer (line-ending only) instead of canonicalize()
+    # which would collapse meaningful whitespace inside CSV cells.
+    canonical = canonicalize_file_drop(body.file_content)
     if len(canonical) < 1:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -529,31 +619,16 @@ async def ingest_file_drop(
         )
     hash_hex = content_hash(canonical)
 
-    source_external_id = f"drive:{body.file_id}:{body.modified_time}"
+    source_external_id = f"drive:{body.file_id}:{canonical_modified_time}"
 
-    # Validate business_slug exists and is active. n8n's folder->business
-    # mapping config could go stale; surfacing the bad slug as a 422
-    # tells the operator to fix the config rather than silently
-    # creating orphan ingest events.
     pool = request.app.state.db
     request_id = getattr(request.state, "request_id", None)
 
     async with pool.acquire() as conn:
-        biz = await conn.fetchrow(
-            "SELECT id::text AS id, slug::text AS slug "
-            "FROM businesses "
-            "WHERE slug::text = $1 AND deletion_state = 'active'",
-            body.business_slug,
-        )
-        if not biz:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={"code": "business_not_found",
-                        "business_slug": body.business_slug,
-                        "detail": "n8n folder->business mapping is stale"},
-            )
-
-        # Idempotency pre-check by (source, source_external_id).
+        # Codex chunk-9-step1 close-fix: dedupe pre-check FIRST so a
+        # retry of an already-ingested file still dedupes after the
+        # business is later soft-deleted. Business validation only
+        # matters for NEW events.
         existing = await conn.fetchrow(
             "SELECT id::text AS id, status::text AS status FROM ingest_events "
             "WHERE source = 'file_drop' AND source_external_id = $1",
@@ -567,9 +642,41 @@ async def ingest_file_drop(
                 "dedup_key": "source_external_id",
             }
 
+        # Validate business_slug exists and is active. n8n's
+        # folder->business mapping config could go stale; surfacing
+        # this as 422 tells the operator to fix the config rather
+        # than silently creating orphan ingest events.
+        # Codex chunk-9-step1 close-fix: distinguish "missing" from
+        # "soft-deleted" via separate error codes; the schema uses
+        # deletion_state, not a 'status' column on businesses.
+        biz = await conn.fetchrow(
+            "SELECT id::text AS id, slug::text AS slug, "
+            "       deletion_state::text AS deletion_state "
+            "FROM businesses "
+            "WHERE slug::text = $1",
+            body.business_slug,
+        )
+        if not biz:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "business_not_found",
+                        "business_slug": body.business_slug,
+                        "detail": "n8n folder->business mapping is stale"},
+            )
+        if biz["deletion_state"] != "active":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "business_inactive",
+                        "business_slug": body.business_slug,
+                        "deletion_state": biz["deletion_state"],
+                        "detail": "business has been soft-deleted; "
+                                  "update the n8n folder mapping"},
+            )
+
         metadata = {
             "drive_file_id": body.file_id,
-            "modified_time": body.modified_time,
+            "modified_time": canonical_modified_time,
+            "modified_time_raw": body.modified_time,
             "mime_type": body.mime_type,
             "filename": body.filename,
             "folder_ids": body.folder_ids,
