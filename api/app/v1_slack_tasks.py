@@ -158,6 +158,10 @@ async def _resolve_caller(conn, team_id: str, slack_user_id: str) -> dict | None
     )
     if not row or row["status"] != "active":
         return None
+    # Match auth.py's canonical membership filter exactly: a Slack
+    # caller with a disabled business membership (bm.status != 'active')
+    # or a soft-deleted business must NOT see those tasks (Codex
+    # chunk-8-step1 blocker).
     biz_rows = await conn.fetch(
         """
         SELECT b.id::text   AS id,
@@ -167,6 +171,7 @@ async def _resolve_caller(conn, team_id: str, slack_user_id: str) -> dict | None
         FROM business_memberships bm
         JOIN businesses b ON b.id = bm.business_id
         WHERE bm.user_id = $1::uuid
+          AND bm.status = 'active'
           AND b.deletion_state = 'active'
         """,
         row["id"],
