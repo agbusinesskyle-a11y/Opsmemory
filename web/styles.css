@@ -1021,7 +1021,8 @@ ul.businesses li {
 .settings-edit-save,
 .settings-edit-cancel,
 .settings-revoke,
-.settings-enable-push {
+.settings-enable-push,
+.settings-sw-recheck {
   padding: 4px 12px;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1036,7 +1037,8 @@ ul.businesses li {
 .settings-edit-cancel:disabled,
 .settings-edit-open:disabled,
 .settings-revoke:disabled,
-.settings-enable-push:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-enable-push:disabled,
+.settings-sw-recheck:disabled { opacity: 0.5; cursor: not-allowed; }
 .settings-enable-push {
   background: rgba(0, 100, 200, 0.15);
   font-weight: 600;

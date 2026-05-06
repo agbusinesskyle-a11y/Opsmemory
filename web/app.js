@@ -1384,13 +1384,16 @@ function renderSettingsWebPushSection() {
   const localEndpoint = s.browserSubscription ? s.browserSubscription.endpoint : null;
   const serverHasLocal = !!(localEndpoint
     && (s.subscriptions || []).some(sub => sub.endpoint === localEndpoint));
-  const canTrySubscribe = (
+  // Codex chunk-10-step3b3-close (2): drop !subscriptionCreate
+  // Pending from canTrySubscribe so the button is rendered (and
+  // disabled) during a pending operation, not removed. This keeps
+  // 'Enabling…' / 'Reconnecting…' labels visible.
+  const prereqsMet = (
     s.pushApiAvailable === true
     && !!s.vapidPublicKey
-    && s.serviceWorkerReady
     && s.permissionState !== 'denied'
-    && !s.subscriptionCreatePending
   );
+  const canTrySubscribe = prereqsMet && s.serviceWorkerReady;
   let actionRow = '';
   if (s.permissionState === 'denied') {
     actionRow = `
@@ -1400,6 +1403,22 @@ function renderSettingsWebPushSection() {
           Permission was denied. To re-enable, open your browser's
           site settings for this app and allow notifications, then
           reload the page.
+        </span>
+      </div>
+    `;
+  } else if (prereqsMet && !s.serviceWorkerReady) {
+    // Codex chunk-10-step3b3-close (1): SW-not-ready stranded the
+    // UI with no action and no error. Surface a 'Check again'
+    // button so the user has a path forward.
+    actionRow = `
+      <div class="settings-row">
+        <span class="settings-label">Service worker</span>
+        <span class="settings-value">
+          <button class="settings-sw-recheck"
+                  ${s.loading ? 'disabled' : ''}>${s.loading ? 'Checking…' : 'Check again'}</button>
+          <span class="muted" style="margin-left:10px;">
+            The service worker isn't ready yet. Click to recheck.
+          </span>
         </span>
       </div>
     `;
@@ -2451,6 +2470,25 @@ function attachEventHandlers() {
     });
   });
 
+  // Codex chunk-10-step3b3-close (1): manual SW recheck.
+  document.querySelectorAll('.settings-sw-recheck').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (state.settings.loading) return;
+      state.settings.loading = true;
+      render();
+      try {
+        const probe = await _readServiceWorkerSubscription(2000);
+        state.settings.serviceWorkerReady = !!probe.ready;
+        state.settings.browserSubscription = probe.subscription || null;
+      } catch (err) {
+        // No-op: probe already swallows; UI stays in not-ready state.
+      } finally {
+        state.settings.loading = false;
+        render();
+      }
+    });
+  });
+
   // Codex chunk-10-step3b2-close sub-(b)/3: Enable Web Push +
   // Reconnect this browser. Single button; the renderer picks
   // the label based on whether browserSubscription matches a
@@ -2517,12 +2555,24 @@ function attachEventHandlers() {
           device_label: null,
           user_agent: ua.length > 512 ? ua.slice(0, 512) : ua,
         };
-        await postPushSubscription(body);
+        const postResponse = await postPushSubscription(body);
         // Step 9: refetch subscriptions + re-probe SW state.
         try {
           const subsResp = await loadPushSubscriptions();
           state.settings.subscriptions = (subsResp && subsResp.items) || [];
         } catch (refetchErr) {
+          // Codex chunk-10-step3b3-close (10): if refetch fails
+          // the local list stays stale and serverHasLocal would
+          // flip the UI back to 'Reconnect this browser'
+          // immediately after a successful POST. Merge the POST
+          // response into local state so serverHasLocal stays
+          // true.
+          if (postResponse && postResponse.id && postResponse.endpoint) {
+            const existing = (state.settings.subscriptions || []).filter(
+              x => x.endpoint !== postResponse.endpoint
+            );
+            state.settings.subscriptions = [postResponse, ...existing];
+          }
           state.settings.subscriptionCreateError =
             'Enabled. The device list did not refresh; reload to verify.';
         }

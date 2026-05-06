@@ -26,7 +26,7 @@
 //   server sends Cache-Control: no-cache on /sw.js per main.py changes).
 //   Bumping BUILD invalidates old shell caches at activate time.
 
-const BUILD = 'c10s3b3-enable-webpush';
+const BUILD = 'c10s3b3-fix-sw-strand';
 const SHELL_CACHE = `opsmemory-shell-${BUILD}`;
 const TASKS_CACHE = `opsmemory-tasks-${BUILD}`;
 
