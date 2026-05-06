@@ -25,7 +25,9 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
+from pydantic import BaseModel, Field
 
 from .auth import Principal, require_principal
 from .authz import require_admin
@@ -626,3 +628,507 @@ async def get_sop_instance(
         "instance": _serialize_instance(instance_row),
         "generated_tasks": [_serialize_generated(g) for g in gen_rows],
     }
+
+
+# ===========================================================================
+# Write endpoints (Chunk 7 step 3b — admin-only)
+# ===========================================================================
+#
+# Workflow:
+#   POST /v1/sops                          create an SOP record (no version)
+#   POST /v1/sops/{id}/versions            create a draft version (auto-allocates
+#                                           version_no = max+1)
+#   PATCH /v1/sops/{id}/versions/{vn}/templates
+#                                           replace ALL templates of a draft
+#                                           atomically (cleaner than per-row
+#                                           CRUD for this use case)
+#   POST /v1/sops/{id}/versions/{vn}/publish
+#                                           atomic state='published' + bump
+#                                           sops.latest_version_id +
+#                                           supersede prior published version
+#   POST /v1/anchor_events                  schedule an anchor
+#
+# Schema-side guardrails (migration 0010):
+#   - sop_versions immutability trigger blocks state regression and
+#     content edits post-publish.
+#   - sop_template_tasks trigger blocks any mutation when parent != draft.
+#   - sops.latest_version_id trigger requires state='published' + same sop.
+#   - Partial unique indexes prevent two drafts or two published per sop.
+
+# ---------------------------------------------------------------------------
+# Pydantic bodies
+# ---------------------------------------------------------------------------
+
+class _CreateSopBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    business_slug: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=1, max_length=256)
+    description: str | None = Field(default=None, max_length=8192)
+
+
+class _CreateSopVersionBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    change_log: str | None = Field(default=None, max_length=8192)
+
+
+class _TemplateBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    summary: str = Field(..., min_length=1, max_length=4096)
+    description: str | None = Field(default=None, max_length=8192)
+    due_offset_days: int | None = Field(default=None, ge=-3650, le=3650)
+    dependency_text: str | None = Field(default=None, max_length=2048)
+    category: str | None = Field(default=None, max_length=64)
+    priority: str | None = Field(default=None, max_length=32)
+    owner_role: str | None = Field(default=None, max_length=64)
+    owner_user_id: uuid.UUID | None = None
+
+
+class _ReplaceTemplatesBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    templates: list[_TemplateBody] = Field(..., min_length=0, max_length=200)
+
+
+class _PublishVersionBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    change_log: str | None = Field(default=None, max_length=8192)
+
+
+class _CreateAnchorBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    business_slug: str = Field(..., min_length=1, max_length=64)
+    kind: str = Field(..., min_length=1, max_length=64)
+    sop_id: uuid.UUID
+    scheduled_for: str = Field(..., min_length=1, max_length=64,
+                                 description="ISO-8601 timestamp with timezone (Z or offset).")
+    notes: str | None = Field(default=None, max_length=4096)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/sops
+# ---------------------------------------------------------------------------
+
+@router.post("/v1/sops", status_code=201)
+async def create_sop(
+    body: _CreateSopBody,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    require_admin(principal)
+    pool = request.app.state.db
+    actor_id = principal.id if principal.principal_type == "user" else None
+    async with pool.acquire() as conn:
+        biz_id = await _resolve_business_id(conn, body.business_slug)
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO sops (business_id, name, description, created_by, updated_by)
+                VALUES ($1::uuid, $2, $3, $4::uuid, $4::uuid)
+                RETURNING id::text AS id,
+                          business_id::text AS business_id,
+                          name AS name,
+                          description AS description,
+                          status::text AS status,
+                          latest_version_id::text AS latest_version_id,
+                          created_at::text AS created_at,
+                          updated_at::text AS updated_at
+                """,
+                biz_id, body.name, body.description, actor_id,
+            )
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "sop_name_in_use",
+                        "detail": (f"an active SOP named {body.name!r} already "
+                                    f"exists in business {body.business_slug!r}")},
+            )
+    log.info("sop_created", extra={"sop_id": row["id"], "actor": actor_id})
+    return {**_serialize_sop(row), "latest_version_no": None}
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/sops/{id}/versions
+# ---------------------------------------------------------------------------
+
+@router.post("/v1/sops/{sop_id}/versions", status_code=201)
+async def create_sop_version(
+    sop_id: uuid.UUID,
+    body: _CreateSopVersionBody,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Create a new draft version. Server allocates version_no = max+1.
+
+    A SOP may have at most one outstanding draft (enforced by the
+    partial unique index from migration 0010). A second concurrent
+    create returns 409 sop_draft_exists.
+    """
+    require_admin(principal)
+    pool = request.app.state.db
+    actor_id = principal.id if principal.principal_type == "user" else None
+    rid = str(sop_id)
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            sop = await conn.fetchrow(
+                "SELECT id::text AS id, status::text AS status "
+                "FROM sops WHERE id = $1::uuid FOR UPDATE",
+                rid,
+            )
+            if not sop:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "sop_not_found", "id": rid},
+                )
+            if sop["status"] != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_archived", "id": rid,
+                            "detail": "cannot add versions to an archived SOP"},
+                )
+            next_no_row = await conn.fetchrow(
+                "SELECT COALESCE(MAX(version_no), 0) + 1 AS n "
+                "FROM sop_versions WHERE sop_id = $1::uuid",
+                rid,
+            )
+            next_no = int(next_no_row["n"])
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO sop_versions
+                      (sop_id, version_no, state, change_log, created_by, updated_by)
+                    VALUES ($1::uuid, $2, 'draft', $3, $4::uuid, $4::uuid)
+                    RETURNING id::text AS id,
+                              sop_id::text AS sop_id,
+                              version_no AS version_no,
+                              state::text AS state,
+                              change_log AS change_log,
+                              created_at::text AS created_at,
+                              published_at::text AS published_at,
+                              published_by::text AS published_by
+                    """,
+                    rid, next_no, body.change_log, actor_id,
+                )
+            except asyncpg.UniqueViolationError:
+                # Either (sop_id, version_no) collided (impossible — we
+                # just allocated max+1 inside the row lock) OR the
+                # one-draft-per-sop partial unique tripped.
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_draft_exists",
+                            "detail": ("this SOP already has an outstanding "
+                                       "draft; publish or delete it before "
+                                       "creating another")},
+                )
+    log.info("sop_version_created", extra={
+        "sop_id": rid, "version_no": next_no, "actor": actor_id,
+    })
+    return _serialize_version(row)
+
+
+# ---------------------------------------------------------------------------
+# PATCH /v1/sops/{id}/versions/{vn}/templates
+# ---------------------------------------------------------------------------
+
+@router.patch("/v1/sops/{sop_id}/versions/{version_no}/templates")
+async def replace_sop_templates(
+    sop_id: uuid.UUID,
+    version_no: Annotated[int, Path(ge=1)],
+    body: _ReplaceTemplatesBody,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Replace ALL templates of a draft version atomically.
+
+    Per-row CRUD would multiply round trips and complicate ordering.
+    The reorder + add + remove cases all collapse into "send the new
+    full list". seq_no is the array index.
+
+    Schema trigger blocks all mutations when parent != draft, so
+    publishing freezes templates automatically.
+    """
+    require_admin(principal)
+    pool = request.app.state.db
+    rid = str(sop_id)
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            version = await conn.fetchrow(
+                "SELECT id::text AS id, sop_id::text AS sop_id, "
+                "       state::text AS state "
+                "FROM sop_versions "
+                "WHERE sop_id = $1::uuid AND version_no = $2 FOR UPDATE",
+                rid, version_no,
+            )
+            if not version:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "sop_version_not_found",
+                            "sop_id": rid, "version_no": version_no},
+                )
+            if version["state"] != "draft":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_version_not_draft",
+                            "state": version["state"],
+                            "detail": "templates can only be edited while the version is draft"},
+                )
+
+            # Delete-all + reinsert. Cheaper than diffing for a list
+            # bounded at 200 templates. The schema trigger
+            # sop_template_tasks_draft_only_check passes because we're
+            # still in 'draft' state.
+            await conn.execute(
+                "DELETE FROM sop_template_tasks WHERE sop_version_id = $1::uuid",
+                version["id"],
+            )
+            for idx, t in enumerate(body.templates):
+                owner_uid = str(t.owner_user_id) if t.owner_user_id else None
+                await conn.execute(
+                    """
+                    INSERT INTO sop_template_tasks
+                      (sop_version_id, seq_no, summary, description,
+                       due_offset_days, dependency_text, category, priority,
+                       owner_role, owner_user_id)
+                    VALUES
+                      ($1::uuid, $2, $3, $4,
+                       $5, $6, $7, $8,
+                       $9, $10::uuid)
+                    """,
+                    version["id"], idx, t.summary, t.description,
+                    t.due_offset_days, t.dependency_text, t.category, t.priority,
+                    t.owner_role, owner_uid,
+                )
+
+            # Touch the version row so its updated_at reflects this edit.
+            actor_id = principal.id if principal.principal_type == "user" else None
+            await conn.execute(
+                "UPDATE sop_versions SET updated_by = $2::uuid "
+                "WHERE id = $1::uuid",
+                version["id"], actor_id,
+            )
+
+    log.info("sop_templates_replaced", extra={
+        "sop_id": rid, "version_no": version_no,
+        "template_count": len(body.templates),
+    })
+    return {
+        "sop_id": rid,
+        "version_no": version_no,
+        "template_count": len(body.templates),
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/sops/{id}/versions/{vn}/publish
+# ---------------------------------------------------------------------------
+
+@router.post("/v1/sops/{sop_id}/versions/{version_no}/publish")
+async def publish_sop_version(
+    sop_id: uuid.UUID,
+    version_no: Annotated[int, Path(ge=1)],
+    body: _PublishVersionBody,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Atomic publish of a draft version.
+
+    Single transaction:
+      1. Lock the sop FOR UPDATE.
+      2. Lock target version FOR UPDATE; require state='draft' AND
+         the SOP has at least one template (an empty SOP wouldn't
+         materialize anything useful on fire — refuse).
+      3. If there's an existing 'published' version, supersede it
+         (state='superseded'). The schema trigger guards content
+         immutability during this transition.
+      4. Set target version state='published' with published_at +
+         published_by + (optional) change_log override.
+      5. UPDATE sops.latest_version_id to the newly published version.
+
+    Schema triggers from migration 0010 enforce all the invariants
+    the application code can't see — once published, version content
+    is immutable; only one published per sop; latest_version_id must
+    reference a published version of THIS sop.
+    """
+    require_admin(principal)
+    pool = request.app.state.db
+    actor_id = principal.id if principal.principal_type == "user" else None
+    rid = str(sop_id)
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            sop = await conn.fetchrow(
+                "SELECT id::text AS id, status::text AS status "
+                "FROM sops WHERE id = $1::uuid FOR UPDATE",
+                rid,
+            )
+            if not sop:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "sop_not_found", "id": rid},
+                )
+            if sop["status"] != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_archived", "id": rid},
+                )
+
+            target = await conn.fetchrow(
+                """
+                SELECT id::text AS id, state::text AS state, change_log
+                FROM sop_versions
+                WHERE sop_id = $1::uuid AND version_no = $2
+                FOR UPDATE
+                """,
+                rid, version_no,
+            )
+            if not target:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "sop_version_not_found",
+                            "sop_id": rid, "version_no": version_no},
+                )
+            if target["state"] != "draft":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_version_not_draft",
+                            "state": target["state"],
+                            "detail": "only draft versions can be published"},
+                )
+
+            template_count_row = await conn.fetchrow(
+                "SELECT count(*) AS c FROM sop_template_tasks "
+                "WHERE sop_version_id = $1::uuid",
+                target["id"],
+            )
+            if int(template_count_row["c"]) == 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "sop_version_empty",
+                            "detail": "cannot publish a version with no templates"},
+                )
+
+            # Supersede any prior published version. The schema
+            # trigger ensures only state + updated_at/by change.
+            await conn.execute(
+                """
+                UPDATE sop_versions
+                   SET state = 'superseded', updated_by = $2::uuid
+                 WHERE sop_id = $1::uuid AND state = 'published'
+                """,
+                rid, actor_id,
+            )
+
+            # Publish target. Use the body's change_log if provided,
+            # else keep the draft's existing change_log.
+            new_change_log = body.change_log if body.change_log is not None else target["change_log"]
+            published = await conn.fetchrow(
+                """
+                UPDATE sop_versions
+                   SET state         = 'published',
+                       published_at  = now(),
+                       published_by  = $2::uuid,
+                       change_log    = $3,
+                       updated_by    = $2::uuid
+                 WHERE id = $1::uuid
+                RETURNING id::text AS id,
+                          sop_id::text AS sop_id,
+                          version_no AS version_no,
+                          state::text AS state,
+                          change_log AS change_log,
+                          created_at::text AS created_at,
+                          published_at::text AS published_at,
+                          published_by::text AS published_by
+                """,
+                target["id"], actor_id, new_change_log,
+            )
+
+            # Bump sops.latest_version_id. Trigger requires
+            # state='published' for this column; we just satisfied it.
+            await conn.execute(
+                "UPDATE sops SET latest_version_id = $2::uuid, updated_by = $3::uuid "
+                "WHERE id = $1::uuid",
+                rid, target["id"], actor_id,
+            )
+
+    log.info("sop_version_published", extra={
+        "sop_id": rid, "version_no": version_no, "actor": actor_id,
+    })
+    return _serialize_version(published)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/anchor_events
+# ---------------------------------------------------------------------------
+
+@router.post("/v1/anchor_events", status_code=201)
+async def create_anchor_event(
+    body: _CreateAnchorBody,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Schedule an anchor event for a SOP.
+
+    The schema trigger anchor_events_business_match_check enforces
+    that the anchor's business_id matches the SOP's business_id, so
+    a typo or hostile body can't pair business A with business B's
+    SOP.
+    """
+    require_admin(principal)
+
+    scheduled_for_dt = _parse_iso_timestamp(body.scheduled_for, field="scheduled_for")
+    if scheduled_for_dt is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "scheduled_for_required",
+                    "detail": "scheduled_for must be an ISO timestamp"},
+        )
+
+    pool = request.app.state.db
+    actor_id = principal.id if principal.principal_type == "user" else None
+
+    async with pool.acquire() as conn:
+        biz_id = await _resolve_business_id(conn, body.business_slug)
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO anchor_events
+                  (business_id, kind, sop_id, scheduled_for, notes,
+                   created_by, updated_by)
+                VALUES
+                  ($1::uuid, $2, $3::uuid, $4::timestamptz, $5,
+                   $6::uuid, $6::uuid)
+                RETURNING id::text                AS id,
+                          business_id::text       AS business_id,
+                          kind                    AS kind,
+                          sop_id::text            AS sop_id,
+                          scheduled_for::text     AS scheduled_for,
+                          state::text             AS state,
+                          fired_at::text          AS fired_at,
+                          fired_by::text          AS fired_by,
+                          cancelled_at::text      AS cancelled_at,
+                          cancelled_by::text      AS cancelled_by,
+                          notes                   AS notes,
+                          created_at::text        AS created_at
+                """,
+                biz_id, body.kind, str(body.sop_id), scheduled_for_dt,
+                body.notes, actor_id,
+            )
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "anchor_in_use",
+                        "detail": (f"anchor for ({body.business_slug}, "
+                                    f"{body.kind!r}, {body.scheduled_for}) already "
+                                    f"exists; create a distinct kind or schedule")},
+            )
+        except asyncpg.ForeignKeyViolationError as e:
+            # Trigger raises foreign_key_violation when business <> sop.business.
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "anchor_business_mismatch",
+                        "detail": str(e)},
+            )
+
+    log.info("anchor_event_created", extra={"id": row["id"], "actor": actor_id})
+    return _serialize_anchor(row)
+
