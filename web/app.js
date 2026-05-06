@@ -90,6 +90,11 @@ const state = {
     loaded: false,                // first refresh has completed
     loading: false,               // a refresh is in flight
     loadError: null,              // inline error pill (does NOT replace shell)
+    // Sub-(b) commit 1: per-channel editor drafts. Codex chunk-10-
+    // step3b1 (3): keyed map of {channel -> draft}, no global
+    // pendingChannel. Per-draft pending + save-handler guard is
+    // enough.
+    editing: {},                  // { [channel]: draft } — see _seedSettingsDraft
   },
 };
 
@@ -1085,6 +1090,13 @@ async function loadPushSubscriptions() {
   return await api('/v1/notifications/web_push/subscriptions');
 }
 
+async function patchNotificationPref(channel, body) {
+  return await api(`/v1/notifications/prefs/${encodeURIComponent(channel)}`, {
+    method: 'PATCH',
+    body,
+  });
+}
+
 async function loadVapidPublicKey() {
   // Treat 503 as "server doesn't have VAPID configured" — that's a
   // valid state, not an error. Per
@@ -1133,6 +1145,62 @@ async function refreshSettings() {
     state.settings.loading = false;
     render();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-(b) commit 1: prefs editor — draft helpers, validate, serialize.
+// ---------------------------------------------------------------------------
+
+const _SETTINGS_KIND_OPTIONS = ['daily', 'weekly'];
+const _SETTINGS_WEEKDAYS = ['mon','tue','wed','thu','fri','sat','sun'];
+
+function _seedSettingsDraft(pref) {
+  // Build a draft from a pref row. Works for both saved rows and
+  // synthesized defaults. Codex chunk-10-step3b1 (5): unknown kind
+  // is rendered read-only / not editable; we don't coerce it here.
+  const sched = (pref && pref.schedule) || {};
+  const kind = _SETTINGS_KIND_OPTIONS.includes(sched.kind) ? sched.kind : 'daily';
+  return {
+    enabled: !!pref.enabled,
+    scheduleKind: kind,
+    hour: Number.isInteger(sched.hour) ? sched.hour : 7,
+    minute: Number.isInteger(sched.minute) ? sched.minute : 0,
+    weekday: _SETTINGS_WEEKDAYS.includes(sched.weekday) ? sched.weekday : 'mon',
+    timezone: (typeof sched.timezone === 'string' && sched.timezone) ? sched.timezone : 'America/Phoenix',
+    dirty: false,
+    pending: false,
+    error: null,
+  };
+}
+
+function _validateSettingsDraft(draft) {
+  if (typeof draft.enabled !== 'boolean') return 'enabled must be boolean';
+  if (!_SETTINGS_KIND_OPTIONS.includes(draft.scheduleKind)) return 'kind must be daily or weekly';
+  if (!Number.isInteger(draft.hour) || draft.hour < 0 || draft.hour > 23) return 'hour must be 0..23';
+  if (!Number.isInteger(draft.minute) || draft.minute < 0 || draft.minute > 59) return 'minute must be 0..59';
+  if (draft.scheduleKind === 'weekly' && !_SETTINGS_WEEKDAYS.includes(draft.weekday)) return 'weekday required for weekly';
+  return null;
+}
+
+function _serializeSettingsDraft(draft) {
+  const schedule = {
+    kind: draft.scheduleKind,
+    hour: draft.hour,
+    minute: draft.minute,
+    timezone: draft.timezone || 'America/Phoenix',
+  };
+  if (draft.scheduleKind === 'weekly') schedule.weekday = draft.weekday;
+  return { enabled: draft.enabled, schedule };
+}
+
+function hasDirtySettingsDraft() {
+  const e = state.settings.editing || {};
+  return Object.values(e).some(d => d && d.dirty && !d.pending);
+}
+
+function hasPendingSettingsDraft() {
+  const e = state.settings.editing || {};
+  return Object.values(e).some(d => d && d.pending);
 }
 
 function _shortenKey(key) {
@@ -1243,9 +1311,71 @@ function renderSettingsWebPushSection() {
   `;
 }
 
+function _renderPrefDrawer(channel, draft) {
+  // Codex chunk-10-step3b1: inline drawer row with colspan, not
+  // cramming controls into the existing table cells.
+  const validationError = _validateSettingsDraft(draft);
+  const saveDisabled = draft.pending || !draft.dirty || !!validationError;
+  const weeklyOpts = _SETTINGS_WEEKDAYS.map(d =>
+    `<option value="${d}"${draft.weekday === d ? ' selected' : ''}>${d}</option>`).join('');
+  const kindOpts = _SETTINGS_KIND_OPTIONS.map(k =>
+    `<option value="${k}"${draft.scheduleKind === k ? ' selected' : ''}>${k}</option>`).join('');
+  const hourPad = String(draft.hour).padStart(2, '0');
+  const minPad = String(draft.minute).padStart(2, '0');
+  const errorBlock = draft.error
+    ? `<div class="settings-row-error">${escapeHtml(draft.error)}</div>`
+    : (validationError
+        ? `<div class="settings-row-error">${escapeHtml(validationError)}</div>`
+        : '');
+  return `
+    <tr class="settings-drawer" data-drawer-channel="${escapeHtml(channel)}">
+      <td colspan="5">
+        <div class="settings-editor">
+          <label class="settings-editor-field">
+            <input type="checkbox" data-pref-field="enabled" data-channel="${escapeHtml(channel)}"
+                   ${draft.enabled ? 'checked' : ''}> Enabled
+          </label>
+          <label class="settings-editor-field">
+            Kind
+            <select data-pref-field="scheduleKind" data-channel="${escapeHtml(channel)}">${kindOpts}</select>
+          </label>
+          <label class="settings-editor-field">
+            Hour
+            <input type="number" min="0" max="23" inputmode="numeric"
+                   data-pref-field="hour" data-channel="${escapeHtml(channel)}"
+                   value="${hourPad}">
+          </label>
+          <label class="settings-editor-field">
+            Minute
+            <input type="number" min="0" max="59" inputmode="numeric"
+                   data-pref-field="minute" data-channel="${escapeHtml(channel)}"
+                   value="${minPad}">
+          </label>
+          ${draft.scheduleKind === 'weekly' ? `
+            <label class="settings-editor-field">
+              Weekday
+              <select data-pref-field="weekday" data-channel="${escapeHtml(channel)}">${weeklyOpts}</select>
+            </label>
+          ` : ''}
+          <span class="settings-editor-field muted">Timezone: ${escapeHtml(draft.timezone)}</span>
+          <div class="settings-editor-actions">
+            <button class="settings-edit-save" data-channel="${escapeHtml(channel)}"
+                    ${saveDisabled ? 'disabled' : ''}>${draft.pending ? 'Saving…' : 'Save'}</button>
+            <button class="settings-edit-cancel" data-channel="${escapeHtml(channel)}"
+                    ${draft.pending ? 'disabled' : ''}>Cancel</button>
+          </div>
+          ${errorBlock}
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
 function renderSettingsPrefsSection() {
   const s = state.settings;
+  const editing = s.editing || {};
   const rows = (s.prefs || []).map(p => {
+    const channel = p.channel;
     const enabledPill = p.enabled
       ? '<span class="settings-pill badge-granted">enabled</span>'
       : '<span class="settings-pill badge-default">disabled</span>';
@@ -1255,14 +1385,21 @@ function renderSettingsPrefsSection() {
     const settingsKv = (p.settings && Object.keys(p.settings).length)
       ? `<code class="settings-kv">${escapeHtml(JSON.stringify(p.settings))}</code>`
       : '<span class="muted">—</span>';
-    return `
+    const isEditing = !!editing[channel];
+    const editButton = isEditing
+      ? '<span class="muted">editing…</span>'
+      : `<button class="settings-edit-open" data-channel="${escapeHtml(channel)}">Edit</button>`;
+    const baseRow = `
       <tr class="${p.synthesized_default ? 'settings-row-default' : ''}">
-        <td><strong>${escapeHtml(p.channel)}</strong>${defaultPill}</td>
+        <td><strong>${escapeHtml(channel)}</strong>${defaultPill}</td>
         <td>${enabledPill}</td>
         <td>${_renderScheduleSummary(p.schedule)}</td>
         <td>${settingsKv}</td>
+        <td class="settings-actions-cell">${editButton}</td>
       </tr>
     `;
+    const drawerRow = isEditing ? _renderPrefDrawer(channel, editing[channel]) : '';
+    return baseRow + drawerRow;
   }).join('');
   const table = s.prefs && s.prefs.length
     ? `<table class="settings-table">
@@ -1272,6 +1409,7 @@ function renderSettingsPrefsSection() {
            <th scope="col">Status</th>
            <th scope="col">Schedule</th>
            <th scope="col">Settings</th>
+           <th scope="col">Actions</th>
          </tr></thead>
          <tbody>${rows}</tbody>
        </table>`
@@ -1280,7 +1418,7 @@ function renderSettingsPrefsSection() {
     <section class="settings-section">
       <h3>Notification preferences</h3>
       ${table}
-      <p class="muted">Preferences are read-only here for now. Edit / save controls land in the next update.</p>
+      <p class="muted">Edit a row to change schedule or enable a channel. Settings (stale_days, include_completed) edits land in the next update.</p>
     </section>
   `;
 }
@@ -1319,6 +1457,17 @@ function attachEventHandlers() {
         if (!window.confirm('Discard unsaved SOP template edits?')) return;
       }
       state.sops.editing = null;
+      // Codex chunk-10-step3b1 plan-review (10): mirror the SOP
+      // dirty-tab guard for Settings drafts. Block navigation while
+      // a save is pending; prompt to discard otherwise.
+      if (hasPendingSettingsDraft()) {
+        window.alert('A notification preference save is in flight; wait for it to finish.');
+        return;
+      }
+      if (hasDirtySettingsDraft()) {
+        if (!window.confirm('Discard unsaved notification preference edits?')) return;
+      }
+      state.settings.editing = {};
       state.view = v;
       state.review.actionError = null;
       if (v === 'review') {
@@ -2081,6 +2230,103 @@ function attachEventHandlers() {
       state.review.actionError = null;
       state.anchors.fireResult = null;
       await refreshReviewItems();
+    });
+  });
+
+  // ---- Settings: prefs editor (chunk 10 step 3 sub-(b) commit 1) ----
+  document.querySelectorAll('.settings-edit-open').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const channel = btn.dataset.channel;
+      if (!channel) return;
+      const pref = (state.settings.prefs || []).find(p => p.channel === channel);
+      if (!pref) return;
+      // Codex chunk-10-step3b1 (5): unknown kind => render read-only
+      // (don't seed an editable draft from a kind we can't represent).
+      const kind = (pref.schedule || {}).kind;
+      if (kind && !_SETTINGS_KIND_OPTIONS.includes(kind)) {
+        window.alert(`Schedule kind "${kind}" is not supported by this editor.`);
+        return;
+      }
+      state.settings.editing = state.settings.editing || {};
+      state.settings.editing[channel] = _seedSettingsDraft(pref);
+      render();
+    });
+  });
+
+  document.querySelectorAll('.settings-edit-cancel').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const channel = btn.dataset.channel;
+      if (!channel) return;
+      const draft = (state.settings.editing || {})[channel];
+      if (draft && draft.pending) return;
+      delete state.settings.editing[channel];
+      render();
+    });
+  });
+
+  // Field-change listeners for the drawer. data-pref-field +
+  // data-channel identify the target draft.
+  document.querySelectorAll('[data-pref-field][data-channel]').forEach(el => {
+    const handler = () => {
+      const channel = el.dataset.channel;
+      const field = el.dataset.prefField;
+      const draft = (state.settings.editing || {})[channel];
+      if (!draft || draft.pending) return;
+      let next;
+      if (field === 'enabled') next = !!el.checked;
+      else if (field === 'scheduleKind' || field === 'weekday') next = el.value;
+      else if (field === 'hour' || field === 'minute') {
+        const n = parseInt(el.value, 10);
+        next = Number.isFinite(n) ? n : 0;
+      }
+      if (draft[field] !== next) {
+        draft[field] = next;
+        draft.dirty = true;
+        draft.error = null;
+        render();
+      }
+    };
+    el.addEventListener('change', handler);
+    if (el.tagName === 'INPUT' && el.type === 'number') {
+      el.addEventListener('input', handler);
+    }
+  });
+
+  document.querySelectorAll('.settings-edit-save').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const channel = btn.dataset.channel;
+      if (!channel) return;
+      const draft = (state.settings.editing || {})[channel];
+      if (!draft) return;
+      // Codex chunk-10-step3b1 plan-review: save-handler guard is
+      // separate from the disabled attribute. Disabled buttons can
+      // still fire on rapid double-click in some browsers.
+      if (draft.pending) return;
+      const validationErr = _validateSettingsDraft(draft);
+      if (validationErr) {
+        draft.error = validationErr;
+        render();
+        return;
+      }
+      draft.pending = true;
+      draft.error = null;
+      render();
+      try {
+        const body = _serializeSettingsDraft(draft);
+        const updated = await patchNotificationPref(channel, body);
+        // Replace the row in state.settings.prefs with the saved
+        // version (so synthesized_default badge clears).
+        state.settings.prefs = (state.settings.prefs || []).map(p =>
+          p.channel === channel ? updated : p
+        );
+        delete state.settings.editing[channel];
+      } catch (err) {
+        draft.pending = false;
+        draft.error = (err && err.body && err.body.detail)
+          ? (typeof err.body.detail === 'string' ? err.body.detail : JSON.stringify(err.body.detail))
+          : (err && err.message) || 'Save failed.';
+      }
+      render();
     });
   });
 }

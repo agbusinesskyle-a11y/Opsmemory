@@ -68,6 +68,53 @@ def _require_user(principal: Principal) -> None:
 # Pydantic bodies
 # ---------------------------------------------------------------------------
 
+# Codex chunk-10-step3b1 plan-review (1+5): schedule semantics are
+# now validated server-side. Without this, hour=99 / kind='event' /
+# missing weekday would silently save and a future scheduler run
+# would crash mid-job. Validation is intentionally minimal — the
+# scheduler module (step 4) will share the same validator.
+_SCHEDULE_KINDS = frozenset({"daily", "weekly"})
+_WEEKDAYS = frozenset({"mon", "tue", "wed", "thu", "fri", "sat", "sun"})
+
+# Best-effort timezone whitelist. We don't import zoneinfo here to
+# keep this module dependency-free; the operator's deploy ships
+# tzdata. Pattern: 'Region/City' or 'UTC'. The scheduler does the
+# real resolve at fire time.
+import re as _re
+_TIMEZONE_RE = _re.compile(r"^(UTC|[A-Z][A-Za-z_]+/[A-Z][A-Za-z_]+(/[A-Z][A-Za-z_]+)?)$")
+
+
+def _validate_schedule_object(schedule: dict) -> None:
+    """Raise ValueError on bad schedule shape. Used by PrefPatchBody.
+    Step 4 (digest scheduler) will import this for fire-time validation
+    so client and scheduler can never disagree.
+    """
+    kind = schedule.get("kind")
+    if kind not in _SCHEDULE_KINDS:
+        raise ValueError(
+            f"schedule.kind must be one of {sorted(_SCHEDULE_KINDS)}; got {kind!r}"
+        )
+    hour = schedule.get("hour")
+    if not isinstance(hour, int) or not (0 <= hour <= 23):
+        raise ValueError(f"schedule.hour must be int 0..23; got {hour!r}")
+    minute = schedule.get("minute")
+    if not isinstance(minute, int) or not (0 <= minute <= 59):
+        raise ValueError(f"schedule.minute must be int 0..59; got {minute!r}")
+    tz = schedule.get("timezone")
+    if not isinstance(tz, str) or not _TIMEZONE_RE.match(tz):
+        raise ValueError(
+            "schedule.timezone must be a string IANA tz id "
+            "(e.g. 'America/Phoenix' or 'UTC')"
+        )
+    if kind == "weekly":
+        weekday = schedule.get("weekday")
+        if weekday not in _WEEKDAYS:
+            raise ValueError(
+                f"schedule.weekday required for weekly kind; "
+                f"must be one of {sorted(_WEEKDAYS)}; got {weekday!r}"
+            )
+
+
 class PrefPatchBody(BaseModel):
     model_config = {"extra": "forbid"}
     enabled: bool | None = None
@@ -81,6 +128,14 @@ class PrefPatchBody(BaseModel):
             return v
         if not isinstance(v, dict):
             raise ValueError("must be a JSON object")
+        return v
+
+    @field_validator("schedule")
+    @classmethod
+    def _schedule_shape(cls, v):
+        if v is None:
+            return v
+        _validate_schedule_object(v)
         return v
 
 

@@ -1016,6 +1016,61 @@ ul.businesses li {
   letter-spacing: 0.5px;
   padding-bottom: 4px;
 }
+.settings-actions-cell { white-space: nowrap; }
+.settings-edit-open,
+.settings-edit-save,
+.settings-edit-cancel {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 12px;
+}
+.settings-edit-open:hover { background: rgba(0, 100, 200, 0.10); }
+.settings-edit-save { background: rgba(0, 150, 0, 0.15); }
+.settings-edit-save:disabled,
+.settings-edit-cancel:disabled,
+.settings-edit-open:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-drawer > td {
+  background: rgba(120, 120, 120, 0.05);
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-editor {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+}
+.settings-editor-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.settings-editor-field input[type=number],
+.settings-editor-field select {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 13px;
+  min-width: 80px;
+}
+.settings-editor-actions { display: flex; gap: 6px; margin-left: auto; }
+.settings-row-error {
+  flex-basis: 100%;
+  background: var(--error-bg);
+  color: var(--error-fg);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  margin-top: 8px;
+}
 .settings-error {
   background: var(--error-bg);
   color: var(--error-fg);
