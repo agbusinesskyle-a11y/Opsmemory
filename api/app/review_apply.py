@@ -471,6 +471,15 @@ async def _apply_update_task(
             "code": "update_field_unknown",
             "message": f"fields {bad_fields} not in UPDATE allowlist {list(_UPDATE_MUTABLE_FIELDS)}",
         }])
+    # Defensive: summary is NOT NULL in the tasks schema. PATCH already
+    # rejects this in v1_review.py, but the apply path runs against
+    # arbitrary historic review_items (including ones queued by the
+    # pipeline before any of these guards were in place), so re-check.
+    if "summary" in update and update["summary"] is None:
+        raise ApplyValidationError([{
+            "code": "summary_null_invalid",
+            "message": "summary cannot be null on UPDATE_TASK",
+        }])
 
     # ----- Lock target -----
     task_row = await conn.fetchrow(

@@ -23,6 +23,28 @@ log = logging.getLogger("opsmemory.db")
 _pool: Optional[asyncpg.Pool] = None
 
 
+async def register_jsonb_codec(conn: asyncpg.Connection) -> None:
+    """Register jsonb + json codecs on a connection.
+
+    Called from both the API pool setup (init_pool) and from
+    scripts/run_pipeline.py's worker pool, so any code path that
+    passes raw Python dicts/lists to ::jsonb params behaves
+    consistently.
+    """
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+    await conn.set_type_codec(
+        "json",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+
+
 async def init_pool() -> asyncpg.Pool:
     """Create the connection pool. Idempotent."""
     global _pool
@@ -38,19 +60,7 @@ async def init_pool() -> asyncpg.Pool:
     async def _setup_connection(conn: asyncpg.Connection) -> None:
         await conn.execute(f"SET statement_timeout = {statement_timeout_ms}")
         await conn.execute(f"SET idle_in_transaction_session_timeout = {idle_in_tx_ms}")
-        # Auto-decode jsonb / json so callers see dicts/lists, not strings.
-        await conn.set_type_codec(
-            "jsonb",
-            encoder=json.dumps,
-            decoder=json.loads,
-            schema="pg_catalog",
-        )
-        await conn.set_type_codec(
-            "json",
-            encoder=json.dumps,
-            decoder=json.loads,
-            schema="pg_catalog",
-        )
+        await register_jsonb_codec(conn)
 
     _pool = await asyncpg.create_pool(
         dsn=dsn,

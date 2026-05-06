@@ -51,6 +51,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import asyncpg  # noqa: E402
 
+from api.app.db import register_jsonb_codec  # noqa: E402
 from api.app.reconciliation.pipeline import process_event  # noqa: E402
 
 log = logging.getLogger("opsmemory.run_pipeline")
@@ -67,7 +68,15 @@ async def main_async(args: argparse.Namespace) -> int:
 
     stale_minutes = int(os.environ.get("INGEST_PIPELINE_STALE_MINUTES", "10"))
 
-    pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=2)
+    # Worker pool MUST install the same jsonb codec the API pool uses,
+    # otherwise pipeline.py's raw-dict params to ::jsonb fail (Codex
+    # chunk-4-close blocker).
+    pool = await asyncpg.create_pool(
+        dsn=dsn,
+        min_size=1,
+        max_size=2,
+        setup=register_jsonb_codec,
+    )
     try:
         # Atomic claim: pick up to `limit` rows whose status is received,
         # failed, or stale-extracting; flip them to extracting in the same

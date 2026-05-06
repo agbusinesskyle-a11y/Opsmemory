@@ -513,9 +513,35 @@ async def patch_review_item(
                 )
 
             # Build the new proposed_patch envelope from the typed body.
-            patch_value = getattr(body, body_action_key).model_dump(
-                exclude_none=False
-            )
+            #
+            # CREATE: include all keys (even when null) — fresh row, the
+            #   nulls are intentional initial values.
+            # UPDATE: ONLY include keys the client explicitly set. With
+            #   exclude_unset=True a PATCH like {"update": {"summary":
+            #   "x"}} writes summary only; due_at/category/dependency_text
+            #   are not in patch_value, so the apply loop won't touch
+            #   them. Without this, every omitted field would be set to
+            #   NULL on approve (Codex chunk-4-close blocker).
+            # COMPLETE: only completion_note exists, semantics same as
+            #   CREATE.
+            body_obj = getattr(body, body_action_key)
+            if body_action_key == "update":
+                patch_value = body_obj.model_dump(exclude_unset=True)
+                if not patch_value:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={"code": "update_empty",
+                                "detail": "update PATCH must touch at least one field"},
+                    )
+                # NOT NULL in DB — explicit summary=null is invalid for UPDATE.
+                if "summary" in patch_value and patch_value["summary"] is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={"code": "summary_null_invalid",
+                                "detail": "summary cannot be null on UPDATE"},
+                    )
+            else:
+                patch_value = body_obj.model_dump(exclude_none=False)
             new_proposed_patch = {body_action_key: patch_value}
 
             # Build a synthetic candidate for re-validation. CREATE pulls
@@ -539,13 +565,13 @@ async def patch_review_item(
                 synth_candidate["dependency_text"] = patch_value.get("dependency_text")
             else:
                 synth_candidate = dict(candidate_facts)
-                # UPDATE may edit summary; reflect it for downstream validators
-                # that read candidate.summary length checks.
+                # UPDATE may edit summary/due_at/category/dependency_text;
+                # mirror every set key into candidate_facts so the audit
+                # trail and any downstream validator that re-reads
+                # candidate_facts sees the post-edit shape.
                 if body_action_key == "update":
-                    if patch_value.get("summary") is not None:
-                        synth_candidate["summary"] = patch_value["summary"]
-                    if patch_value.get("due_at") is not None:
-                        synth_candidate["due_at"] = patch_value["due_at"]
+                    for fname in patch_value.keys():
+                        synth_candidate[fname] = patch_value[fname]
 
             # Re-snapshot base versions for UPDATE/COMPLETE so the next
             # approve compares against the post-edit state, not the
