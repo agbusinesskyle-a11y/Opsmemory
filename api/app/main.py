@@ -240,6 +240,11 @@ async def serve_sw() -> FileResponse:
         raise HTTPException(status_code=404, detail="not found")
     response = FileResponse(path, media_type="application/javascript")
     response.headers["Service-Worker-Allowed"] = "/"
+    # Browsers revalidate /sw.js on every page load by default, but
+    # set explicit no-cache so an upstream proxy (CF Tunnel /
+    # Cloudflare cache) doesn't pin a stale SW after a deploy
+    # (Codex chunk-6-step1 STEP 2 GUIDANCE).
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return response
 
 
