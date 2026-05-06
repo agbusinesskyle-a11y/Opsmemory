@@ -23,6 +23,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -213,33 +214,96 @@ async def _load_user(
     )
 
 
-async def _load_service(request: Request, raw_key: str) -> Principal:
-    pepper = os.environ.get("SERVICE_KEY_PEPPER")
-    if not pepper:
-        log.error("service_auth_unavailable: SERVICE_KEY_PEPPER unset")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="service auth unavailable",
-        )
+def _resolve_pepper(version: str | None) -> str | None:
+    """Return the pepper for a specific version, or the active one if version is None.
 
-    key_prefix = raw_key[:16]
-    key_hash = hmac.new(pepper.encode(), raw_key.encode(), hashlib.sha256).hexdigest()
+    Pepper versioning:
+      SERVICE_KEY_PEPPER_ACTIVE_VERSION = "v1"   # which version to write new keys with
+      SERVICE_KEY_PEPPER_V1             = "<hex>" # actual pepper for v1
+      SERVICE_KEY_PEPPER_V2             = "<hex>" # next-version pepper after rotation
+
+    The legacy SERVICE_KEY_PEPPER (no version suffix) is honored when set
+    and treated as v1 — backward compat for chunk1 deploys.
+    """
+    if version:
+        env_name = f"SERVICE_KEY_PEPPER_{version.upper()}"
+        return os.environ.get(env_name)
+    # Default: prefer the active version, fall back to legacy SERVICE_KEY_PEPPER.
+    active = os.environ.get("SERVICE_KEY_PEPPER_ACTIVE_VERSION")
+    if active:
+        return os.environ.get(f"SERVICE_KEY_PEPPER_{active.upper()}")
+    return os.environ.get("SERVICE_KEY_PEPPER")
+
+
+_KEY_PATTERN = re.compile(
+    r"^opsmem_(?P<env>live|test)_(?P<kid>[A-Za-z0-9]{16})_(?P<secret>[A-Za-z0-9_-]{32,})$"
+)
+
+
+def _parse_service_key(raw: str) -> dict[str, str] | None:
+    """Parse `opsmem_<env>_<kid>_<secret>` into components.
+
+    Returns None on any malformed input. Refuses keys not matching the
+    canonical shape — prevents legacy "first 16 chars of opaque blob"
+    parsing that Codex flagged in the chunk1 review.
+    """
+    if not raw or len(raw) > 256:
+        return None
+    m = _KEY_PATTERN.match(raw)
+    if not m:
+        return None
+    return {"env": m.group("env"), "kid": m.group("kid"), "secret": m.group("secret")}
+
+
+async def _load_service(request: Request, raw_key: str) -> Principal:
+    parsed = _parse_service_key(raw_key)
+    if not parsed:
+        log.info("service_key_malformed")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid service key",
+        )
 
     pool = request.app.state.db
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id::text AS id, name, key_hash, scopes
+            SELECT id::text AS id, name, key_hash, scopes,
+                   COALESCE(metadata->>'pepper_version', '') AS pepper_version
             FROM service_accounts
             WHERE key_prefix = $1
               AND status = 'active'
               AND (expires_at IS NULL OR expires_at > now())
             """,
-            key_prefix,
+            parsed["kid"],
         )
 
-        if not row or not hmac.compare_digest(row["key_hash"], key_hash):
-            log.info(f"service_key_invalid prefix={key_prefix[:6]}...")
+        if not row:
+            log.info(f"service_key_unknown_kid kid={parsed['kid'][:6]}...")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid service key",
+            )
+
+        # Resolve the pepper version this row was hashed with.
+        pepper = _resolve_pepper(row["pepper_version"] or None)
+        if not pepper:
+            log.error(
+                "service_pepper_missing",
+                extra={"kid": parsed["kid"][:6], "pepper_version": row["pepper_version"]},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="service auth unavailable",
+            )
+
+        # HMAC the full displayed key (env_prefix + kid + secret), so
+        # rotating the secret half always changes the hash even if the
+        # kid stays the same.
+        key_hash = hmac.new(pepper.encode(), raw_key.encode(), hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(row["key_hash"], key_hash):
+            log.info(f"service_key_hash_mismatch kid={parsed['kid'][:6]}...")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="invalid service key",
