@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any
+from datetime import datetime
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 
 from .auth import Principal, require_principal
 from .authz import require_admin
@@ -32,6 +33,48 @@ from .authz import require_admin
 log = logging.getLogger("opsmemory.v1_sops")
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Module constants
+# ---------------------------------------------------------------------------
+
+# Mirror the schema enums (api/migrations/0009_sops.sql) so a typo in
+# either side surfaces here, not at runtime.
+SOP_STATUSES = frozenset({"active", "archived"})
+ANCHOR_EVENT_STATES = frozenset({"scheduled", "fired", "cancelled", "failed"})
+
+
+def _parse_iso_timestamp(raw: str | None, *, field: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp from a query string. None passes
+    through. Normalizes 'Z' -> '+00:00' (Python 3.11+ accepts both,
+    but older fromisoformat doesn't, and being explicit makes the
+    error path predictable)."""
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_timestamp", "field": field, "got": raw},
+        )
+    # Reject naive timestamps — anchor scheduled_for is timestamptz
+    # and a timezone-less filter would silently use the DB session
+    # timezone, which produces nondeterministic results across
+    # operator clients.
+    if dt.tzinfo is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "naive_timestamp", "field": field,
+                    "detail": "include a timezone offset (e.g. 'Z' or '+00:00')"},
+        )
+    return dt
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +172,8 @@ def _serialize_generated(row: Any) -> dict:
         "id": row["id"],
         "sop_instance_id": row["sop_instance_id"],
         "sop_template_task_id": row["sop_template_task_id"],
+        "template_seq_no": row.get("template_seq_no"),
+        "template_summary": row.get("template_summary"),
         "review_item_id": row.get("review_item_id"),
         "review_item_status": row.get("review_item_status"),
         "task_id": row.get("task_id"),
@@ -153,30 +198,33 @@ async def list_sops(
     offset: int = Query(default=0, ge=0),
 ) -> dict:
     require_admin(principal)
-    if sop_status is not None and sop_status not in ("active", "archived"):
+    if sop_status is not None and sop_status not in SOP_STATUSES:
         raise HTTPException(
             status_code=400,
-            detail={"code": "invalid_status", "got": sop_status},
+            detail={"code": "invalid_status", "got": sop_status,
+                    "allowed": sorted(SOP_STATUSES)},
         )
 
     pool = request.app.state.db
     async with pool.acquire() as conn:
         biz_id = await _resolve_business_id(conn, business_slug)
 
-        params: list[Any] = []
+        # Separate where_params from list_params (limit/offset) per
+        # Codex chunk-7-step2 review — the params[:-2] slice trick
+        # in v1.py was already noted as brittle.
+        where_params: list[Any] = []
         where: list[str] = []
         if biz_id:
-            params.append(biz_id)
-            where.append(f"s.business_id = ${len(params)}::uuid")
+            where_params.append(biz_id)
+            where.append(f"s.business_id = ${len(where_params)}::uuid")
         if sop_status:
-            params.append(sop_status)
-            where.append(f"s.status::text = ${len(params)}")
+            where_params.append(sop_status)
+            where.append(f"s.status::text = ${len(where_params)}")
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
-        params.append(limit)
-        limit_p = len(params)
-        params.append(offset)
-        offset_p = len(params)
+        list_params = where_params + [limit, offset]
+        limit_p = len(where_params) + 1
+        offset_p = len(where_params) + 2
 
         rows = await conn.fetch(
             f"""
@@ -192,16 +240,14 @@ async def list_sops(
             FROM sops s
             LEFT JOIN sop_versions v ON v.id = s.latest_version_id
             {where_sql}
-            ORDER BY s.business_id, s.name
+            ORDER BY s.business_id, s.name, s.id
             LIMIT ${limit_p} OFFSET ${offset_p}
             """,
-            *params,
+            *list_params,
         )
-        # Use the same WHERE for the count.
-        count_params = params[: len(params) - 2]
         count_row = await conn.fetchrow(
             f"SELECT count(*) AS c FROM sops s {where_sql}",
-            *count_params,
+            *where_params,
         )
 
     return {
@@ -277,16 +323,11 @@ async def get_sop(
 @router.get("/v1/sops/{sop_id}/versions/{version_no}")
 async def get_sop_version(
     sop_id: uuid.UUID,
-    version_no: int,
+    version_no: Annotated[int, Path(ge=1)],
     request: Request,
     principal: Principal = Depends(require_principal),
 ) -> dict:
     require_admin(principal)
-    if version_no < 1:
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "invalid_version_no", "got": version_no},
-        )
 
     pool = request.app.state.db
     async with pool.acquire() as conn:
@@ -357,41 +398,53 @@ async def list_anchor_events(
     offset: int = Query(default=0, ge=0),
 ) -> dict:
     require_admin(principal)
-    if state_filter is not None and state_filter not in (
-        "scheduled", "fired", "cancelled", "failed",
-    ):
+    if state_filter is not None and state_filter not in ANCHOR_EVENT_STATES:
         raise HTTPException(
             status_code=400,
-            detail={"code": "invalid_state", "got": state_filter},
+            detail={"code": "invalid_state", "got": state_filter,
+                    "allowed": sorted(ANCHOR_EVENT_STATES)},
+        )
+
+    # Parse timestamps in Python so a malformed value returns a clean
+    # 400 instead of bubbling PG 22007 as a 500 (Codex chunk-7-step2
+    # blocker). Also enforces tz-aware semantics so the filter is
+    # deterministic across operator timezones.
+    from_dt = _parse_iso_timestamp(from_ts, field="from")
+    to_dt = _parse_iso_timestamp(to_ts, field="to")
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "timestamp_range_invalid",
+                    "detail": "'from' must be <= 'to'",
+                    "from": from_ts, "to": to_ts},
         )
 
     pool = request.app.state.db
     async with pool.acquire() as conn:
         biz_id = await _resolve_business_id(conn, business_slug)
 
-        params: list[Any] = []
+        where_params: list[Any] = []
         where: list[str] = []
         if biz_id:
-            params.append(biz_id)
-            where.append(f"a.business_id = ${len(params)}::uuid")
+            where_params.append(biz_id)
+            where.append(f"a.business_id = ${len(where_params)}::uuid")
         if state_filter:
-            params.append(state_filter)
-            where.append(f"a.state::text = ${len(params)}")
+            where_params.append(state_filter)
+            where.append(f"a.state::text = ${len(where_params)}")
         if kind:
-            params.append(kind)
-            where.append(f"a.kind = ${len(params)}")
-        if from_ts:
-            params.append(from_ts)
-            where.append(f"a.scheduled_for >= ${len(params)}::timestamptz")
-        if to_ts:
-            params.append(to_ts)
-            where.append(f"a.scheduled_for <= ${len(params)}::timestamptz")
+            where_params.append(kind)
+            where.append(f"a.kind = ${len(where_params)}")
+        if from_dt is not None:
+            where_params.append(from_dt)
+            where.append(f"a.scheduled_for >= ${len(where_params)}::timestamptz")
+        if to_dt is not None:
+            where_params.append(to_dt)
+            where.append(f"a.scheduled_for <= ${len(where_params)}::timestamptz")
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
-        params.append(limit)
-        limit_p = len(params)
-        params.append(offset)
-        offset_p = len(params)
+        list_params = where_params + [limit, offset]
+        limit_p = len(where_params) + 1
+        offset_p = len(where_params) + 2
 
         rows = await conn.fetch(
             f"""
@@ -409,15 +462,14 @@ async def list_anchor_events(
                    a.created_at::text        AS created_at
             FROM anchor_events a
             {where_sql}
-            ORDER BY a.scheduled_for DESC
+            ORDER BY a.scheduled_for DESC, a.id
             LIMIT ${limit_p} OFFSET ${offset_p}
             """,
-            *params,
+            *list_params,
         )
-        count_params = params[: len(params) - 2]
         count_row = await conn.fetchrow(
             f"SELECT count(*) AS c FROM anchor_events a {where_sql}",
-            *count_params,
+            *where_params,
         )
 
     return {
@@ -493,7 +545,7 @@ async def list_anchor_instances(
                    fired_by::text        AS fired_by
             FROM sop_instances
             WHERE anchor_event_id = $1::uuid
-            ORDER BY fired_at DESC
+            ORDER BY fired_at DESC, id
             LIMIT $2 OFFSET $3
             """,
             str(anchor_id), limit, offset,
@@ -542,13 +594,18 @@ async def get_sop_instance(
                 status_code=404,
                 detail={"code": "sop_instance_not_found", "id": str(instance_id)},
             )
-        # Junction rows joined to review_items + tasks for the audit
-        # pane the PWA SOPs tab will render.
+        # Junction rows joined to template + review_items + tasks for
+        # the audit pane the PWA SOPs tab will render. Ordered by
+        # template seq_no so the reviewer sees materialized tasks in
+        # the SOP author's intended order even before they're
+        # approved into real tasks (Codex chunk-7-step2 fix).
         gen_rows = await conn.fetch(
             """
             SELECT g.id::text                  AS id,
                    g.sop_instance_id::text     AS sop_instance_id,
                    g.sop_template_task_id::text AS sop_template_task_id,
+                   st.seq_no                   AS template_seq_no,
+                   st.summary                  AS template_summary,
                    g.review_item_id::text      AS review_item_id,
                    ri.status::text             AS review_item_status,
                    g.task_id::text             AS task_id,
@@ -556,10 +613,11 @@ async def get_sop_instance(
                    t.summary                   AS task_summary,
                    g.manually_overridden_fields AS manually_overridden_fields
             FROM sop_generated_tasks g
-            LEFT JOIN review_items ri ON ri.id = g.review_item_id
-            LEFT JOIN tasks t        ON t.id = g.task_id
+            JOIN sop_template_tasks st ON st.id = g.sop_template_task_id
+            LEFT JOIN review_items ri  ON ri.id = g.review_item_id
+            LEFT JOIN tasks t          ON t.id = g.task_id
             WHERE g.sop_instance_id = $1::uuid
-            ORDER BY g.id
+            ORDER BY st.seq_no, g.created_at, g.id
             """,
             instance_row["id"],
         )
