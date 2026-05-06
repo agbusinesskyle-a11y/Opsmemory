@@ -68,55 +68,15 @@ def _require_user(principal: Principal) -> None:
 # Pydantic bodies
 # ---------------------------------------------------------------------------
 
-# Codex chunk-10-step3b1 plan-review (1+5): schedule semantics are
-# now validated server-side. Without this, hour=99 / kind='event' /
-# missing weekday would silently save and a future scheduler run
-# would crash mid-job. Validation is intentionally minimal — the
-# scheduler module (step 4) will share the same validator.
-_SCHEDULE_KINDS = frozenset({"daily", "weekly"})
-_WEEKDAYS = frozenset({"mon", "tue", "wed", "thu", "fri", "sat", "sun"})
-
-# Best-effort timezone whitelist. We don't import zoneinfo here to
-# keep this module dependency-free; the operator's deploy ships
-# tzdata. Pattern: 'Region/City' or 'UTC'. The scheduler does the
-# real resolve at fire time.
-import re as _re
-_TIMEZONE_RE = _re.compile(r"^(UTC|[A-Z][A-Za-z_]+/[A-Z][A-Za-z_]+(/[A-Z][A-Za-z_]+)?)$")
-
-
-def _validate_schedule_object(schedule: dict) -> None:
-    """Raise ValueError on bad schedule shape. Used by PrefPatchBody.
-    Step 4 (digest scheduler) will import this for fire-time validation
-    so client and scheduler can never disagree.
-    """
-    kind = schedule.get("kind")
-    if kind not in _SCHEDULE_KINDS:
-        raise ValueError(
-            f"schedule.kind must be one of {sorted(_SCHEDULE_KINDS)}; got {kind!r}"
-        )
-    # Codex chunk-10-step3b1-close (blocker 2): bool is an int
-    # subclass in Python, so isinstance(True, int) is True. Use a
-    # strict type check so JSON `true`/`false` doesn't slip through
-    # as 1/0.
-    hour = schedule.get("hour")
-    if type(hour) is not int or not (0 <= hour <= 23):
-        raise ValueError(f"schedule.hour must be int 0..23; got {hour!r}")
-    minute = schedule.get("minute")
-    if type(minute) is not int or not (0 <= minute <= 59):
-        raise ValueError(f"schedule.minute must be int 0..59; got {minute!r}")
-    tz = schedule.get("timezone")
-    if not isinstance(tz, str) or not _TIMEZONE_RE.match(tz):
-        raise ValueError(
-            "schedule.timezone must be a string IANA tz id "
-            "(e.g. 'America/Phoenix' or 'UTC')"
-        )
-    if kind == "weekly":
-        weekday = schedule.get("weekday")
-        if weekday not in _WEEKDAYS:
-            raise ValueError(
-                f"schedule.weekday required for weekly kind; "
-                f"must be one of {sorted(_WEEKDAYS)}; got {weekday!r}"
-            )
+# Codex chunk-10-step3c-close STEP 4 PLAN (2): the schedule contract
+# is now owned by api/app/notifications/schedule.py. Both this module
+# (PATCH body validator) and the scheduler import the same validator
+# so they can never disagree at runtime.
+from .notifications.schedule import (
+    validate_schedule_object as _validate_schedule_object,
+    SCHEDULE_KINDS as _SCHEDULE_KINDS,
+    WEEKDAY_SET as _WEEKDAYS,
+)
 
 
 class PrefPatchBody(BaseModel):
