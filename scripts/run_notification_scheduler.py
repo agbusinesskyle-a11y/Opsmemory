@@ -57,6 +57,10 @@ from api.app.notifications.sender import (  # noqa: E402
     preflight_sender,
     send_one,
 )
+from api.app.notifications.slack_sender import (  # noqa: E402
+    preflight_n8n,
+    send_one_slack,
+)
 
 
 log = logging.getLogger("opsmemory.run_notification_scheduler")
@@ -88,12 +92,20 @@ async def main_async(args: argparse.Namespace) -> int:
 
     # Preflight before opening the pool so a misconfigured deploy
     # exits 1 fast without DB churn (Codex COMMIT 3 PLAN).
+    # Step 6: also preflight n8n config when send_mode is on so a
+    # missing webhook URL fails fast like a missing VAPID key.
     vapid = None
+    n8n_config = None
     if send_mode:
         try:
             vapid = preflight_sender()
         except RuntimeError as exc:
             print(f"ERROR: sender preflight failed: {exc}", file=sys.stderr)
+            return 1
+        try:
+            n8n_config = preflight_n8n()
+        except RuntimeError as exc:
+            print(f"ERROR: slack sender preflight failed: {exc}", file=sys.stderr)
             return 1
 
     lookback = int(
@@ -170,17 +182,87 @@ async def main_async(args: argparse.Namespace) -> int:
                     else:
                         tag = "[DRY-RUN]"
 
-                    if due.channel != "web_push" and send_mode:
-                        # Codex chunk-10-step5c2-close COMMIT 3 PLAN:
-                        # send mode handles only web_push for now.
-                        # slack_dm / email_digest senders land in
-                        # step 6 / a future module.
+                    if due.channel == "email_digest" and send_mode:
+                        # Step 6 only ships web_push + slack_dm
+                        # senders. email_digest stays a no-op for
+                        # now.
                         print(
                             f"[SEND-SKIP] {due.scheduled_for.isoformat()} "
                             f"channel={due.channel} user={user_label} "
                             f"reason=channel_unsupported_in_send_mode"
                         )
                         skipped_unsupported += 1
+                        continue
+
+                    if due.channel == "slack_dm" and send_mode:
+                        # Step 6: claim a single notification_
+                        # deliveries row (web_push_subscription_id
+                        # stays NULL — invariant enforced inside
+                        # claim_delivery), then ship via the n8n
+                        # webhook bridge.
+                        if not due.user_email:
+                            print(
+                                f"[SEND-SKIP] {due.scheduled_for.isoformat()} "
+                                f"channel=slack_dm user={user_label} "
+                                f"reason=user_email_missing"
+                            )
+                            skipped_unsupported += 1
+                            continue
+                        key = idempotency_key(due.pref_id, due.scheduled_for)
+                        delivery_id = await claim_delivery(
+                            conn, due=due, payload=payload,
+                        )
+                        if delivery_id is None:
+                            print(
+                                f"[CLAIM-SKIP] {due.scheduled_for.isoformat()} "
+                                f"channel=slack_dm user={user_label} "
+                                f"key={key} reason=already_claimed"
+                            )
+                            skipped_claim += 1
+                            continue
+                        send_status = None
+                        send_http = None
+                        send_code = None
+                        try:
+                            result = await send_one_slack(
+                                conn,
+                                delivery_id=delivery_id,
+                                user_id=due.user_id,
+                                pref_id=due.pref_id,
+                                user_email=due.user_email,
+                                user_display_name=due.user_display_name,
+                                payload=payload,
+                                n8n_config=n8n_config,
+                            )
+                            send_status = result.status
+                            send_http = result.http_status
+                            send_code = result.code
+                            if result.status == "sent":
+                                sent += 1
+                            else:
+                                send_failed += 1
+                        except Exception:
+                            send_errors += 1
+                            send_status = "error"
+                            log.exception(
+                                "scheduler_slack_send_error",
+                                extra={
+                                    "delivery_id": delivery_id,
+                                    "pref_id": due.pref_id,
+                                },
+                            )
+                        print(
+                            f"[SEND] {due.scheduled_for.isoformat()} "
+                            f"channel=slack_dm user={user_label} "
+                            f"tasks={len(tasks)} total={total_count} "
+                            f"key={key} delivery_id={delivery_id} "
+                            f"send={send_status or '-'} "
+                            f"http={send_http or '-'} "
+                            f"code={send_code or '-'} "
+                            f"title={payload['title']!r}"
+                        )
+                        delivered += 1
+                        emitted += 1
                         continue
 
                     if due.channel == "web_push":
