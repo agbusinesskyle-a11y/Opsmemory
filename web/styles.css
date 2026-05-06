@@ -425,3 +425,87 @@ ul.businesses li {
 }
 .rv-pending { font-size: 13px; }
 .rv-action-err { margin-top: 10px; }
+
+/* ---- Sync badge in header view-tabs ---- */
+.sync-slot { margin-left: auto; padding-right: 8px; }
+.sync-badge {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  background: var(--pill-bg);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  font-weight: 600;
+}
+.sync-badge.synced  { background: rgba(0, 150, 0, 0.20); color: #2a8c2a; }
+.sync-badge.pending { background: rgba(220, 140, 0, 0.20); color: #c87a00; }
+.sync-badge.conflict { background: rgba(220, 70, 70, 0.20); color: var(--error-fg); }
+.sync-badge.offline { background: rgba(120, 120, 120, 0.20); color: var(--muted); }
+.sync-badge.stale   { background: rgba(180, 130, 60, 0.20); color: #b07a30; }
+
+/* ---- Per-task optimistic + conflict badges ---- */
+.task.optimistic { opacity: 0.85; }
+.task.has-conflict { border-color: var(--error-border); }
+.opt-badge {
+  font-size: 11px;
+  background: rgba(220, 140, 0, 0.20);
+  color: #c87a00;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 4px;
+}
+.conflict-badge {
+  font-size: 11px;
+  background: var(--error-bg);
+  color: var(--error-fg);
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 4px;
+  font-weight: 600;
+}
+
+/* ---- Done / Reopen action buttons in expanded task ---- */
+.task-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 8px;
+}
+.task-complete, .task-reopen {
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  font-size: 14px;
+  cursor: pointer;
+  background: var(--tile);
+  color: var(--fg);
+}
+.task-complete:hover:not([disabled]) { background: rgba(0, 150, 0, 0.18); }
+.task-reopen:hover:not([disabled])   { background: rgba(0, 100, 200, 0.15); }
+.task-complete[disabled],
+.task-reopen[disabled] { opacity: 0.5; cursor: wait; }
+
+/* ---- Conflict block in task detail ---- */
+.task-conflict {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--error-border);
+  background: var(--error-bg);
+  border-radius: 0 4px 4px 0;
+}
+.task-conflict .conflict-msg {
+  font-size: 13px;
+  color: var(--error-fg);
+  margin-bottom: 8px;
+}
+.task-conflict button {
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--tile);
+  color: var(--fg);
+  font-size: 13px;
+  cursor: pointer;
+  margin-right: 6px;
+}
+.task-conflict .conflict-retry:hover { background: rgba(0, 100, 200, 0.15); }
+.task-conflict .conflict-discard:hover { background: var(--error-bg); }

@@ -31,6 +31,17 @@ const state = {
     pendingAction: null,        // 'approve' | 'reject' | null while a write is in flight
     actionError: null,
   },
+  // Sync indicator state. The header pill reads from these.
+  sync: {
+    online: (typeof navigator !== 'undefined') ? navigator.onLine : true,
+    pending: 0,                 // count of mutations waiting to apply
+    conflict: 0,                // count of mutations in 'conflict' state
+    fromCache: false,            // last /v1/tasks render came from SW cache
+  },
+  // Per-task optimistic patches keyed by task_id. Used to overlay
+  // pending in-flight mutations on the rendered task. Cleared when a
+  // mutation reaches a terminal state.
+  optimistic: {},
 };
 
 // ---------------------------------------------------------------------------
@@ -50,13 +61,17 @@ async function api(path, opts) {
   const res = await fetch(path, init);
   let body = null;
   try { body = await res.json(); } catch { /* may be empty */ }
-  if (res.status === 401) throw { kind: 'auth', message: 'Session expired. Refresh the page.' };
-  if (res.status === 403) throw { kind: 'forbidden', message: 'You don\'t have permission for that.' };
-  if (res.status === 404) throw { kind: 'not_found', message: 'Not found.', body };
-  if (res.status === 409) throw { kind: 'conflict', message: 'Conflict — the underlying task changed. Re-check and retry.', body };
-  if (res.status === 422) throw { kind: 'validation', message: 'Validation failed.', body };
-  if (res.status === 501) throw { kind: 'not_implemented', message: 'Not implemented yet.', body };
-  if (!res.ok) throw { kind: 'server', message: `Server returned ${res.status}.`, body };
+  // Pick up the SW's stale-cache marker for /v1/tasks reads.
+  if (res.headers && res.headers.get('X-OpsMemory-From-Cache') === '1') {
+    state.sync.fromCache = true;
+  }
+  if (res.status === 401) throw { kind: 'auth', message: 'Session expired. Refresh the page.', status: 401 };
+  if (res.status === 403) throw { kind: 'forbidden', message: 'You don\'t have permission for that.', status: 403 };
+  if (res.status === 404) throw { kind: 'not_found', message: 'Not found.', body, status: 404 };
+  if (res.status === 409) throw { kind: 'conflict', message: 'Conflict — the underlying task changed. Re-check and retry.', body, status: 409 };
+  if (res.status === 422) throw { kind: 'validation', message: 'Validation failed.', body, status: 422 };
+  if (res.status === 501) throw { kind: 'not_implemented', message: 'Not implemented yet.', body, status: 501 };
+  if (!res.ok) throw { kind: 'server', message: `Server returned ${res.status}.`, body, status: res.status };
   return body;
 }
 
@@ -108,6 +123,21 @@ async function rejectReview(reviewId, reason) {
                    { method: 'POST', body });
 }
 
+// ---------- Client mutations (Chunk 6 step 1 contract + step 3 outbox) ----------
+
+async function postToggleDone(taskId, body) {
+  return await api('/v1/tasks/' + encodeURIComponent(taskId) + '/toggle_done',
+                   { method: 'POST', body });
+}
+
+async function refetchTask(taskId) {
+  // Used by the conflict-recovery path to reload the canonical state
+  // from the server after a 409. SW serves /v1/tasks list cached
+  // (network-first), but /v1/tasks/{id} is network-only.
+  const data = await api('/v1/tasks/' + encodeURIComponent(taskId));
+  return data.task;
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -146,6 +176,24 @@ function fmtRelative(iso) {
   } catch { return iso; }
 }
 
+function renderSyncBadge() {
+  const s = state.sync;
+  if (!s.online) {
+    const extra = s.pending ? ` (${s.pending} pending)` : '';
+    return `<span class="sync-badge offline">offline${escapeHtml(extra)}</span>`;
+  }
+  if (s.conflict > 0) {
+    return `<span class="sync-badge conflict">${s.conflict} conflict</span>`;
+  }
+  if (s.pending > 0) {
+    return `<span class="sync-badge pending">${s.pending} pending</span>`;
+  }
+  if (s.fromCache) {
+    return `<span class="sync-badge stale">cached</span>`;
+  }
+  return `<span class="sync-badge synced">synced</span>`;
+}
+
 function renderHeader() {
   const p = state.principal;
   if (!p) return '';
@@ -159,6 +207,7 @@ function renderHeader() {
       ${isAdmin
         ? `<button class="view-tab${state.view === 'review' ? ' active' : ''}" data-view="review">Review</button>`
         : ''}
+      <span class="sync-slot">${renderSyncBadge()}</span>
     </div>
   `;
   return `
@@ -192,14 +241,24 @@ function renderFilters() {
 }
 
 function renderTask(task) {
-  const expanded = state.expandedTaskId === task.id;
+  const view = effectiveTask(task);
+  const expanded = state.expandedTaskId === view.id;
   const detail = expanded ? state.expandedTaskDetail : null;
+  const optimistic = !!state.optimistic[view.id];
+  const conflictMutation = (state.outboxByTask && state.outboxByTask[view.id])
+    ? state.outboxByTask[view.id].conflict : null;
 
-  const dueLine = task.due_at
-    ? `<div class="task-due">due ${escapeHtml(fmtDate(task.due_at))}</div>`
+  const dueLine = view.due_at
+    ? `<div class="task-due">due ${escapeHtml(fmtDate(view.due_at))}</div>`
     : '';
-  const depLine = task.dependency_text
-    ? `<div class="task-dep">⏸ waiting on ${escapeHtml(task.dependency_text)}</div>`
+  const depLine = view.dependency_text
+    ? `<div class="task-dep">⏸ waiting on ${escapeHtml(view.dependency_text)}</div>`
+    : '';
+  const optimisticBadge = optimistic
+    ? `<span class="opt-badge">syncing…</span>`
+    : '';
+  const conflictBadge = conflictMutation
+    ? `<span class="conflict-badge">conflict</span>`
     : '';
 
   let detailBlock = '';
@@ -213,6 +272,18 @@ function renderTask(task) {
     const fieldVersionsList = Object.entries(detail.field_versions || {})
       .map(([k, v]) => `<code>${escapeHtml(k)}: v${v}</code>`)
       .join(' ');
+    const toggleLabel = view.status === 'done' ? 'Reopen' : 'Mark done';
+    const toggleClass = view.status === 'done' ? 'task-reopen' : 'task-complete';
+    const toggleDisabled = optimistic ? 'disabled' : '';
+    const conflictBlock = conflictMutation
+      ? `<div class="task-conflict">
+           <div class="conflict-msg">
+             Conflict on last change: <code>${escapeHtml(conflictMutation.last_error || 'task_version_moved')}</code>
+           </div>
+           <button class="conflict-retry" data-key="${escapeHtml(conflictMutation.idempotency_key)}">Retry from current</button>
+           <button class="conflict-discard" data-key="${escapeHtml(conflictMutation.idempotency_key)}">Discard</button>
+         </div>`
+      : '';
     detailBlock = `
       <div class="task-detail">
         ${detail.description ? `<div class="task-description">${escapeHtml(detail.description)}</div>` : ''}
@@ -231,15 +302,23 @@ function renderTask(task) {
           <div>Created: ${escapeHtml(fmtDate(detail.created_at))}</div>
           ${detail.completed_at ? `<div>Completed: ${escapeHtml(fmtDate(detail.completed_at))}</div>` : ''}
         </div>
+        ${conflictBlock}
+        <div class="task-actions">
+          <button class="${toggleClass}" data-task-id="${escapeHtml(view.id)}" ${toggleDisabled}>
+            ${toggleLabel}
+          </button>
+        </div>
       </div>
     `;
   }
 
   return `
-    <li class="task ${task.status}${expanded ? ' expanded' : ''}" data-task-id="${escapeHtml(task.id)}">
+    <li class="task ${view.status}${expanded ? ' expanded' : ''}${optimistic ? ' optimistic' : ''}${conflictMutation ? ' has-conflict' : ''}" data-task-id="${escapeHtml(view.id)}">
       <div class="task-header">
-        <div class="task-summary">${escapeHtml(task.summary)}</div>
-        <div class="task-status-pill ${task.status}">${escapeHtml(task.status)}</div>
+        <div class="task-summary">${escapeHtml(view.summary)}</div>
+        ${optimisticBadge}
+        ${conflictBadge}
+        <div class="task-status-pill ${view.status}">${escapeHtml(view.status)}</div>
       </div>
       ${dueLine}
       ${depLine}
@@ -497,8 +576,9 @@ function attachEventHandlers() {
 
   document.querySelectorAll('.task').forEach(li => {
     li.addEventListener('click', async (e) => {
-      // Don't toggle when clicking on inner links (none yet, but safe)
+      // Don't toggle when clicking on inner links/buttons in detail.
       if (e.target.closest('a')) return;
+      if (e.target.closest('button')) return;
       const taskId = li.dataset.taskId;
       if (state.expandedTaskId === taskId) {
         state.expandedTaskId = null;
@@ -522,6 +602,35 @@ function attachEventHandlers() {
         }
       }
       render();
+    });
+  });
+
+  // ----- Done / Reopen buttons (chunk 6 step 3) -----
+  document.querySelectorAll('.task-complete, .task-reopen').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const taskId = btn.dataset.taskId;
+      const local = getTaskFromState(taskId);
+      if (!local) return;
+      try {
+        await enqueueToggleDone(local);
+      } catch (err) {
+        renderError(err);
+      }
+    });
+  });
+
+  // ----- Conflict retry / discard -----
+  document.querySelectorAll('.conflict-retry').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await retryConflict(btn.dataset.key);
+    });
+  });
+  document.querySelectorAll('.conflict-discard').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await discardConflict(btn.dataset.key);
     });
   });
 }
@@ -564,6 +673,268 @@ function formatActionError(verb, err) {
 }
 
 // ---------------------------------------------------------------------------
+// Outbox-backed mutations (Chunk 6 step 3)
+// ---------------------------------------------------------------------------
+
+const REPLAY_BACKOFF_BASE_MS = 5_000;
+const REPLAY_BACKOFF_MAX_MS = 60_000;
+
+async function refreshSyncCounters() {
+  const Outbox = self.OpsMemoryOutbox;
+  if (!Outbox) return;
+  try {
+    const pending = await Outbox.getByStatus('pending');
+    const conflict = await Outbox.getByStatus('conflict');
+    state.sync.pending = pending.length;
+    state.sync.conflict = conflict.length;
+    // Index by task_id so renderTask can show the conflict marker
+    // (and future commits can show pending counts per task).
+    const byTask = {};
+    for (const m of pending) {
+      byTask[m.task_id] = byTask[m.task_id] || {};
+      byTask[m.task_id].pending = m;
+    }
+    for (const m of conflict) {
+      byTask[m.task_id] = byTask[m.task_id] || {};
+      byTask[m.task_id].conflict = m;
+    }
+    state.outboxByTask = byTask;
+  } catch (e) {
+    console.warn('[opsmemory] outbox count failed:', e);
+  }
+}
+
+async function hydrateOptimisticFromOutbox() {
+  // On PWA reload, restore the optimistic overlay for any 'pending'
+  // mutations in the outbox so the UI matches what the user clicked
+  // before the reload. Replay then resolves them.
+  const Outbox = self.OpsMemoryOutbox;
+  if (!Outbox) return;
+  try {
+    const pending = await Outbox.getByStatus('pending');
+    for (const m of pending) {
+      if (m.optimistic_patch) applyOptimistic(m.task_id, m.optimistic_patch);
+    }
+  } catch (e) {
+    console.warn('[opsmemory] hydrate from outbox failed:', e);
+  }
+}
+
+function applyOptimistic(taskId, patch) {
+  state.optimistic[taskId] = Object.assign({}, state.optimistic[taskId] || {}, patch);
+}
+
+function clearOptimistic(taskId) {
+  delete state.optimistic[taskId];
+}
+
+function effectiveTask(task) {
+  // Overlay any in-flight optimistic patch over the server-known task.
+  const patch = state.optimistic[task.id];
+  if (!patch) return task;
+  return Object.assign({}, task, patch);
+}
+
+function getTaskFromState(taskId) {
+  return state.tasks.find(function (t) { return t.id === taskId; });
+}
+
+async function enqueueToggleDone(task) {
+  const Outbox = self.OpsMemoryOutbox;
+  if (!Outbox) {
+    throw { kind: 'local', message: 'Outbox not available — reload the page.' };
+  }
+  const goingToDone = task.status !== 'done';
+  // The PWA tasks list /v1/tasks doesn't currently return field
+  // versions per task. Send empty base_field_versions; the server
+  // skips the per-field compare (whole-task version is still
+  // checked). Once /v1/tasks is extended to include field versions,
+  // populate the relevant subset (status / completed_* / etc.).
+  const body = {
+    idempotency_key: Outbox.newKey(),
+    base_task_version: task.version,
+    base_field_versions: {},
+    completion_note: null,
+  };
+  const previous_task_snapshot = {
+    id: task.id,
+    status: task.status,
+    version: task.version,
+    completed_at: task.completed_at,
+    completed_by: task.completed_by,
+    completion_note: task.completion_note,
+  };
+  const optimistic_patch = goingToDone
+    ? { status: 'done' }
+    : { status: 'open', completed_at: null, completed_by: null, completion_note: null };
+
+  await Outbox.enqueue({
+    idempotency_key: body.idempotency_key,
+    principal_id: state.principal && state.principal.id,
+    action: 'toggle_done',
+    method: 'POST',
+    path: '/v1/tasks/' + encodeURIComponent(task.id) + '/toggle_done',
+    task_id: task.id,
+    body: body,
+    base_task_version: body.base_task_version,
+    base_field_versions: body.base_field_versions,
+    previous_task_snapshot: previous_task_snapshot,
+    optimistic_patch: optimistic_patch,
+  });
+  applyOptimistic(task.id, optimistic_patch);
+  await refreshSyncCounters();
+  render();
+  // Try to flush immediately when online; offline replay fires on
+  // window 'online'.
+  replayOutbox().catch(function (e) {
+    console.warn('[opsmemory] replayOutbox after enqueue failed:', e);
+  });
+}
+
+let _replayInFlight = false;
+
+async function replayOutbox() {
+  if (_replayInFlight) return;
+  if (!navigator.onLine) return;
+  const Outbox = self.OpsMemoryOutbox;
+  if (!Outbox) return;
+  _replayInFlight = true;
+  try {
+    const pending = await Outbox.getByStatus('pending');
+    // Sort by created_at to replay in order (the server's idempotency
+    // ledger doesn't care, but the user's expectation does).
+    pending.sort(function (a, b) {
+      return (a.created_at || '').localeCompare(b.created_at || '');
+    });
+    const now = Date.now();
+    for (const m of pending) {
+      // Backoff gate.
+      if (m.next_attempt_at && Date.parse(m.next_attempt_at) > now) continue;
+      await replayOne(m);
+    }
+  } finally {
+    _replayInFlight = false;
+    await refreshSyncCounters();
+    render();
+  }
+}
+
+async function replayOne(m) {
+  const Outbox = self.OpsMemoryOutbox;
+  if (m.action !== 'toggle_done') {
+    // Future actions land in subsequent commits; for now the only
+    // outbox shape is toggle_done.
+    await Outbox.update(m.idempotency_key, {
+      status: 'rejected',
+      last_error: 'unknown_action_in_outbox',
+    });
+    clearOptimistic(m.task_id);
+    return;
+  }
+  try {
+    const result = await postToggleDone(m.task_id, m.body);
+    await Outbox.update(m.idempotency_key, {
+      status: 'applied',
+      last_status: 200,
+      server_payload: result,
+    });
+    // Pull server state into the local task list. Don't blindly
+    // refresh the whole list (would erase other in-flight optimistic
+    // patches); patch the affected task.
+    const local = getTaskFromState(m.task_id);
+    if (local) {
+      Object.assign(local, {
+        status: result.status,
+        version: result.version,
+        completed_at: result.completed_at || null,
+        completed_by: result.completed_by || null,
+        completion_note: result.completion_note || null,
+      });
+    }
+    clearOptimistic(m.task_id);
+  } catch (err) {
+    await handleReplayError(m, err);
+  }
+}
+
+async function handleReplayError(m, err) {
+  const Outbox = self.OpsMemoryOutbox;
+  if (err.kind === 'conflict') {
+    // The server has a different version. Pull canonical state so the
+    // user can decide. Revert the optimistic patch.
+    let server_task = null;
+    try { server_task = await refetchTask(m.task_id); } catch (e) {
+      console.warn('[opsmemory] refetch after 409 failed:', e);
+    }
+    await Outbox.update(m.idempotency_key, {
+      status: 'conflict',
+      last_status: 409,
+      last_error: (err.body && err.body.detail && err.body.detail.code) || 'task_version_moved',
+      server_payload: server_task || (err.body || null),
+      attempt_count: (m.attempt_count || 0) + 1,
+    });
+    if (server_task) {
+      const local = getTaskFromState(m.task_id);
+      if (local) Object.assign(local, server_task);
+    }
+    clearOptimistic(m.task_id);
+    return;
+  }
+  if (err.kind === 'validation' || err.kind === 'not_found' ||
+      err.kind === 'forbidden' || err.kind === 'auth' ||
+      err.kind === 'not_implemented') {
+    // Deterministic server reject. Don't retry; revert optimistic UI.
+    await Outbox.update(m.idempotency_key, {
+      status: 'rejected',
+      last_status: err.status || null,
+      last_error: (err.body && err.body.detail && err.body.detail.code) || err.kind,
+      server_payload: err.body || null,
+      attempt_count: (m.attempt_count || 0) + 1,
+    });
+    clearOptimistic(m.task_id);
+    return;
+  }
+  // Transient: network throw or 5xx. Schedule backoff retry.
+  const attempt = (m.attempt_count || 0) + 1;
+  const delay = Math.min(REPLAY_BACKOFF_MAX_MS,
+                          REPLAY_BACKOFF_BASE_MS * Math.pow(2, attempt - 1));
+  await Outbox.update(m.idempotency_key, {
+    last_status: err.status || null,
+    last_error: err.message || 'network_error',
+    attempt_count: attempt,
+    next_attempt_at: new Date(Date.now() + delay).toISOString(),
+  });
+}
+
+async function discardConflict(idempotency_key) {
+  const Outbox = self.OpsMemoryOutbox;
+  if (!Outbox) return;
+  await Outbox.discard(idempotency_key);
+  await refreshSyncCounters();
+  render();
+}
+
+async function retryConflict(idempotency_key) {
+  const Outbox = self.OpsMemoryOutbox;
+  if (!Outbox) return;
+  const m = await Outbox.getByKey(idempotency_key);
+  if (!m) return;
+  // Rebuild from current server state. The user is saying "now try
+  // again" — so re-base on whatever the server has.
+  const task = getTaskFromState(m.task_id);
+  if (!task) {
+    await Outbox.update(idempotency_key, { status: 'discarded',
+                                            last_error: 'task_not_in_view' });
+    await refreshSyncCounters();
+    render();
+    return;
+  }
+  // Discard the old conflicted mutation, enqueue a fresh one.
+  await Outbox.discard(idempotency_key);
+  await enqueueToggleDone(task);
+}
+
+// ---------------------------------------------------------------------------
 // Service worker (chunk 1: pass-through; chunk 6 will add caching)
 // ---------------------------------------------------------------------------
 
@@ -577,14 +948,48 @@ async function registerServiceWorker() {
 // Boot
 // ---------------------------------------------------------------------------
 
+function attachConnectivityHandlers() {
+  function setOnline(online) {
+    state.sync.online = online;
+    render();
+    if (online) {
+      // Try to flush any pending mutations the moment we're back.
+      replayOutbox().catch(function () {});
+    }
+  }
+  window.addEventListener('online', function () { setOnline(true); });
+  window.addEventListener('offline', function () { setOnline(false); });
+  // Also poll on visibilitychange — a tab brought back to foreground
+  // after a long sleep may have stale connectivity state.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && navigator.onLine) {
+      replayOutbox().catch(function () {});
+    }
+  });
+}
+
 (async function () {
   try {
     state.principal = await loadPrincipal();
     state.businesses = await loadBusinesses();
+    // Outbox bootstrap: bring back any optimistic patches the user
+    // queued before this reload, then refresh sync counters before
+    // the first render so the header badge is accurate.
+    await hydrateOptimisticFromOutbox();
+    await refreshSyncCounters();
     await refreshTasks();
     registerServiceWorker();
+    attachConnectivityHandlers();
+    // Best-effort initial replay; if offline this is a no-op.
+    replayOutbox().catch(function () {});
+    // Small periodic flush so backoff entries get re-tried while the
+    // app stays open (in addition to event-triggered replays).
+    setInterval(function () {
+      replayOutbox().catch(function () {});
+    }, 10_000);
   } catch (err) {
     renderError(err);
     registerServiceWorker();
+    attachConnectivityHandlers();
   }
 })();

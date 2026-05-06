@@ -217,6 +217,14 @@ async def serve_appjs() -> FileResponse:
     return FileResponse(path, media_type="application/javascript")
 
 
+@app.get("/outbox.js")
+async def serve_outbox() -> FileResponse:
+    path = _safe_web_path("outbox.js")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path, media_type="application/javascript")
+
+
 @app.get("/manifest.json")
 async def serve_manifest() -> FileResponse:
     path = _safe_web_path("manifest.json")

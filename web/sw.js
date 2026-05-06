@@ -26,7 +26,7 @@
 //   server sends Cache-Control: no-cache on /sw.js per main.py changes).
 //   Bumping BUILD invalidates old shell caches at activate time.
 
-const BUILD = '6153568';
+const BUILD = '643f117';
 const SHELL_CACHE = `opsmemory-shell-${BUILD}`;
 const TASKS_CACHE = `opsmemory-tasks-${BUILD}`;
 
@@ -35,6 +35,7 @@ const TASKS_CACHE = `opsmemory-tasks-${BUILD}`;
 const SHELL_URLS_REQUIRED = [
   '/',
   '/app.js',
+  '/outbox.js',
   '/styles.css',
   '/manifest.json',
 ];
@@ -119,6 +120,7 @@ self.addEventListener('fetch', function (event) {
 function isShellAsset(url) {
   if (url.pathname === '/') return true;
   if (url.pathname === '/app.js') return true;
+  if (url.pathname === '/outbox.js') return true;
   if (url.pathname === '/styles.css') return true;
   if (url.pathname === '/manifest.json') return true;
   if (url.pathname.startsWith('/icons/')) return true;
