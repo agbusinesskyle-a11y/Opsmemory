@@ -90,23 +90,35 @@ async def main_async(args: argparse.Namespace) -> int:
     claim_mode = (args.claim or args.send) and not env_dry
     dry_run = not claim_mode
 
-    # Preflight before opening the pool so a misconfigured deploy
-    # exits 1 fast without DB churn (Codex COMMIT 3 PLAN).
-    # Step 6: also preflight n8n config when send_mode is on so a
-    # missing webhook URL fails fast like a missing VAPID key.
+    # Codex chunk-10-step6-close: per-channel preflight is LAZY.
+    # If the operator only has web_push prefs configured (no
+    # slack_dm enabled for any user), an unset n8n webhook should
+    # NOT block the run. Same in reverse. Each channel's preflight
+    # runs the first time we encounter that channel's row; on
+    # failure we skip that channel for the rest of the run with a
+    # clear log line.
     vapid = None
+    vapid_preflight_error: str | None = None
     n8n_config = None
-    if send_mode:
+    n8n_preflight_error: str | None = None
+
+    def _ensure_vapid():
+        nonlocal vapid, vapid_preflight_error
+        if vapid is not None or vapid_preflight_error is not None:
+            return
         try:
             vapid = preflight_sender()
         except RuntimeError as exc:
-            print(f"ERROR: sender preflight failed: {exc}", file=sys.stderr)
-            return 1
+            vapid_preflight_error = str(exc)
+
+    def _ensure_n8n():
+        nonlocal n8n_config, n8n_preflight_error
+        if n8n_config is not None or n8n_preflight_error is not None:
+            return
         try:
             n8n_config = preflight_n8n()
         except RuntimeError as exc:
-            print(f"ERROR: slack sender preflight failed: {exc}", file=sys.stderr)
-            return 1
+            n8n_preflight_error = str(exc)
 
     lookback = int(
         os.environ.get("NOTIFICATIONS_LOOKBACK_MINUTES", str(DEFAULT_LOOKBACK_MINUTES))
@@ -200,6 +212,16 @@ async def main_async(args: argparse.Namespace) -> int:
                         # stays NULL — invariant enforced inside
                         # claim_delivery), then ship via the n8n
                         # webhook bridge.
+                        _ensure_n8n()
+                        if n8n_preflight_error is not None:
+                            print(
+                                f"[SEND-SKIP] {due.scheduled_for.isoformat()} "
+                                f"channel=slack_dm user={user_label} "
+                                f"reason=channel_preflight_failed "
+                                f"detail={n8n_preflight_error!r}"
+                            )
+                            skipped_unsupported += 1
+                            continue
                         if not due.user_email:
                             print(
                                 f"[SEND-SKIP] {due.scheduled_for.isoformat()} "
@@ -266,6 +288,17 @@ async def main_async(args: argparse.Namespace) -> int:
                         continue
 
                     if due.channel == "web_push":
+                        if send_mode:
+                            _ensure_vapid()
+                            if vapid_preflight_error is not None:
+                                print(
+                                    f"[SEND-SKIP] {due.scheduled_for.isoformat()} "
+                                    f"channel=web_push user={user_label} "
+                                    f"reason=channel_preflight_failed "
+                                    f"detail={vapid_preflight_error!r}"
+                                )
+                                skipped_unsupported += 1
+                                continue
                         # Codex chunk-10-step5 plan-review: one row
                         # per (pref, fire, active subscription).
                         subs = await list_active_subscriptions(
