@@ -8,3 +8,13 @@ PyJWT[crypto]==2.10.1
 # (openpyxl's PyPI page flags this as opt-in).
 openpyxl==3.1.5
 defusedxml==0.7.1
+# Chunk 10 step 5: Web Push sender. pywebpush implements RFC 8291
+# (encrypted payload to a PushSubscription) and RFC 8292 (VAPID
+# JWT signing). It depends on cryptography, which we already get
+# transitively via PyJWT[crypto].
+pywebpush==2.0.0
+# Chunk 10 step 4 close (j): tzdata Python wheel as a belt-and-
+# braces backup to the apt tzdata package. The notification
+# scheduler resolves IANA tz names at fire time and main.lifespan
+# fails fast if ZoneInfo('America/Phoenix') doesn't resolve.
+tzdata==2024.2
