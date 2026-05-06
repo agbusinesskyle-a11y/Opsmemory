@@ -43,6 +43,31 @@ def require_admin(principal: Principal) -> None:
     )
 
 
+# Standard scope strings issued by scripts/bootstrap_service_account.py.
+# These are the only scopes wired into authz.require_scope below; new
+# scopes ship with the route that consumes them.
+SCOPE_INGEST_WRITE = "ingest:write"
+SCOPE_TASKS_READ_ALL = "tasks:read:all"
+SCOPE_BUSINESSES_READ = "businesses:read"
+
+
+def require_scope(principal: Principal, scope: str) -> None:
+    """Allow if principal is admin user OR service-with-scope.
+
+    Owners do not have scopes — they get role-based access via the routes
+    that don't call this helper. require_scope is the gate for endpoints
+    that admit machine callers (e.g. ingest endpoints called by n8n).
+    """
+    if principal.principal_type == "user" and principal.role == "admin":
+        return
+    if scope in (principal.scopes or []):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=f"scope '{scope}' required",
+    )
+
+
 def visible_business_ids(principal: Principal) -> list[str] | None:
     """Return business ids the principal can see, or None for unrestricted.
 

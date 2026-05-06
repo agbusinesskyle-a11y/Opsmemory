@@ -43,6 +43,7 @@ class Principal:
     role: str
     businesses: list[dict[str, Any]] = field(default_factory=list)
     permissions: dict[str, bool] = field(default_factory=dict)
+    scopes: list[str] = field(default_factory=list)
     auth_method: str = ""
 
 
@@ -325,6 +326,7 @@ async def _load_service(request: Request, raw_key: str) -> Principal:
         role="service",
         businesses=[],
         permissions=_permissions("service", scopes),
+        scopes=scopes,
         auth_method="service_key",
     )
 
