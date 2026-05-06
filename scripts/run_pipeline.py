@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
 """Run the OpsMemory reconciliation pipeline once over pending events.
 
-Polls `ingest_events` for rows with `status IN ('received', 'failed')`
-and processes each through the 6-step pipeline (extract -> normalize ->
-retrieve -> choose -> validate -> queue review).
+Atomically claims rows from `ingest_events` whose status is `received`,
+`failed`, or `extracting` (and stale, i.e. processing_started_at older
+than INGEST_PIPELINE_STALE_MINUTES). Each claim flips status to
+`extracting` in the same statement under FOR UPDATE SKIP LOCKED, so two
+concurrent workers cannot double-process the same event.
 
-Designed to be invoked manually (one-shot) or via a systemd timer
-(future). NOT a long-running daemon.
+Pipeline steps (extract -> normalize -> retrieve -> choose -> validate
+-> queue review) run per claimed event.
+
+Designed to be invoked manually (one-shot) or via a systemd timer.
+NOT a long-running daemon.
 
 Usage:
     python3 scripts/run_pipeline.py [--limit N] [--source meeting_recap]
 
 Environment:
-    DATABASE_URL                runtime DSN (use opsmemory_owner for now;
-                                pipeline writes ingest_events.status,
-                                inserts review_items + llm_calls)
-    INGEST_LLM_EXTRACT_MODELS   ordered fallback chain (default: 'mock')
-    INGEST_LLM_CHOOSE_MODELS    same shape; local llama excluded by code
-    LITELLM_BASE_URL            litellm proxy URL
-    LITELLM_API_KEY             litellm api key
-    INGEST_PIPELINE_LIMIT       max events per invocation (default: 50)
+    DATABASE_URL                  runtime DSN (use opsmemory_owner for now;
+                                  pipeline writes ingest_events.status,
+                                  inserts review_items + llm_calls)
+    INGEST_LLM_EXTRACT_MODELS     ordered fallback chain (default: 'mock')
+    INGEST_LLM_CHOOSE_MODELS      same shape; local llama excluded by code
+    LITELLM_BASE_URL              litellm proxy URL
+    LITELLM_API_KEY               litellm api key
+    INGEST_PIPELINE_LIMIT         max events per invocation (default: 50)
+    INGEST_PIPELINE_STALE_MINUTES re-claim threshold for stuck `extracting`
+                                  rows (default: 10)
+    ENVIRONMENT                   when 'production', mock LLM models are
+                                  refused (fail-closed; see llm_client.py)
 
 Exit codes:
     0  success — N events processed (may be 0)
@@ -56,27 +65,50 @@ async def main_async(args: argparse.Namespace) -> int:
         print("ERROR: DATABASE_URL or ACTION_TRACKER_DATABASE_URL must be set", file=sys.stderr)
         return 1
 
+    stale_minutes = int(os.environ.get("INGEST_PIPELINE_STALE_MINUTES", "10"))
+
     pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=2)
     try:
+        # Atomic claim: pick up to `limit` rows whose status is received,
+        # failed, or stale-extracting; flip them to extracting in the same
+        # statement; return their ids. SKIP LOCKED stops two workers from
+        # racing for the same row.
+        claimed_rows: list[dict] = []
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id::text AS id, source FROM ingest_events
-                WHERE status IN ('received', 'failed')
-                  AND ($1::text IS NULL OR source = $1)
-                ORDER BY received_at
-                LIMIT $2
-                """,
-                args.source,
-                args.limit,
-            )
-        if not rows:
+            for _ in range(args.limit):
+                row = await conn.fetchrow(
+                    """
+                    UPDATE ingest_events
+                       SET status = 'extracting',
+                           processing_started_at = now()
+                     WHERE id = (
+                         SELECT id FROM ingest_events
+                          WHERE ($1::text IS NULL OR source = $1)
+                            AND (
+                                  status IN ('received', 'failed')
+                               OR (status = 'extracting'
+                                   AND processing_started_at < now() - ($2::int * interval '1 minute'))
+                            )
+                          ORDER BY received_at
+                          FOR UPDATE SKIP LOCKED
+                          LIMIT 1
+                       )
+                    RETURNING id::text AS id, source::text AS source
+                    """,
+                    args.source,
+                    stale_minutes,
+                )
+                if not row:
+                    break
+                claimed_rows.append({"id": row["id"], "source": row["source"]})
+
+        if not claimed_rows:
             print("No pending ingest events.")
             return 0
 
-        print(f"Processing {len(rows)} pending event(s)...")
+        print(f"Processing {len(claimed_rows)} claimed event(s)...")
         any_failures = False
-        for row in rows:
+        for row in claimed_rows:
             async with pool.acquire() as conn:
                 try:
                     result = await process_event(conn, row["id"])
@@ -86,6 +118,22 @@ async def main_async(args: argparse.Namespace) -> int:
                         any_failures = True
                 except Exception as exc:
                     log.exception("pipeline_unhandled_error")
+                    # Mark the event failed so it gets picked up next run
+                    # rather than being stranded in 'extracting'. The claim
+                    # loop's stale-recovery is a safety net; this is the
+                    # primary path.
+                    try:
+                        async with pool.acquire() as failconn:
+                            await failconn.execute(
+                                "UPDATE ingest_events "
+                                "SET status = 'failed', failed_at = now(), "
+                                "    error = $2, retry_count = retry_count + 1 "
+                                "WHERE id = $1::uuid",
+                                row["id"],
+                                f"worker_unhandled: {exc!r}"[:1024],
+                            )
+                    except Exception:
+                        log.exception("pipeline_failmark_failed")
                     print(f"  {row['id']}  source={row['source']}  -> CRASHED: {exc!r}", file=sys.stderr)
                     any_failures = True
 

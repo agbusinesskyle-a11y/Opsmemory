@@ -31,13 +31,31 @@ async def retrieve_candidates(
     *,
     top_n: int = DEFAULT_TOP_N,
     business_id_by_slug: dict[str, str] | None = None,
-) -> list[dict]:
-    """Return up to `top_n` existing tasks the candidate might match."""
+    actor_business_ids: list[str] | None = None,
+) -> tuple[list[dict], bool]:
+    """Return (matches, retrieval_skipped).
+
+    `actor_business_ids` is the list of business UUIDs the ingest actor
+    is allowed to see (None = admin/system, no scoping; [] = no
+    visibility). Retrieval intersects candidate.businesses with the
+    actor's visible set so an owner cannot surface tasks from a business
+    they don't belong to. The intersection is enforced even though the
+    candidate hint came from the actor's own content — the LLM may
+    extract business names that the actor lacks membership for.
+
+    Returns:
+      ([...], False) — retrieval ran (with valid business filter); the
+                       list may legitimately be empty (no matches).
+      ([],   True)  — retrieval was skipped (no business hint, or actor
+                       has no visibility into the candidate's businesses).
+                       The choose step uses this to distinguish "no match"
+                       from "couldn't search."
+    """
     business_slugs = candidate.get("businesses") or []
     if not business_slugs:
-        # Without any business hint, the candidate could be in any of our
-        # businesses. Skip retrieval (let the choose step decide CREATE).
-        return []
+        # No business hint extracted; skip retrieval (choose step treats
+        # this as AMBIGUOUS, not CREATE — see choose.py).
+        return [], True
 
     # Map slugs -> ids if not given. This prepared map is what the
     # pipeline orchestrator caches across candidates.
@@ -46,7 +64,17 @@ async def retrieve_candidates(
         business_id_by_slug = {r["slug"]: r["id"] for r in rows}
     biz_ids = [business_id_by_slug[s] for s in business_slugs if s in business_id_by_slug]
     if not biz_ids:
-        return []
+        return [], True
+
+    # Actor scoping: intersect with what the actor can see.
+    if actor_business_ids is not None:
+        visible = set(actor_business_ids)
+        biz_ids = [bid for bid in biz_ids if bid in visible]
+        if not biz_ids:
+            # Actor cannot see any business referenced by this candidate.
+            # Treat as skipped — validation will surface the authz error
+            # so the reviewer (admin) sees it.
+            return [], True
 
     # Optional time window: +/- 30 days from candidate.due_at, if set.
     due_iso = candidate.get("due_at")
@@ -114,4 +142,4 @@ async def retrieve_candidates(
     """
 
     rows = await conn.fetch(sql, *params)
-    return [dict(r) for r in rows]
+    return [dict(r) for r in rows], False

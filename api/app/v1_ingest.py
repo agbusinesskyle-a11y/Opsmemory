@@ -30,6 +30,7 @@ import logging
 import re
 from typing import Any
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
@@ -158,27 +159,52 @@ async def ingest_meeting_recap(
                 }
 
         # Insert new event. Pipeline picks it up later by status='received'.
-        row = await conn.fetchrow(
-            """
-            INSERT INTO ingest_events
-              (source, source_external_id, raw_content, normalized_hash,
-               source_metadata, status,
-               actor_type, actor_user_id, actor_service_account_id,
-               request_id)
-            VALUES
-              ('meeting_recap', $1, $2, $3, $4::jsonb, 'received',
-               $5, $6::uuid, $7::uuid, $8)
-            RETURNING id::text AS id, status::text AS status
-            """,
-            body.source_external_id,
-            canonical,
-            hash_hex,
-            __import__("json").dumps(body.source_metadata),
-            actor_type,
-            actor_user_id,
-            actor_service_id,
-            request_id,
-        )
+        # Race: another concurrent request may insert the same content_hash
+        # or (source, source_external_id) between our pre-checks above and
+        # this INSERT. Catch the unique violation and re-select the
+        # winning row instead of returning a 500.
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO ingest_events
+                  (source, source_external_id, raw_content, normalized_hash,
+                   source_metadata, status,
+                   actor_type, actor_user_id, actor_service_account_id,
+                   request_id)
+                VALUES
+                  ('meeting_recap', $1, $2, $3, $4::jsonb, 'received',
+                   $5, $6::uuid, $7::uuid, $8)
+                RETURNING id::text AS id, status::text AS status
+                """,
+                body.source_external_id,
+                canonical,
+                hash_hex,
+                __import__("json").dumps(body.source_metadata),
+                actor_type,
+                actor_user_id,
+                actor_service_id,
+                request_id,
+            )
+        except asyncpg.UniqueViolationError:
+            existing = await conn.fetchrow(
+                "SELECT id::text AS id, status::text AS status, "
+                "       (normalized_hash = $1) AS by_hash "
+                "FROM ingest_events "
+                "WHERE normalized_hash = $1 "
+                "   OR (source = 'meeting_recap' AND source_external_id IS NOT NULL "
+                "       AND source_external_id = $2) "
+                "LIMIT 1",
+                hash_hex,
+                body.source_external_id,
+            )
+            if not existing:
+                raise
+            return {
+                "event_id": existing["id"],
+                "status": existing["status"],
+                "deduped": True,
+                "dedup_key": "content_hash" if existing["by_hash"] else "source_external_id",
+            }
 
     log.info(
         "ingest_meeting_recap_received",

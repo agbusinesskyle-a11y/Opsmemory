@@ -62,13 +62,38 @@ def _provider_for(model: str) -> str:
     return "litellm"
 
 
+def _is_production() -> bool:
+    return os.environ.get("ENVIRONMENT", "").strip().lower() == "production"
+
+
+def _strip_mock_in_production(step: str, chain: list[str]) -> list[str]:
+    """Production fail-closed: mock provider is dev-only.
+
+    A misconfigured production worker that defaults to mock would silently
+    log fabricated review_items and llm_calls rows. Reject the chain
+    instead — the caller surfaces a RuntimeError and the worker exits
+    non-zero, which the operator notices.
+    """
+    if not _is_production():
+        return chain
+    real = [m for m in chain if _provider_for(m) != "mock"]
+    if not real:
+        raise RuntimeError(
+            f"ENVIRONMENT=production but step {step!r} chain is mock-only "
+            f"(set INGEST_LLM_{step.upper()}_MODELS to real providers)"
+        )
+    return real
+
+
 def models_for_step(step: str) -> list[str]:
     if step == "extract":
-        return _model_chain("INGEST_LLM_EXTRACT_MODELS", "mock")
+        chain = _model_chain("INGEST_LLM_EXTRACT_MODELS", "mock")
+        return _strip_mock_in_production(step, chain)
     if step == "choose":
         # Filter out local models; chunk1 design forbids local Llama at choose.
         chain = _model_chain("INGEST_LLM_CHOOSE_MODELS", "mock")
-        return [m for m in chain if _provider_for(m) != "litellm-local"]
+        chain = [m for m in chain if _provider_for(m) != "litellm-local"]
+        return _strip_mock_in_production(step, chain)
     raise ValueError(f"unknown step {step!r}")
 
 

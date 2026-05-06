@@ -67,13 +67,56 @@ async def _record_llm_call(conn, *, ingest_event_id: str, review_item_id: str | 
     )
 
 
+async def _resolve_actor_business_ids(conn, event) -> list[str] | None:
+    """Return the list of business UUIDs the ingest actor is scoped to.
+
+    Result semantics match authz.visible_business_ids:
+      - None  → no scoping (admin user OR system actor; sees everything)
+      - []    → service principal with no business_memberships
+      - [...] → owner / scoped-service: only these business ids
+    """
+    actor_type = event["actor_type"]
+    if actor_type == "system":
+        return None
+    if actor_type == "user" and event["actor_user_id"]:
+        row = await conn.fetchrow(
+            "SELECT role::text AS role FROM users WHERE id = $1::uuid",
+            event["actor_user_id"],
+        )
+        if row and row["role"] == "admin":
+            return None
+        # Owner: scope to their business_memberships.
+        biz_rows = await conn.fetch(
+            "SELECT business_id::text AS id "
+            "FROM business_memberships WHERE user_id = $1::uuid",
+            event["actor_user_id"],
+        )
+        return [r["id"] for r in biz_rows]
+    if actor_type == "service" and event["actor_service_account_id"]:
+        # Service accounts in chunk1 don't have per-business scoping yet;
+        # treat as visible to all businesses they're explicitly granted.
+        # For now: empty list (nothing visible) until per-service biz
+        # grants land. Caller treats [] as "no businesses visible".
+        return []
+    # Fallback: no scoping derivable; refuse to mass-leak — empty.
+    return []
+
+
 async def process_event(conn, event_id: str) -> dict:
-    """Run the 6-step pipeline for one ingest_event. Returns a summary dict."""
+    """Run the 6-step pipeline for one ingest_event. Returns a summary dict.
+
+    Assumes the caller has already claimed the row (status='extracting',
+    processing_started_at set). See scripts/run_pipeline.py for the
+    atomic claim path.
+    """
     log.info("pipeline_start", extra={"event_id": event_id})
 
     # ---- Read the event ----
     event = await conn.fetchrow(
-        "SELECT id::text AS id, source, raw_content, status::text AS status, retry_count "
+        "SELECT id::text AS id, source, raw_content, status::text AS status, "
+        "       retry_count, actor_type, "
+        "       actor_user_id::text AS actor_user_id, "
+        "       actor_service_account_id::text AS actor_service_account_id "
         "FROM ingest_events WHERE id = $1::uuid",
         event_id,
     )
@@ -81,13 +124,15 @@ async def process_event(conn, event_id: str) -> dict:
         return {"event_id": event_id, "status": "missing"}
     if event["source"] != "meeting_recap":
         # Other sources land in later chunks (Slack, email, Excel, SOP).
+        # Roll back the claim so the event isn't stuck in 'extracting'.
+        await conn.execute(
+            "UPDATE ingest_events SET status = 'received', processing_started_at = NULL "
+            "WHERE id = $1::uuid",
+            event_id,
+        )
         return {"event_id": event_id, "status": "skipped", "reason": f"source={event['source']!r} not handled in chunk3"}
 
-    # ---- Mark extracting ----
-    await conn.execute(
-        "UPDATE ingest_events SET status = 'extracting', processing_started_at = now() WHERE id = $1::uuid",
-        event_id,
-    )
+    actor_business_ids = await _resolve_actor_business_ids(conn, event)
 
     candidates_raw: list[dict] = []
     try:
@@ -119,9 +164,21 @@ async def process_event(conn, event_id: str) -> dict:
     review_count = 0
     biz_map_rows = await conn.fetch("SELECT id::text AS id, slug::text AS slug FROM businesses")
     business_id_by_slug = {r["slug"]: r["id"] for r in biz_map_rows}
+    business_slug_by_id = {v: k for k, v in business_id_by_slug.items()}
+    # Slug list the actor is scoped to (None = admin/system, no scoping).
+    actor_business_slugs: list[str] | None
+    if actor_business_ids is None:
+        actor_business_slugs = None
+    else:
+        actor_business_slugs = [business_slug_by_id[bid] for bid in actor_business_ids
+                                if bid in business_slug_by_id]
 
     for cand in normalized:
-        retrieved = await retrieve_candidates(conn, cand, business_id_by_slug=business_id_by_slug)
+        retrieved, retrieval_skipped = await retrieve_candidates(
+            conn, cand,
+            business_id_by_slug=business_id_by_slug,
+            actor_business_ids=actor_business_ids,
+        )
 
         async def on_choose_call_for_cand(call):
             # We need the review_item_id to link, but it doesn't exist yet at this point.
@@ -129,7 +186,11 @@ async def process_event(conn, event_id: str) -> dict:
             await _record_llm_call(conn, ingest_event_id=event_id, review_item_id=None, call=call)
 
         try:
-            decision, _ = await choose_action(cand, retrieved, on_call=on_choose_call_for_cand)
+            decision, _ = await choose_action(
+                cand, retrieved,
+                retrieval_skipped=retrieval_skipped,
+                on_call=on_choose_call_for_cand,
+            )
         except Exception as exc:
             log.warning("pipeline_choose_failed", extra={"event_id": event_id, "err": repr(exc)})
             decision = {
@@ -139,7 +200,10 @@ async def process_event(conn, event_id: str) -> dict:
                 "reason": f"choose step failed: {exc!r}"[:512],
             }
 
-        validation_errors = await validate_decision(conn, cand, decision)
+        validation_errors = await validate_decision(
+            conn, cand, decision,
+            actor_business_slugs=actor_business_slugs,
+        )
 
         # Snapshot base versions for chunk 4's transactional recheck.
         base_task_version = None

@@ -273,6 +273,33 @@ def check(env: dict[str, str]) -> Result:
         if recipient.startswith("<"):
             fatal.append("BACKUP_GPG_RECIPIENT still has placeholder")
 
+    # Production fail-closed: ingest pipeline must NOT default to mock LLM.
+    if prod:
+        for var, step in (
+            ("INGEST_LLM_EXTRACT_MODELS", "extract"),
+            ("INGEST_LLM_CHOOSE_MODELS", "choose"),
+        ):
+            chain = [m.strip() for m in env.get(var, "").split(",") if m.strip()]
+            if not chain:
+                # Falls back to 'mock' default in code — fatal in production.
+                fatal.append(f"{var} unset; defaults to mock at runtime "
+                             f"(production must set real providers for the "
+                             f"{step} step)")
+                continue
+            if all(m == "mock" for m in chain):
+                fatal.append(f"{var}={','.join(chain)} is mock-only "
+                             f"(production cannot run the {step} step on mock)")
+        # If real models are configured, LITELLM_BASE_URL must be set.
+        any_real = False
+        for var in ("INGEST_LLM_EXTRACT_MODELS", "INGEST_LLM_CHOOSE_MODELS"):
+            chain = [m.strip() for m in env.get(var, "").split(",") if m.strip()]
+            if any(m != "mock" for m in chain):
+                any_real = True
+                break
+        if any_real and not env.get("LITELLM_BASE_URL", "").strip():
+            fatal.append("LITELLM_BASE_URL required when ingest LLM chains "
+                         "include non-mock providers")
+
     # Production-extra warnings.
     if prod and not _truthy(env, "READYZ_REQUIRE_BACKUP"):
         warn.append("ENVIRONMENT=production but READYZ_REQUIRE_BACKUP is not enabled"

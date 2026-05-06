@@ -25,14 +25,35 @@ async def choose_action(
     candidate: dict,
     retrieved: list[dict],
     *,
+    retrieval_skipped: bool = False,
     on_call=None,
 ) -> tuple[dict, Any | None]:
     """Run the choose step. Returns (decision_dict, llm_call_record_or_None).
 
     Decision dict shape:
       { "action", "target_task_id", "confidence", "reason" }
+
+    Two empty-retrieval cases:
+      - retrieval_skipped=True: retrieval couldn't run (no business hint,
+        or actor lacks visibility into the candidate's businesses).
+        We do NOT auto-CREATE — emit AMBIGUOUS so the reviewer sees the
+        candidate and assigns a business or rejects it.
+      - retrieval_skipped=False, retrieved=[]: retrieval ran with a valid
+        business filter and found zero matches. Safe to short-circuit
+        to CREATE_TASK at default confidence.
     """
-    # Short-circuit: no retrieved candidates -> CREATE_TASK at default confidence.
+    # Skipped retrieval: ambiguous, not auto-CREATE.
+    if retrieval_skipped:
+        return (
+            {
+                "action": "AMBIGUOUS",
+                "target_task_id": None,
+                "confidence": 0.0,
+                "reason": "Retrieval skipped (no business hint or no actor visibility).",
+            },
+            None,
+        )
+    # Short-circuit: retrieval ran, 0 candidates -> CREATE_TASK.
     if not retrieved:
         return (
             {

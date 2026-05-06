@@ -17,9 +17,33 @@ async def validate_decision(
     conn,
     candidate: dict,
     decision: dict,
+    *,
+    actor_business_slugs: list[str] | None = None,
 ) -> list[dict]:
-    """Return a list of validation errors (each {code, message, field?})."""
+    """Return a list of validation errors (each {code, message, field?}).
+
+    `actor_business_slugs` is the business slug list the ingest actor is
+    scoped to (None = admin/system, no scoping). When the candidate
+    references businesses outside that scope, an authz error is added so
+    the reviewer sees that the actor was implicitly trying to write
+    cross-business.
+    """
     errors: list[dict] = []
+
+    # Actor authz: the candidate's businesses must be a subset of what
+    # the actor is allowed to see. Admin/system actors (None) bypass.
+    if actor_business_slugs is not None:
+        cand_biz = candidate.get("businesses") or []
+        unauthorized = [b for b in cand_biz if b not in actor_business_slugs]
+        if unauthorized:
+            errors.append({
+                "code": "actor_business_unauthorized",
+                "message": (
+                    f"actor lacks membership in business(es) {unauthorized}; "
+                    f"candidate references {cand_biz}, actor scoped to "
+                    f"{actor_business_slugs}"
+                ),
+            })
 
     action = decision.get("action")
     target = decision.get("target_task_id")
