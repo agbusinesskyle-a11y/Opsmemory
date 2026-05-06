@@ -3184,6 +3184,74 @@ async function retryConflict(idempotency_key) {
 // Service worker (chunk 1: pass-through; chunk 6 will add caching)
 // ---------------------------------------------------------------------------
 
+// Sub-(c) commit 2: deep-link auto-expand helpers.
+//
+// Codex chunk-10-step3b3-close SUB-(c) PLAN: parse ?task=<id>
+// from window.location, set view='tasks' + status='all', refresh,
+// expand. If the task isn't in the rendered list, fetch it
+// directly so the expanded-detail panel still renders.
+function _readDeepLinkTaskId() {
+  try {
+    const params = new URLSearchParams(window.location.search || '');
+    const id = params.get('task');
+    if (!id) return null;
+    // UUID v4 sanity check — reject anything that doesn't look
+    // like a UUID so a malformed query doesn't trigger a /v1/tasks
+    // /{garbage} 422.
+    const trimmed = id.trim();
+    if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(trimmed)) {
+      return null;
+    }
+    return trimmed;
+  } catch (_e) {
+    return null;
+  }
+}
+
+async function _autoExpandDeepLinkedTask(taskId) {
+  // Try the in-list path first. refreshTasks() has already
+  // populated state.tasks; if our taskId is among them, expand
+  // and load detail through the existing path.
+  const inList = (state.tasks || []).some(t => t && t.id === taskId);
+  if (inList) {
+    state.expandedTaskId = taskId;
+    try {
+      state.expandedTaskDetail = await loadTaskDetail(taskId);
+    } catch (_e) { /* keep row expanded; user can click again */ }
+    render();
+    return;
+  }
+  // Not in the visible list. Fetch the detail directly so the
+  // user at least sees the task they were notified about. The
+  // list row won't render, but the expanded detail will.
+  try {
+    const detail = await loadTaskDetail(taskId);
+    state.expandedTaskId = taskId;
+    state.expandedTaskDetail = detail;
+    // Inject a synthetic stub into state.tasks so the renderer
+    // has a row to anchor the expanded detail under. Marked with
+    // a flag so the renderer (and we) can tell it's deep-link-
+    // synthetic if needed.
+    const stubRow = {
+      id: detail.id,
+      summary: detail.summary,
+      status: detail.status,
+      priority: detail.priority,
+      due_iso: detail.due_iso,
+      businesses: detail.businesses || [],
+      _deep_link_only: true,
+    };
+    state.tasks = [stubRow, ...(state.tasks || [])];
+    render();
+  } catch (err) {
+    // 404 / 403 / network — leave the user on the (filtered)
+    // task list. No notification banner; the failed deep link
+    // is silent enough.
+    console.warn('[opsmemory] deep-link task fetch failed', taskId, err);
+    render();
+  }
+}
+
 async function registerServiceWorker() {
   if (!('serviceWorker' in navigator)) return;
   try { await navigator.serviceWorker.register('/sw.js', { scope: '/' }); }
@@ -3257,7 +3325,24 @@ async function _bootBusinesses() {
     state.businesses = await _bootBusinesses();
     await hydrateOptimisticFromOutbox();
     await refreshSyncCounters();
-    await refreshTasks();
+    // Sub-(c) commit 2: deep-link auto-expand. If the URL has
+    // ?task=<id>, set the Tasks view's filter to 'all' (so a
+    // closed task linked from a notification doesn't get hidden
+    // by the default 'open' filter), refresh tasks, and try to
+    // expand the matching row. If the task isn't in the visible
+    // list (e.g. user has many businesses, page-1 doesn't
+    // include it), fall back to fetching it directly via
+    // /v1/tasks/{id} and surfacing it as the expanded detail
+    // even if the list row doesn't render.
+    const deepLinkTaskId = _readDeepLinkTaskId();
+    if (deepLinkTaskId) {
+      state.view = 'tasks';
+      state.filters.status = 'all';
+      await refreshTasks();
+      await _autoExpandDeepLinkedTask(deepLinkTaskId);
+    } else {
+      await refreshTasks();
+    }
     replayOutbox().catch(function () {});
     setInterval(function () {
       replayOutbox().catch(function () {});
