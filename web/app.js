@@ -100,6 +100,11 @@ const state = {
     // a single inline pill near the subscription table.
     subscriptionRevokes: {},      // { [subscriptionId]: true } when DELETE is in flight
     subscriptionRevokeError: null,
+    // Sub-(b) commit 3: Enable Web Push (subscribe) flow. Single
+    // global pending+error pair per Codex chunk-10-step3b2 gate-2
+    // (plan for sub-(b)/3).
+    subscriptionCreatePending: false,
+    subscriptionCreateError: null,
   },
 };
 
@@ -1108,6 +1113,50 @@ async function deletePushSubscription(id) {
   });
 }
 
+async function postPushSubscription(body) {
+  return await api('/v1/notifications/web_push/subscriptions', {
+    method: 'POST',
+    body,
+  });
+}
+
+// Standard Web Push helper: convert a base64url-encoded VAPID
+// public key into the Uint8Array PushManager.subscribe expects.
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+function _b64FromArrayBuffer(buf) {
+  if (!buf) return null;
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.byteLength; i++) s += String.fromCharCode(bytes[i]);
+  // base64url, no padding (matches what the server's CHECK
+  // expects on web_push_subscriptions p256dh_key/auth_key).
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function _extractSubscriptionKeys(sub) {
+  // Prefer .toJSON() when it returns the keys. Some browsers
+  // (older Safari) only expose them via getKey().
+  const json = (typeof sub.toJSON === 'function') ? sub.toJSON() : null;
+  if (json && json.keys && json.keys.p256dh && json.keys.auth) {
+    return { p256dh: json.keys.p256dh, auth: json.keys.auth };
+  }
+  if (typeof sub.getKey === 'function') {
+    return {
+      p256dh: _b64FromArrayBuffer(sub.getKey('p256dh')),
+      auth: _b64FromArrayBuffer(sub.getKey('auth')),
+    };
+  }
+  return { p256dh: null, auth: null };
+}
+
 async function loadVapidPublicKey() {
   // Treat 503 as "server doesn't have VAPID configured" — that's a
   // valid state, not an error. Per
@@ -1323,6 +1372,54 @@ function renderSettingsWebPushSection() {
     ? `<div class="settings-row-error">${escapeHtml(s.subscriptionRevokeError)}</div>`
     : '';
 
+  // Codex chunk-10-step3b2-close sub-(b)/3 plan:
+  //   Button gate: pushApiAvailable && vapidPublicKey
+  //                && serviceWorkerReady
+  //                && permissionState !== 'denied'
+  //                && !subscriptionCreatePending
+  //   Don't gate ONLY on !browserSubscription — also expose a
+  //   'Reconnect' path when the local sub exists but no server
+  //   row matches its endpoint (failed cleanup or server-side
+  //   revoke could otherwise strand the browser).
+  const localEndpoint = s.browserSubscription ? s.browserSubscription.endpoint : null;
+  const serverHasLocal = !!(localEndpoint
+    && (s.subscriptions || []).some(sub => sub.endpoint === localEndpoint));
+  const canTrySubscribe = (
+    s.pushApiAvailable === true
+    && !!s.vapidPublicKey
+    && s.serviceWorkerReady
+    && s.permissionState !== 'denied'
+    && !s.subscriptionCreatePending
+  );
+  let actionRow = '';
+  if (s.permissionState === 'denied') {
+    actionRow = `
+      <div class="settings-row settings-row-hint">
+        <span class="settings-label">Notifications</span>
+        <span class="settings-value muted">
+          Permission was denied. To re-enable, open your browser's
+          site settings for this app and allow notifications, then
+          reload the page.
+        </span>
+      </div>
+    `;
+  } else if (canTrySubscribe && (!s.browserSubscription || !serverHasLocal)) {
+    const label = s.browserSubscription && !serverHasLocal
+      ? (s.subscriptionCreatePending ? 'Reconnecting…' : 'Reconnect this browser')
+      : (s.subscriptionCreatePending ? 'Enabling…' : 'Enable Web Push on this browser');
+    actionRow = `
+      <div class="settings-row">
+        <span class="settings-label">Action</span>
+        <span class="settings-value">
+          <button class="settings-enable-push"
+                  ${s.subscriptionCreatePending ? 'disabled' : ''}>${escapeHtml(label)}</button>
+        </span>
+      </div>
+    `;
+  }
+  const createErrorBlock = s.subscriptionCreateError
+    ? `<div class="settings-row-error">${escapeHtml(s.subscriptionCreateError)}</div>`
+    : '';
   return `
     <section class="settings-section">
       <h3>Web Push</h3>
@@ -1331,10 +1428,11 @@ function renderSettingsWebPushSection() {
       ${_renderSettingsLine('Service worker', swStatus)}
       ${_renderSettingsLine('Server VAPID key', vapidStatus)}
       ${_renderSettingsLine('This browser', browserSubStatus)}
+      ${actionRow}
+      ${createErrorBlock}
       <h4>Active subscriptions</h4>
       ${revokeErrorBlock}
       ${subsTable}
-      <p class="muted">Enable controls land in the next update.</p>
     </section>
   `;
 }
@@ -2353,6 +2451,116 @@ function attachEventHandlers() {
     });
   });
 
+  // Codex chunk-10-step3b2-close sub-(b)/3: Enable Web Push +
+  // Reconnect this browser. Single button; the renderer picks
+  // the label based on whether browserSubscription matches a
+  // server row. The handler does:
+  //   - guard pending
+  //   - request permission if not granted
+  //   - get SW registration
+  //   - subscribe (or reuse existing browserSubscription for
+  //     reconnect) -> extract keys -> POST to server
+  //   - on POST failure after subscribe: best-effort unsubscribe
+  //   - on success: refetch subscriptions + permission +
+  //     browserSubscription
+  document.querySelectorAll('.settings-enable-push').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (state.settings.subscriptionCreatePending) return;
+      state.settings.subscriptionCreatePending = true;
+      state.settings.subscriptionCreateError = null;
+      render();
+      let createdSubscription = null;
+      let weCreatedIt = false;
+      try {
+        // Step 2: request permission if needed. Must be in
+        // direct response to a user gesture (we are: this is
+        // the click handler itself).
+        if (state.settings.permissionState !== 'granted') {
+          if (!('Notification' in window)) {
+            throw new Error('Notification API unavailable.');
+          }
+          const result = await window.Notification.requestPermission();
+          state.settings.permissionState = result;
+          if (result !== 'granted') {
+            throw new Error('Notification permission was not granted.');
+          }
+        }
+        // Step 4: get SW registration.
+        const reg = await navigator.serviceWorker.ready;
+        if (!reg || !reg.pushManager) {
+          throw new Error('Service worker / Push manager unavailable.');
+        }
+        // Step 5: reuse existing subscription if present, else
+        // call .subscribe() with the VAPID key.
+        let sub = await reg.pushManager.getSubscription();
+        if (!sub) {
+          if (!state.settings.vapidPublicKey) {
+            throw new Error('Server VAPID key missing; ask admin.');
+          }
+          sub = await reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array(state.settings.vapidPublicKey),
+          });
+          weCreatedIt = true;
+        }
+        createdSubscription = sub;
+        // Step 6+7: extract keys and POST.
+        const keys = _extractSubscriptionKeys(sub);
+        if (!keys.p256dh || !keys.auth) {
+          throw new Error('Subscription keys unavailable.');
+        }
+        const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+        const body = {
+          endpoint: sub.endpoint,
+          p256dh_key: keys.p256dh,
+          auth_key: keys.auth,
+          device_label: null,
+          user_agent: ua.length > 512 ? ua.slice(0, 512) : ua,
+        };
+        await postPushSubscription(body);
+        // Step 9: refetch subscriptions + re-probe SW state.
+        try {
+          const subsResp = await loadPushSubscriptions();
+          state.settings.subscriptions = (subsResp && subsResp.items) || [];
+        } catch (refetchErr) {
+          state.settings.subscriptionCreateError =
+            'Enabled. The device list did not refresh; reload to verify.';
+        }
+        try {
+          const probe = await _readServiceWorkerSubscription(2000);
+          state.settings.serviceWorkerReady = !!probe.ready;
+          state.settings.browserSubscription = probe.subscription || sub;
+        } catch (probeErr) {
+          state.settings.browserSubscription = sub;
+        }
+      } catch (err) {
+        // If we created the browser subscription but the server
+        // POST or downstream step failed, best-effort
+        // unsubscribe so the browser doesn't stay subscribed
+        // without a server record.
+        if (weCreatedIt && createdSubscription) {
+          try { await createdSubscription.unsubscribe(); }
+          catch (unsubErr) { console.warn('[opsmemory] cleanup unsubscribe() failed', unsubErr); }
+        }
+        let msg = (err && err.message) || 'Could not enable Web Push.';
+        const detail = err && err.body && err.body.detail;
+        if (typeof detail === 'string') msg = detail;
+        else if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+          msg = detail.reason || detail.detail || detail.code || msg;
+        } else if (Array.isArray(detail) && detail.length && detail[0].msg) {
+          msg = detail[0].msg;
+        }
+        state.settings.subscriptionCreateError = msg;
+        // Re-probe permission state so UI reflects user's choice
+        // if they denied the prompt.
+        state.settings.permissionState = readNotificationPermission();
+      } finally {
+        state.settings.subscriptionCreatePending = false;
+        render();
+      }
+    });
+  });
+
   // Codex chunk-10-step3b2: per-device Revoke flow. Per-row
   // pending map keys on subscription id; window.confirm gates
   // the destructive action; matches the SOP "Discard edits?"
@@ -2370,9 +2578,11 @@ function attachEventHandlers() {
       const revokes = state.settings.subscriptionRevokes || {};
       if (revokes[subId]) return;  // already in flight
       if (!window.confirm('Revoke this device? It will stop receiving push notifications.')) return;
-      // Re-check after confirm (user may have clicked Revoke
-      // twice while the confirm dialog was open).
-      if (revokes[subId]) return;
+      // Codex chunk-10-step3b2-close (a): re-read live state after
+      // confirm, not the captured-before-confirm snapshot. The
+      // earlier copy in `revokes` was a closure capture and would
+      // miss any intervening pending update.
+      if ((state.settings.subscriptionRevokes || {})[subId]) return;
 
       const localEndpoint = state.settings.browserSubscription
         ? state.settings.browserSubscription.endpoint

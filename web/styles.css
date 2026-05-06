@@ -1020,7 +1020,8 @@ ul.businesses li {
 .settings-edit-open,
 .settings-edit-save,
 .settings-edit-cancel,
-.settings-revoke {
+.settings-revoke,
+.settings-enable-push {
   padding: 4px 12px;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1034,7 +1035,16 @@ ul.businesses li {
 .settings-edit-save:disabled,
 .settings-edit-cancel:disabled,
 .settings-edit-open:disabled,
-.settings-revoke:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-revoke:disabled,
+.settings-enable-push:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-enable-push {
+  background: rgba(0, 100, 200, 0.15);
+  font-weight: 600;
+}
+.settings-enable-push:hover:not(:disabled) {
+  background: rgba(0, 100, 200, 0.25);
+}
+.settings-row-hint .settings-value { font-size: 12px; line-height: 1.4; }
 .settings-revoke {
   background: var(--error-bg);
   color: var(--error-fg);
