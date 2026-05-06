@@ -21,12 +21,25 @@ import io
 import logging
 from typing import Any
 
-# Harden openpyxl's XML parsing BEFORE openpyxl is imported. defusedxml
-# replaces the unsafe stdlib ElementTree with a hardened variant.
-import defusedxml  # noqa: F401  (side-effect import)
-defusedxml.defuse_stdlib()
+# Codex chunk-9-step3 fix: do NOT call defusedxml.defuse_stdlib().
+# That's a process-global monkey patch with surprising side effects on
+# any other XML consumer. openpyxl already auto-detects defusedxml at
+# import time and routes its own XML parsing through it
+# (openpyxl.DEFUSEDXML == True when defusedxml is installed). Just
+# require defusedxml is importable + assert openpyxl picked it up.
+import defusedxml  # noqa: F401  (presence-required side effect)
+import openpyxl  # noqa: E402
 
-import openpyxl  # noqa: E402  (must follow defusedxml.defuse_stdlib)
+if not getattr(openpyxl, "DEFUSEDXML", False):
+    # openpyxl ships with DEFUSEDXML auto-set when defusedxml is
+    # importable. If False here, openpyxl is parsing XLSX XML through
+    # the unhardened stdlib parser (billion-laughs / XXE exposure on
+    # operator-supplied workbooks). Refuse to load this module.
+    raise ImportError(
+        "openpyxl.DEFUSEDXML is False; XLSX parsing would use the "
+        "unhardened stdlib XML parser. Install defusedxml or upgrade "
+        "openpyxl."
+    )
 
 log = logging.getLogger("opsmemory.xlsx_decode")
 
@@ -119,6 +132,10 @@ def decode_xlsx_to_csv(
     sheet = wb[selected_name]
 
     # ---- Convert to CSV ----
+    # Codex chunk-9-step3 fix: stream the cap check after each row
+    # so a pathological 100k-row sheet doesn't materialize 50MB in
+    # memory before being rejected. read_only=True iter_rows is
+    # streaming; this completes the streaming story.
     buf = io.StringIO()
     writer = csv.writer(buf)
     row_count = 0
@@ -130,22 +147,17 @@ def decode_xlsx_to_csv(
         while last >= 0 and (row[last] is None or row[last] == ""):
             last -= 1
         cells = [_cell_to_str(row[i]) for i in range(last + 1)]
-        if not cells:
-            # Fully empty row — keep it; csv parser uses empty rows
-            # to delimit groups in some operator workflows. (Skip
-            # before header? Always preserve.)
-            cells = []
         writer.writerow(cells)
         row_count += 1
         col_count = max(col_count, len(cells))
+        if buf.tell() > max_csv_chars:
+            raise XlsxDecodeError(
+                "xlsx_csv_too_large",
+                f"converted CSV exceeded cap {max_csv_chars} chars at "
+                f"row {row_count}; reduce sheet rows or split the file",
+            )
 
     csv_text = buf.getvalue()
-    if len(csv_text) > max_csv_chars:
-        raise XlsxDecodeError(
-            "xlsx_csv_too_large",
-            f"converted CSV is {len(csv_text)} chars, exceeds cap "
-            f"{max_csv_chars}; reduce sheet rows or split the file",
-        )
 
     metadata = {
         "selected_sheet": selected_name,
@@ -169,8 +181,15 @@ def _select_sheet(wb) -> tuple[str | None, list[str]]:
     hidden = []
     for name in wb.sheetnames:
         s = wb[name]
-        # openpyxl exposes sheet_state: 'visible'|'hidden'|'veryHidden'
-        if getattr(s, "sheet_state", "visible") == "visible":
+        # openpyxl exposes sheet_state: 'visible'|'hidden'|'veryHidden'.
+        # read-only workbooks may not expose it on every sheet object;
+        # log when we fall back so the audit trail records the
+        # ambiguity (Codex chunk-9-step3 (h)).
+        if not hasattr(s, "sheet_state"):
+            log.info("xlsx_sheet_state_missing", extra={"sheet_name": name})
+            visible.append(name)
+            continue
+        if s.sheet_state == "visible":
             visible.append(name)
         else:
             hidden.append(name)

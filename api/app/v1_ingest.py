@@ -551,7 +551,10 @@ class FileDropIngest(BaseModel):
                     "first visible sheet with a recognizable task "
                     "header), converts to CSV, then runs the existing "
                     "CSV parser path. Mutually exclusive with file_content. "
-                    "8MB base64 cap = ~6MB raw XLSX.")
+                    "Pydantic cap is 8MB base64 (~6MB raw); the "
+                    "authoritative size cap is 5 MiB raw bytes inside "
+                    "xlsx_decode.decode_xlsx_to_csv (xlsx_too_large 422 "
+                    "if exceeded).")
     business_slug: str = Field(..., min_length=1, max_length=64,
                                  description="Business this file is associated with. n8n "
                                              "maps Drive folder -> business slug; "

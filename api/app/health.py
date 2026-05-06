@@ -137,6 +137,23 @@ async def readyz(request: Request):
                 log.warning("readyz_restore_unreadable", extra={"err": repr(exc)})
                 # Soft mode: don't fail readiness on a malformed restore file.
 
+    # 5. XLSX-decode availability (Chunk 9 step 3).
+    # Soft check: import xlsx_decode (which lazy-imports openpyxl +
+    # defusedxml on first call). If openpyxl/defusedxml aren't installed
+    # — or openpyxl doesn't have DEFUSEDXML hardening — the import
+    # raises ImportError. /readyz reports the failure but doesn't 503,
+    # because the rest of the API works. n8n's /v1/ingest/file_drop
+    # XLSX path returns 503 itself when this happens. Codex
+    # chunk-9-step3 (g): "missing openpyxl/defusedxml should show up
+    # before n8n discovers it through retries."
+    xlsx_decode_status: str
+    try:
+        from . import xlsx_decode  # noqa: F401
+        xlsx_decode_status = "ok"
+    except ImportError as exc:
+        xlsx_decode_status = f"unavailable: {exc!r}"
+        log.warning("readyz_xlsx_decode_unavailable", extra={"err": repr(exc)})
+
     return {
         "ok": True,
         "service": "opsmemory-api",
@@ -145,6 +162,7 @@ async def readyz(request: Request):
         "backup_age_hours": backup_age,
         "restore_check": "required" if require_restore else "soft",
         "restore_age_hours": restore_age,
+        "xlsx_decode": xlsx_decode_status,
     }
 
 
