@@ -7,11 +7,14 @@
 //     icons) on install. Cache-first for subsequent shell loads, so the
 //     PWA opens instantly and works on flaky networks.
 //   - Network-first with stale-if-error for /v1/tasks list GETs. When
-//     the network returns 2xx, the response is cached and forwarded.
-//     When the network errors (offline, 5xx, timeout), serves the most
-//     recent cached response. The PWA renders stale data with no
-//     "needs refresh" UI — Codex chunk-6-step1 review held SWR's active
-//     re-render for step 3 alongside the IndexedDB outbox.
+//     the network returns 2xx, the response is cached (await — durable
+//     before responding) and forwarded. When the network throws (offline,
+//     timeout) OR returns 5xx, falls back to the most recent cached
+//     response with X-OpsMemory-From-Cache: 1. 401/403/404 are returned
+//     unchanged (auth failures and not-founds must NOT serve stale —
+//     they reflect real state changes). The PWA renders stale data with
+//     no "needs refresh" UI — Codex chunk-6-step1 review held SWR's
+//     active re-render for step 3 alongside the IndexedDB outbox.
 //   - Network-only for everything else (/whoami, /v1/businesses,
 //     /v1/review/*, /v1/tasks/{id}, POSTs, PATCHes). Auth-scoped data
 //     is sensitive; the PWA's "view tasks while online" path is the
@@ -27,13 +30,21 @@ const BUILD = '6153568';
 const SHELL_CACHE = `opsmemory-shell-${BUILD}`;
 const TASKS_CACHE = `opsmemory-tasks-${BUILD}`;
 
-const SHELL_URLS = [
+// Required: install fails if any of these don't precache. Loss of these
+// breaks the offline boot path entirely.
+const SHELL_URLS_REQUIRED = [
   '/',
   '/app.js',
   '/styles.css',
   '/manifest.json',
+];
+
+// Optional: install tolerates failures here. A missing icon doesn't
+// brick the app; on-demand serve in serveShell() catches misses.
+const SHELL_URLS_OPTIONAL = [
   '/icons/icon-192.png',
   '/icons/icon-512.png',
+  '/icons/icon-512-maskable.png',
 ];
 
 // ---------------------------------------------------------------------------
@@ -43,22 +54,18 @@ const SHELL_URLS = [
 self.addEventListener('install', function (event) {
   event.waitUntil((async function () {
     const cache = await caches.open(SHELL_CACHE);
-    // Use addAll to fail fast if any precache target is missing — better
-    // to reject the SW install than silently ship a half-cached shell.
-    // Wrapped in try so a missing icon doesn't permanently brick install.
-    try {
-      await cache.addAll(SHELL_URLS);
-    } catch (err) {
-      // Per-URL retry so we still cache what we can. Logs the failure
-      // so it's debuggable in chrome://serviceworker-internals.
-      console.warn('[opsmemory sw] shell precache partial fail:', err);
-      for (const url of SHELL_URLS) {
-        try {
-          const res = await fetch(url, { cache: 'reload' });
-          if (res.ok) await cache.put(url, res.clone());
-        } catch (e) {
-          console.warn('[opsmemory sw] cache miss for', url, e);
-        }
+    // Required core: addAll throws on any miss -> install rejects, the
+    // old SW (if any) keeps serving. We do NOT silently degrade to a
+    // half-cached shell because that would brick offline boot.
+    await cache.addAll(SHELL_URLS_REQUIRED);
+    // Optional icons: per-URL fetch with swallow. A missing maskable
+    // icon shouldn't reject install.
+    for (const url of SHELL_URLS_OPTIONAL) {
+      try {
+        const res = await fetch(url, { cache: 'reload' });
+        if (res.ok) await cache.put(url, res.clone());
+      } catch (e) {
+        console.warn('[opsmemory sw] optional asset cache miss for', url, e);
       }
     }
     self.skipWaiting();
@@ -165,33 +172,53 @@ async function event_revalidate(cache, req) {
 async function serveTasksList(req) {
   const cache = await caches.open(TASKS_CACHE);
   try {
-    // Network-first. Honors the request's credentials (Cloudflare
-    // Access cookie) since fetch(req) preserves the original Request
-    // attributes.
+    // Network-first. fetch(req) preserves credentials so the
+    // Cloudflare Access cookie rides along.
     const fresh = await fetch(req);
     if (fresh.ok) {
-      // Cache user-visible 2xx responses only. 401/403/404 must NOT be
-      // cached — Cloudflare Access challenges shouldn't bake into the
-      // tasks cache.
-      cache.put(req, fresh.clone()).catch(function () {});
+      // AWAIT the cache write so the SW isn't terminated before it
+      // completes (Codex chunk-6-step2 blocker — fire-and-forget put
+      // could lose the cache entry). Clone first; .clone() is cheap
+      // because the body is just buffered, not re-fetched.
+      try {
+        await cache.put(req, fresh.clone());
+      } catch (e) {
+        // QuotaExceededError or similar — log and serve fresh
+        // anyway. We'd rather respond now than fail the user.
+        console.warn('[opsmemory sw] tasks cache.put failed:', e);
+      }
+      return fresh;
     }
+    // 5xx: try stale cache before propagating the server failure
+    // (Codex chunk-6-step2 blocker — original code only fell back on
+    // throw, so 502 from CF would surface unmodified).
+    if (fresh.status >= 500 && fresh.status <= 599) {
+      const stale = await _staleResponse(cache, req);
+      if (stale) return stale;
+    }
+    // 401/403/404 and other 4xx: return as-is. Auth failures and
+    // not-founds must NOT be served stale — they reflect real state
+    // changes (Cloudflare Access lockout, deleted task).
     return fresh;
   } catch (err) {
-    // Network unreachable. Try the cache; on miss, surface a network
-    // error so the PWA renders its standard error state.
-    const cached = await cache.match(req);
-    if (cached) {
-      // Mark the response as a cache hit so the PWA can show a "stale
-      // data — offline" indicator if it wants to. (Not yet wired in
-      // app.js; available for chunk 6 step 3.)
-      const hdrs = new Headers(cached.headers);
-      hdrs.set('X-OpsMemory-From-Cache', '1');
-      return new Response(await cached.blob(), {
-        status: cached.status,
-        statusText: cached.statusText,
-        headers: hdrs,
-      });
-    }
+    // Network unreachable. Stale cache, else error.
+    const stale = await _staleResponse(cache, req);
+    if (stale) return stale;
     throw err;
   }
+}
+
+async function _staleResponse(cache, req) {
+  const cached = await cache.match(req);
+  if (!cached) return null;
+  // Mark the response as a cache hit so app.js (step 3) can show a
+  // "stale — offline" indicator. Same-origin response, controlled by
+  // us, no CORS leak risk.
+  const hdrs = new Headers(cached.headers);
+  hdrs.set('X-OpsMemory-From-Cache', '1');
+  return new Response(await cached.blob(), {
+    status: cached.status,
+    statusText: cached.statusText,
+    headers: hdrs,
+  });
 }
