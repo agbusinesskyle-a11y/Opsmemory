@@ -27,6 +27,8 @@ from .logging_config import configure_logging
 from .v1 import router as v1_router
 from .v1_ingest import router as v1_ingest_router
 from .v1_mutations import router as v1_mutations_router
+from .v1_notifications import router as v1_notifications_router
+from .v1_notifications import validate_vapid_config
 from .v1_review import router as v1_review_router
 from .v1_slack_tasks import router as v1_slack_tasks_router
 from .v1_sops import router as v1_sops_router
@@ -163,6 +165,22 @@ async def lifespan(app: FastAPI):
     _enforce_production_safety()
     pool = await init_pool()
     app.state.db = pool
+    # Chunk 10 step 2: VAPID config validation. Cleanly-unconfigured
+    # is OK (Web Push just returns 503). Partially-configured is
+    # fatal (operator started setup but didn't finish).
+    try:
+        vapid = validate_vapid_config({k: v for k, v in os.environ.items()})
+    except ValueError as exc:
+        log.error("vapid_config_invalid", extra={"detail": str(exc)})
+        raise
+    if vapid:
+        app.state.vapid_public_key = vapid["public_key"]
+        log.info("vapid_configured")
+    else:
+        app.state.vapid_public_key = None
+        log.info("vapid_not_configured",
+                 extra={"detail": "VAPID env vars unset; Web Push endpoints "
+                                  "return 503 vapid_unconfigured"})
     log.info("opsmemory_started", extra={"version": os.environ.get("APP_VERSION", "chunk1")})
     try:
         yield
@@ -188,6 +206,7 @@ app.include_router(v1_review_router)
 app.include_router(v1_mutations_router)
 app.include_router(v1_sops_router)
 app.include_router(v1_slack_tasks_router)
+app.include_router(v1_notifications_router)
 
 
 # ---------------------------------------------------------------------------
