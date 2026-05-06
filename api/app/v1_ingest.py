@@ -420,3 +420,222 @@ async def ingest_slack_message(
         "source": "slack_message",
         "source_external_id": source_external_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# File-drop ingest (Chunk 9 step 1)
+# ---------------------------------------------------------------------------
+#
+# n8n watches a Drive folder, downloads the file, and POSTs here with
+# the file's text representation + Drive metadata. OpsMemory canonicalizes
+# the text into raw_content (storing the byte SHA-256 + Drive id +
+# modified_time + filename + mime + folder ids in source_metadata) and
+# queues an ingest_events row.
+#
+# Per Codex chunk-8-close STEP 9 PLAN, this commit ships the endpoint
+# only — the parser + extract prompt + source registry entry land in
+# step 2. Until then, file_drop events sit at status='received' and the
+# worker ignores them (file_drop is not in reconciliation.SOURCES, so
+# the claim filter excludes them).
+#
+# Idempotency: source_external_id = 'drive:{file_id}:{modified_time}'
+# matches Codex's recommendation. The (source, source_external_id)
+# partial UNIQUE from migration 0003 dedupes re-uploads of the same
+# Drive file at the same modified_time. Different modified_time values
+# legitimately represent edited files — distinct events.
+#
+# Codex specifically flagged that content-hash uniqueness for file_drop
+# is wrong (legitimate duplicate spreadsheets across folders), so we
+# don't add a hash UNIQUE — only the partial meeting_recap-only one
+# from migration 0006 stands.
+
+# Drive file id: 30-50 chars typical, alphanumeric + dash/underscore.
+_DRIVE_FILE_ID_PATTERN = r"^[A-Za-z0-9_-]{10,128}$"
+
+
+class FileDropIngest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    file_id: str = Field(..., min_length=10, max_length=128,
+                          pattern=_DRIVE_FILE_ID_PATTERN,
+                          description="Google Drive file id.")
+    modified_time: str = Field(..., min_length=1, max_length=64,
+                                description="ISO-8601 timestamp of the Drive file's last modification.")
+    mime_type: str = Field(..., min_length=1, max_length=128,
+                            description="MIME type as reported by Drive (e.g. 'text/csv', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet').")
+    filename: str = Field(..., min_length=1, max_length=512)
+    file_content: str = Field(..., min_length=1, max_length=200_000,
+                                description="Text representation of the file. n8n is "
+                                            "responsible for converting Excel to CSV when "
+                                            "needed; the parser commit (step 2) will "
+                                            "handle structured-row extraction.")
+    business_slug: str = Field(..., min_length=1, max_length=64,
+                                 description="Business this file is associated with. n8n "
+                                             "maps Drive folder -> business slug; "
+                                             "OpsMemory does not infer business from "
+                                             "folder paths to keep the mapping auditable.")
+    folder_ids: list[str] = Field(default_factory=list, max_length=16,
+                                    description="Drive folder ids in the file's path. "
+                                                "Stored for audit; not used for routing.")
+    web_link: str | None = Field(default=None, max_length=1024,
+                                   description="Drive 'Open' URL (https://drive.google.com/...).")
+    drive_owner_email: str | None = Field(default=None, max_length=256,
+                                            description="Drive file owner email, for audit.")
+    extra: dict[str, Any] = Field(default_factory=dict,
+                                    description="Free-form context from n8n forward.")
+
+
+@router.post("/file_drop")
+async def ingest_file_drop(
+    body: FileDropIngest,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Service-only Drive file-drop ingest.
+
+    Called by n8n after a Drive folder change event. n8n is responsible
+    for verifying Drive's webhook + downloading the file + converting
+    binary formats (XLSX) to text (CSV). OpsMemory trusts the n8n
+    forward; service-key auth + ingest:write scope authenticates the
+    bridge.
+
+    Idempotency:
+      - source_external_id = 'drive:{file_id}:{modified_time}'.
+        Re-posting the same (file_id, modified_time) tuple returns the
+        prior event_id with deduped=true. Edits to the same file (new
+        modified_time) produce distinct events — that's intentional;
+        the operator may want each version reviewed.
+      - File content SHA-256 is stored in source_metadata.byte_sha256
+        for forensic comparison but does NOT participate in any UNIQUE.
+
+    Pipeline behavior in this commit:
+      - The event lands at status='received'. The worker ignores
+        file_drop because it isn't in reconciliation.sources.SOURCES.
+        Step 2 adds the parser + source registry entry; until then,
+        events accumulate as audit/provenance only.
+    """
+    if principal.principal_type != "service":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="file_drop ingest requires a service principal",
+        )
+    require_scope(principal, SCOPE_INGEST_WRITE)
+
+    canonical = canonicalize(body.file_content)
+    if len(canonical) < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="file_content empty after canonicalization",
+        )
+    hash_hex = content_hash(canonical)
+
+    source_external_id = f"drive:{body.file_id}:{body.modified_time}"
+
+    # Validate business_slug exists and is active. n8n's folder->business
+    # mapping config could go stale; surfacing the bad slug as a 422
+    # tells the operator to fix the config rather than silently
+    # creating orphan ingest events.
+    pool = request.app.state.db
+    request_id = getattr(request.state, "request_id", None)
+
+    async with pool.acquire() as conn:
+        biz = await conn.fetchrow(
+            "SELECT id::text AS id, slug::text AS slug "
+            "FROM businesses "
+            "WHERE slug::text = $1 AND deletion_state = 'active'",
+            body.business_slug,
+        )
+        if not biz:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "business_not_found",
+                        "business_slug": body.business_slug,
+                        "detail": "n8n folder->business mapping is stale"},
+            )
+
+        # Idempotency pre-check by (source, source_external_id).
+        existing = await conn.fetchrow(
+            "SELECT id::text AS id, status::text AS status FROM ingest_events "
+            "WHERE source = 'file_drop' AND source_external_id = $1",
+            source_external_id,
+        )
+        if existing:
+            return {
+                "event_id": existing["id"],
+                "status": existing["status"],
+                "deduped": True,
+                "dedup_key": "source_external_id",
+            }
+
+        metadata = {
+            "drive_file_id": body.file_id,
+            "modified_time": body.modified_time,
+            "mime_type": body.mime_type,
+            "filename": body.filename,
+            "folder_ids": body.folder_ids,
+            "web_link": body.web_link,
+            "drive_owner_email": body.drive_owner_email,
+            "byte_sha256": hash_hex,
+            "business_slug": biz["slug"],
+            "business_id": biz["id"],
+            "extra": body.extra,
+        }
+
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO ingest_events
+                  (source, source_external_id, raw_content, normalized_hash,
+                   source_metadata, status,
+                   actor_type, actor_user_id, actor_service_account_id,
+                   request_id)
+                VALUES
+                  ('file_drop', $1, $2, $3, $4::jsonb, 'received',
+                   'service', NULL, $5::uuid, $6)
+                RETURNING id::text AS id, status::text AS status
+                """,
+                source_external_id,
+                canonical,
+                hash_hex,
+                metadata,
+                principal.id,
+                request_id,
+            )
+        except asyncpg.UniqueViolationError:
+            # Race with a concurrent post of the same (file_id, modified_time).
+            existing = await conn.fetchrow(
+                "SELECT id::text AS id, status::text AS status FROM ingest_events "
+                "WHERE source = 'file_drop' AND source_external_id = $1",
+                source_external_id,
+            )
+            if not existing:
+                raise
+            return {
+                "event_id": existing["id"],
+                "status": existing["status"],
+                "deduped": True,
+                "dedup_key": "source_external_id",
+            }
+
+    log.info(
+        "ingest_file_drop_received",
+        extra={
+            "event_id": row["id"],
+            "drive_file_id": body.file_id,
+            "modified_time": body.modified_time,
+            "filename": body.filename,
+            "mime_type": body.mime_type,
+            "business_slug": biz["slug"],
+            "service_id": principal.id,
+            "content_bytes": len(canonical),
+            "request_id": request_id,
+        },
+    )
+
+    return {
+        "event_id": row["id"],
+        "status": row["status"],
+        "deduped": False,
+        "source": "file_drop",
+        "source_external_id": source_external_id,
+    }
