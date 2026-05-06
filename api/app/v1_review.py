@@ -119,7 +119,7 @@ async def list_review_items(
               ri.apply_mutation_id         AS apply_mutation_id,
               ri.last_apply_error          AS last_apply_error
             FROM review_items ri
-            WHERE ri.status::text = ANY($1::text[])
+            WHERE ri.status = ANY($1::review_lifecycle_state[])
             ORDER BY ri.created_at DESC
             LIMIT $2 OFFSET $3
             """,
@@ -129,7 +129,7 @@ async def list_review_items(
         )
         count_row = await conn.fetchrow(
             "SELECT count(*) AS c FROM review_items "
-            "WHERE status::text = ANY($1::text[])",
+            "WHERE status = ANY($1::review_lifecycle_state[])",
             requested,
         )
 
@@ -272,23 +272,38 @@ async def approve_review_item(
 
 async def _persist_apply_failure(pool, review_item_id: str, *,
                                   new_status: str, error_payload: dict) -> None:
-    """Run a separate UPDATE outside the apply txn so the side-effect
+    """Run a guarded UPDATE outside the apply txn so the side-effect
     survives the rolled-back txn.
+
+    Race-safety: the apply txn rolled back without acquiring any locks
+    that survive, so between rollback and this call a concurrent worker
+    or operator could legitimately have rejected, approved, or
+    superseded the same review_item. The guard refuses to demote a row
+    that has left the actionable queue, preserving terminal states.
     """
     import json as _json
     try:
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE review_items
-                   SET status = $2::review_lifecycle_state,
-                       last_apply_error = $3::jsonb
-                 WHERE id = $1::uuid
-                """,
-                review_item_id,
-                new_status,
-                _json.dumps(error_payload),
-            )
+            async with conn.transaction():
+                result = await conn.execute(
+                    """
+                    UPDATE review_items
+                       SET status = $2::review_lifecycle_state,
+                           last_apply_error = $3::jsonb
+                     WHERE id = $1::uuid
+                       AND status IN ('pending', 'needs_changes')
+                       AND applied_at IS NULL
+                       AND apply_mutation_id IS NULL
+                    """,
+                    review_item_id,
+                    new_status,
+                    _json.dumps(error_payload),
+                )
+                # asyncpg returns "UPDATE N" — N=0 means the guard refused.
+                if result.endswith(" 0"):
+                    log.info("persist_apply_failure_skipped_terminal",
+                             extra={"review_item_id": review_item_id,
+                                    "intended_status": new_status})
     except Exception:
         log.exception("persist_apply_failure_failed",
                       extra={"review_item_id": review_item_id})
@@ -330,18 +345,22 @@ async def reject_review_item(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="review_item not found",
                 )
-            if row["status"] == "rejected":
+            current = row["status"]
+            # Idempotent re-reject.
+            if current == "rejected":
                 return {
                     "review_item_id": row["id"],
                     "status": "rejected",
                     "rejection_reason": row["rejection_reason"],
                     "deduped": True,
                 }
-            if row["status"] == "approved":
+            # Terminal states block rejection. The state machine only
+            # allows pending / needs_changes -> rejected.
+            if current not in ("pending", "needs_changes"):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail={"code": "already_approved",
-                            "detail": "cannot reject an approved item"},
+                    detail={"code": "non_actionable_state",
+                            "detail": f"cannot reject from status {current!r}"},
                 )
 
             await conn.execute(

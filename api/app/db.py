@@ -2,10 +2,16 @@
 
 Uses asyncpg with per-connection statement_timeout and
 idle_in_transaction_session_timeout configured on each new connection.
+
+Registers a JSONB codec so jsonb columns return as Python dicts/lists
+instead of raw strings. Without this, code that reads `last_apply_error`
+or `proposed_patch` from the DB has to json.loads() each value
+defensively. The codec runs once per pool connection at setup time.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Optional
@@ -32,6 +38,19 @@ async def init_pool() -> asyncpg.Pool:
     async def _setup_connection(conn: asyncpg.Connection) -> None:
         await conn.execute(f"SET statement_timeout = {statement_timeout_ms}")
         await conn.execute(f"SET idle_in_transaction_session_timeout = {idle_in_tx_ms}")
+        # Auto-decode jsonb / json so callers see dicts/lists, not strings.
+        await conn.set_type_codec(
+            "jsonb",
+            encoder=json.dumps,
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
+        await conn.set_type_codec(
+            "json",
+            encoder=json.dumps,
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
 
     _pool = await asyncpg.create_pool(
         dsn=dsn,
