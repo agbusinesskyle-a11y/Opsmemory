@@ -108,6 +108,13 @@ def insert_service_account(
     quotes). This prevents SQL injection from operator-controlled
     --description text. We pass each value as -v key=value; psql does
     the escaping.
+
+    IMPORTANT: psql's :'varname' substitution does NOT work with
+    `-c "...sql..."` — it only fires in script mode (stdin or
+    `-f file`). Original chunk-1 implementation used `-c sql` and
+    psql passed `:'name'` through to postgres verbatim, which
+    syntax-errored. Fix: feed SQL via stdin so psql processes it
+    in script mode and substitutes correctly.
     """
     container = os.environ.get("POSTGRES_CONTAINER", "postgres")
     role = os.environ.get("ACTION_TRACKER_DB_ROLE", "opsmemory_owner")
@@ -117,10 +124,12 @@ def insert_service_account(
     scopes_csv = ",".join(scopes)  # empty string when no scopes
     expires_iso = expires_at.isoformat() if expires_at else ""
 
-    # psql accepts -v key=value pairs; the SQL body references them
-    # as :'name' for quoted-string literals or :"name" for identifiers.
-    # We use :'name' for all values here. NULL handling for expires_at
-    # is done via NULLIF — empty string from -v becomes SQL NULL.
+    # NOTE: schema also has key_prefix as the lookup column. Auth.py
+    # validates by SELECT WHERE key_prefix = '<env>_<kid>'. The kid
+    # value passed in is just the 16-char random token; we expand
+    # to the full prefix here so the row matches what auth expects.
+    key_prefix = f"opsmem_live_{kid}"
+
     sql = (
         "INSERT INTO service_accounts "
         "(name, description, role, status, key_prefix, key_hash, scopes, expires_at, metadata) "
@@ -128,10 +137,10 @@ def insert_service_account(
         ":'name', "
         ":'description', "
         "'service', 'active', "
-        ":'kid', "
+        ":'key_prefix', "
         ":'key_hash', "
         "string_to_array(NULLIF(:'scopes_csv', ''), ',')::text[], "
-        "CASE WHEN :'expires_iso' = '' THEN NULL ELSE :'expires_iso'::timestamptz END, "
+        "NULLIF(:'expires_iso', '')::timestamptz, "
         ":'metadata_json'::jsonb"
         ");"
     )
@@ -143,14 +152,16 @@ def insert_service_account(
             "-v", "ON_ERROR_STOP=1",
             "-v", f"name={name}",
             "-v", f"description={description}",
-            "-v", f"kid={kid}",
+            "-v", f"key_prefix={key_prefix}",
             "-v", f"key_hash={key_hash}",
             "-v", f"scopes_csv={scopes_csv}",
             "-v", f"expires_iso={expires_iso}",
             "-v", f"metadata_json={metadata}",
-            "-c", sql,
         ],
-        capture_output=True, text=True,
+        input=sql,        # SQL via stdin (script mode) — required
+                          # for :'name' substitution to fire. -c does
+                          # not perform substitution in psql.
+        text=True, capture_output=True,
     )
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout)

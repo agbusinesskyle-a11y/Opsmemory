@@ -18,3 +18,8 @@ pywebpush==2.0.0
 # scheduler resolves IANA tz names at fire time and main.lifespan
 # fails fast if ZoneInfo('America/Phoenix') doesn't resolve.
 tzdata==2024.2
+# Chunk 3 reconciliation pipeline: HTTP client used by llm_client.py to
+# talk to the LiteLLM proxy. Lazy-imported (only loaded when a non-mock
+# provider is configured), but must be available in the image once any
+# real provider lands in INGEST_LLM_*_MODELS.
+httpx==0.28.1

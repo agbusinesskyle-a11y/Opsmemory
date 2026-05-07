@@ -68,7 +68,6 @@ async def _record_llm_call(conn, *, ingest_event_id: str, review_item_id: str | 
         call.latency_ms,
         call.status,
         call.error,
-        None,  # request_id — pipeline runs aren't tied to one HTTP request
     )
 
 
