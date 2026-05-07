@@ -53,6 +53,10 @@ from api.app.db import register_jsonb_codec  # noqa: E402
 from api.app.notifications.weekly_digest import (  # noqa: E402
     build_weekly_digest_payload,
 )
+from api.app.notifications.gmail_sender import (  # noqa: E402
+    preflight_gmail_n8n,
+    send_one_gmail_draft,
+)
 
 
 log = logging.getLogger("opsmemory.run_weekly_digest")
@@ -152,31 +156,63 @@ _TASK_BASE_SELECT = """
            t.priority::text                AS priority,
            COALESCE(t.due_at::text, '')    AS due_iso,
            COALESCE(t.completed_at::text, '') AS completed_iso,
-           u.display_name                  AS owner_display_name
+           -- Codex chunk-11-c1 close: tasks can have multiple
+           -- task_assignees rows. The earlier shape duplicated
+           -- t.id once per assignee. Aggregate names into an
+           -- array, comma-join in Python (matches the
+           -- v1_slack_tasks.py array_agg(DISTINCT) pattern).
+           ARRAY_REMOVE(
+             ARRAY_AGG(DISTINCT u.display_name)
+             FILTER (WHERE u.display_name IS NOT NULL),
+             NULL
+           )                                AS owner_display_names
       FROM tasks t
       JOIN task_businesses tb ON tb.task_id = t.id
       LEFT JOIN task_assignees ta ON ta.task_id = t.id
+                                  AND ta.role = 'assignee'
       LEFT JOIN users u ON u.id = ta.user_id
      WHERE tb.business_id = $1::uuid
        AND t.deletion_state = 'active'
 """
 
 
+_GROUP_BY = " GROUP BY t.id "
+
+
+def _row_to_task(r) -> dict:
+    """Convert an asyncpg row from the aggregated SELECT into the
+    dict shape build_weekly_digest_payload expects.
+
+    owner_display_names is an array (possibly empty). The builder
+    keeps `owner_display_name` as a single string for rendering;
+    we comma-join here to support multi-assignee tasks without
+    changing the builder contract.
+    """
+    names = r.get("owner_display_names") or []
+    owner = ", ".join(names) if names else None
+    return {
+        "id": r["id"],
+        "summary": r["summary"],
+        "status": r["status"],
+        "priority": r["priority"],
+        "due_iso": r["due_iso"] or None,
+        "completed_iso": (r["completed_iso"] or None) if "completed_iso" in r else None,
+        "owner_display_name": owner,
+    }
+
+
 async def _fetch_tasks_open(conn, business_id: str) -> list[dict]:
+    # Postgres allows referencing t.* directly in ORDER BY when
+    # GROUP BY is the table's primary key (functional dependency).
     rows = await conn.fetch(
         _TASK_BASE_SELECT
         + " AND t.status = 'open' "
+        + _GROUP_BY
         + " ORDER BY t.due_at NULLS LAST, t.priority NULLS LAST, t.created_at DESC "
         + " LIMIT 200 ",
         business_id,
     )
-    return [
-        {
-            "id": r["id"], "summary": r["summary"], "status": r["status"],
-            "priority": r["priority"], "due_iso": r["due_iso"] or None,
-            "owner_display_name": r["owner_display_name"],
-        } for r in rows
-    ]
+    return [_row_to_task(r) for r in rows]
 
 
 async def _fetch_tasks_completed_in_window(
@@ -187,18 +223,12 @@ async def _fetch_tasks_completed_in_window(
         + " AND t.status = 'done' "
         + "       AND t.completed_at >= $2::timestamptz "
         + "       AND t.completed_at <  $3::timestamptz "
+        + _GROUP_BY
         + " ORDER BY t.completed_at DESC "
         + " LIMIT 200 ",
         business_id, start_utc, end_utc,
     )
-    return [
-        {
-            "id": r["id"], "summary": r["summary"], "status": r["status"],
-            "priority": r["priority"], "due_iso": r["due_iso"] or None,
-            "completed_iso": r["completed_iso"] or None,
-            "owner_display_name": r["owner_display_name"],
-        } for r in rows
-    ]
+    return [_row_to_task(r) for r in rows]
 
 
 async def _fetch_tasks_stale(
@@ -212,17 +242,12 @@ async def _fetch_tasks_stale(
         + "       AND t.due_at IS NOT NULL "
         + "       AND t.due_at < $3::timestamptz "
         + "       AND t.due_at >= $2::timestamptz "
+        + _GROUP_BY
         + " ORDER BY t.due_at ASC "
         + " LIMIT 200 ",
         business_id, stale_floor_utc, now_utc,
     )
-    return [
-        {
-            "id": r["id"], "summary": r["summary"], "status": r["status"],
-            "priority": r["priority"], "due_iso": r["due_iso"] or None,
-            "owner_display_name": r["owner_display_name"],
-        } for r in rows
-    ]
+    return [_row_to_task(r) for r in rows]
 
 
 def _idempotency_key(business_slug: str, week_start: date) -> str:
@@ -235,17 +260,18 @@ async def main_async(args: argparse.Namespace) -> int:
         print("ERROR: DATABASE_URL must be set", file=sys.stderr)
         return 1
 
-    if args.send:
-        # Step 11 commit 1 only ships dry-run; n8n send is commit 2.
-        print(
-            "ERROR: --send is not yet implemented (chunk 11 commit 2 "
-            "adds the gmail_sender + n8n bridge). Re-run without --send.",
-            file=sys.stderr,
-        )
-        return 1
-
     env_dry = os.environ.get("NOTIFICATIONS_DRY_RUN", "").strip() == "1"
-    dry_run = True or env_dry  # forced dry-run in this commit
+    send_mode = bool(args.send) and not env_dry
+    dry_run = not send_mode
+
+    n8n_config = None
+    if send_mode:
+        try:
+            n8n_config = preflight_gmail_n8n()
+        except RuntimeError as exc:
+            print(f"ERROR: gmail sender preflight failed: {exc}",
+                  file=sys.stderr)
+            return 1
 
     try:
         tz = _resolve_default_tz()
@@ -278,7 +304,11 @@ async def main_async(args: argparse.Namespace) -> int:
         dsn=dsn, min_size=1, max_size=2, setup=register_jsonb_codec,
     )
     considered = 0
-    emitted = 0
+    emitted = 0       # claimed/dry-run rows that produced a payload
+    sent = 0          # send_one_gmail_draft returned status='sent'
+    send_failed = 0   # provider/n8n returned a failure status
+    send_errors = 0   # send_one_gmail_draft itself raised
+    skipped_claim = 0 # send_mode INSERT ON CONFLICT lost the race
     errors = 0
     try:
         async with pool.acquire() as conn:
@@ -325,8 +355,72 @@ async def main_async(args: argparse.Namespace) -> int:
                         generated_at=now_utc,
                     )
                     key = _idempotency_key(biz["slug"], week_start)
+
+                    run_id = None
+                    send_status = None
+                    send_http = None
+                    send_code = None
+                    send_draft_id = None
+                    tag = "[SEND]" if send_mode else "[DRY-RUN]"
+
+                    if send_mode:
+                        # Atomic claim per (business, week_start).
+                        # ON CONFLICT (idempotency_key) DO NOTHING
+                        # serializes parallel runners.
+                        row = await conn.fetchrow(
+                            """
+                            INSERT INTO weekly_digest_runs
+                              (business_id, week_start_iso, week_end_iso,
+                               status, idempotency_key, payload,
+                               scheduled_for)
+                            VALUES
+                              ($1::uuid, $2::date, $3::date,
+                               'scheduled', $4::text, $5::jsonb,
+                               $6::timestamptz)
+                            ON CONFLICT (idempotency_key) DO NOTHING
+                            RETURNING id::text AS id
+                            """,
+                            biz["id"], week_start, week_end,
+                            key, payload, now_utc,
+                        )
+                        if row is None:
+                            print(
+                                f"[CLAIM-SKIP] week={week_start.isoformat()} "
+                                f"business={biz['slug']} key={key} "
+                                f"reason=already_claimed"
+                            )
+                            skipped_claim += 1
+                            continue
+                        run_id = row["id"]
+                        try:
+                            result = await send_one_gmail_draft(
+                                conn,
+                                run_id=run_id,
+                                business=biz,
+                                payload=payload,
+                                n8n_config=n8n_config,
+                            )
+                            send_status = result.status
+                            send_http = result.http_status
+                            send_code = result.code
+                            send_draft_id = result.draft_id
+                            if result.status == "sent":
+                                sent += 1
+                            else:
+                                send_failed += 1
+                        except Exception:
+                            send_errors += 1
+                            send_status = "error"
+                            log.exception(
+                                "weekly_digest_send_error",
+                                extra={
+                                    "run_id": run_id,
+                                    "business_slug": biz.get("slug"),
+                                },
+                            )
+
                     print(
-                        f"[DRY-RUN] week={week_start.isoformat()}..{week_end.isoformat()} "
+                        f"{tag} week={week_start.isoformat()}..{week_end.isoformat()} "
                         f"business={biz['slug']} "
                         f"to={len(payload['to'])} cc={len(payload['cc'])} "
                         f"bcc={len(payload['bcc'])} "
@@ -334,6 +428,11 @@ async def main_async(args: argparse.Namespace) -> int:
                         f"completed={payload['counts']['completed']} "
                         f"stale={payload['counts']['stale']} "
                         f"key={key} "
+                        f"run_id={run_id or '-'} "
+                        f"send={send_status or '-'} "
+                        f"http={send_http or '-'} "
+                        f"code={send_code or '-'} "
+                        f"draft_id={send_draft_id or '-'} "
                         f"subject={payload['subject']!r}"
                     )
                     emitted += 1
@@ -345,11 +444,15 @@ async def main_async(args: argparse.Namespace) -> int:
                                 "business_id": biz.get("id")},
                     )
                     continue
+        tag = "[SEND]" if send_mode else "[DRY-RUN]"
         print(
-            f"[DRY-RUN] considered={considered} emitted={emitted} "
-            f"errors={errors} week={week_start.isoformat()}..{week_end.isoformat()}"
+            f"{tag} considered={considered} emitted={emitted} "
+            f"sent={sent} send_failed={send_failed} "
+            f"send_errors={send_errors} skipped_claim={skipped_claim} "
+            f"errors={errors} "
+            f"week={week_start.isoformat()}..{week_end.isoformat()}"
         )
-        if errors > 0:
+        if errors > 0 or send_errors > 0:
             return 2
         return 0
     finally:
@@ -373,8 +476,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--send", action="store_true", default=False,
-        help="(reserved for chunk 11 commit 2) ship via n8n; "
-             "currently rejected with exit 1.",
+        help="claim a weekly_digest_runs row per business AND ship "
+             "the digest via the n8n Gmail bridge. Without this "
+             "flag the runner stays in dry-run (payload logged, "
+             "no DB writes, no n8n call). NOTIFICATIONS_DRY_RUN=1 "
+             "forces dry-run regardless.",
     )
     parser.add_argument(
         "--limit", type=int, default=None,
