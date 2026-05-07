@@ -32,11 +32,23 @@ class McpClientConfig:
     api_base_url: str
     service_key: str
     request_timeout: float = 15.0
+    # Cloudflare Access service token (defense in depth, optional).
+    # When tracker.kyleconway.ai is fronted by CF Access (the
+    # production setup), the API enforces Cloudflare's edge JWT in
+    # addition to the OpsMemory service key. The MCP server must
+    # then send a CF service-token Client ID + Secret on every
+    # request — CF validates them at the edge and injects the JWT
+    # before forwarding to the API. See docs/13-mcp-runbook.md
+    # § One-time setup #2 for the operator-side CF dashboard
+    # configuration (Service Auth policy + token).
+    cf_client_id: str | None = None
+    cf_client_secret: str | None = None
 
 
 def load_client_config(env: dict[str, str] | None = None) -> McpClientConfig:
-    """Read OPSMEMORY_API_BASE_URL + OPSMEMORY_MCP_SERVICE_KEY from
-    env. Raises RuntimeError on missing/malformed.
+    """Read OPSMEMORY_API_BASE_URL + OPSMEMORY_MCP_SERVICE_KEY (+
+    optional CF service token vars) from env. Raises RuntimeError
+    on missing/malformed.
     """
     e = env if env is not None else os.environ
     base = (e.get("OPSMEMORY_API_BASE_URL") or "").strip()
@@ -52,7 +64,26 @@ def load_client_config(env: dict[str, str] | None = None) -> McpClientConfig:
             "account with --scopes mcp:read and set the printed key."
         )
     timeout = float(e.get("OPSMEMORY_MCP_TIMEOUT_SECONDS", "15"))
-    return McpClientConfig(api_base_url=base, service_key=key, request_timeout=timeout)
+
+    cf_id = (e.get("OPSMEMORY_MCP_CF_CLIENT_ID") or "").strip() or None
+    cf_secret = (e.get("OPSMEMORY_MCP_CF_CLIENT_SECRET") or "").strip() or None
+    # Both-or-neither: partial config is operator misconfig and
+    # better to fail at startup than silently send a half-broken
+    # request through CF Access.
+    if (cf_id and not cf_secret) or (cf_secret and not cf_id):
+        raise RuntimeError(
+            "OPSMEMORY_MCP_CF_CLIENT_ID and OPSMEMORY_MCP_CF_CLIENT_SECRET "
+            "must be set together (or neither, for a localhost / non-CF "
+            "deploy). Got id={!r} secret={}".format(
+                bool(cf_id), "<set>" if cf_secret else "<unset>",
+            )
+        )
+
+    return McpClientConfig(
+        api_base_url=base, service_key=key,
+        request_timeout=timeout,
+        cf_client_id=cf_id, cf_client_secret=cf_secret,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +104,15 @@ async def _api_get(cfg: McpClientConfig, path: str, params: dict | None = None) 
         "Accept": "application/json",
         "X-OpsMemory-Service-Key": cfg.service_key,
     }
+    if cfg.cf_client_id and cfg.cf_client_secret:
+        # CF Access service-token auth. The CF edge validates these
+        # before forwarding to OpsMemory's API; the API in
+        # production also requires the CF JWT that CF injects
+        # post-validation. See auth.py require_principal: the
+        # service-key path explicitly verifies the CF JWT when
+        # AUTH_MODE='cloudflare'.
+        headers["CF-Access-Client-Id"] = cfg.cf_client_id
+        headers["CF-Access-Client-Secret"] = cfg.cf_client_secret
     try:
         async with httpx.AsyncClient(timeout=cfg.request_timeout) as client:
             resp = await client.get(url, params=params, headers=headers)

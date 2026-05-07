@@ -57,7 +57,60 @@ The MCP server reads:
 OPSMEMORY_API_BASE_URL=https://tracker.kyleconway.ai
 OPSMEMORY_MCP_SERVICE_KEY=opsmem_live_<kid>_<secret>
 OPSMEMORY_MCP_TIMEOUT_SECONDS=15   # optional; default 15s
+# ---- Cloudflare Access service token (REQUIRED for production) ----
+OPSMEMORY_MCP_CF_CLIENT_ID=<32-hex>.access
+OPSMEMORY_MCP_CF_CLIENT_SECRET=<64-hex>
 ```
+
+The CF service token is **required** when the API is fronted by
+Cloudflare Access (the standard production deploy). OpsMemory's
+`auth.py require_principal` enforces both layers:
+
+1. CF Access edge JWT (proves the request came through the
+   tunnel) — gated by your CF dashboard's Access policies
+2. OpsMemory service key (proves the app-level account)
+
+If CF Access isn't fronting the API (e.g. local dev / direct
+container access on a private network), leave both
+`OPSMEMORY_MCP_CF_*` vars unset and the MCP server skips the
+CF headers cleanly. Setting only one of the two is a hard error
+at startup (fails preflight).
+
+#### Cloudflare-side setup (one-time, dashboard)
+
+If you don't already have a CF Access service token for this
+deploy, create one:
+
+1. **Cloudflare Zero Trust → Access → Service Auth → Service Tokens**.
+2. Click **Create Service Token**. Name it `opsmemory-mcp` (or any
+   descriptive name). Set duration to non-expiring or whatever
+   your rotation cadence allows.
+3. The dashboard shows **Client ID** and **Client Secret** in a
+   one-time dialog. Copy both immediately to a notepad — the
+   Secret is never displayed again.
+4. **Access → Applications → tracker.kyleconway.ai → Policies**.
+   Add a new policy:
+   - **Action**: `Service Auth` (NOT `Allow` — Allow with a
+     service-token Include rule additionally requires identity
+     provider auth, which a service token can't satisfy).
+   - **Include**: Selector `Service Token`, Value
+     `opsmemory-mcp`.
+   - Save.
+5. Verify with curl:
+
+   ```bash
+   curl -sSi \
+     -H "CF-Access-Client-Id: <id>.access" \
+     -H "CF-Access-Client-Secret: <secret>" \
+     -H "X-OpsMemory-Service-Key: opsmem_live_..." \
+     https://tracker.kyleconway.ai/v1/businesses
+   ```
+
+   Expect `HTTP/2 200` and a JSON `items` list. If you get
+   `HTTP/2 302` redirecting to `cloudflareaccess.com/cdn-cgi/access/login`,
+   the service token didn't validate at the CF edge — most
+   commonly a Client Secret typo (CF only shows it once;
+   regenerate the token if you can't verify).
 
 ### 3. Configure your MCP client
 
