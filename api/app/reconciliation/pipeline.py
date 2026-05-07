@@ -20,11 +20,13 @@ Workflow guarantees:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .extract import extract
 from .file_drop_resolve import resolve_file_drop_context
+from .llm_client import BudgetExceeded, BudgetUnknown
 from .normalize import normalize_candidates
 from .retrieve import retrieve_candidates
 from .choose import choose_action
@@ -33,6 +35,47 @@ from .sources import get_source_config
 from .validate import validate_decision
 
 log = logging.getLogger("opsmemory.reconciliation.pipeline")
+
+
+def _build_budget_pre_check(conn) -> Callable[[], Awaitable[None]]:
+    """Return a pre_check callable that raises BudgetExceeded if today's
+    cumulative llm_calls.cost_usd has reached INGEST_LLM_DAILY_USD_CAP.
+
+    The day boundary is UTC midnight (matches llm_calls.created_at::date
+    semantics in postgres). This is best-effort: a tick that's already
+    past the start of the choose loop can overshoot by up to one
+    candidate's cost while concurrent ticks race the same SUM. For
+    operator-scale volumes this is fine; if Slack ingest pushes
+    >100 events/day we should add a row-locked counter.
+    """
+    cap_str = (os.environ.get("INGEST_LLM_DAILY_USD_CAP") or "").strip()
+    cap: float | None
+    if cap_str:
+        try:
+            cap = float(cap_str)
+        except ValueError:
+            log.warning("budget_cap_unparseable", extra={"value": cap_str})
+            cap = None
+    else:
+        cap = None
+
+    async def check() -> None:
+        if cap is None:
+            return
+        row = await conn.fetchrow(
+            "SELECT COALESCE(SUM(cost_usd), 0)::float8 AS spent "
+            "FROM llm_calls "
+            "WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') "
+            "  AND cost_usd IS NOT NULL"
+        )
+        spent = float(row["spent"]) if row else 0.0
+        if spent >= cap:
+            raise BudgetExceeded(
+                f"daily LLM cap reached: ${spent:.4f} of ${cap:.2f} "
+                f"(INGEST_LLM_DAILY_USD_CAP)"
+            )
+
+    return check
 
 
 async def _record_llm_call(conn, *, ingest_event_id: str, review_item_id: str | None, call) -> None:
@@ -159,6 +202,8 @@ async def process_event(conn, event_id: str) -> dict:
 
     actor_business_ids = await _resolve_actor_business_ids(conn, event)
 
+    budget_pre_check = _build_budget_pre_check(conn)
+
     candidates_raw: list[dict] = []
     try:
         async def on_extract_call(call):
@@ -168,7 +213,32 @@ async def process_event(conn, event_id: str) -> dict:
             raw_content=event["raw_content"],
             source_metadata=event["source_metadata"],
             on_call=on_extract_call,
+            pre_check=budget_pre_check,
         )
+    except BudgetExceeded as exc:
+        # Daily cap reached. Mark event failed but keep retry_count
+        # bumped so tomorrow's first tick re-claims it (status='failed'
+        # is in the worker's recovery WHERE clause). Operator can also
+        # raise the cap and re-run sooner.
+        await conn.execute(
+            "UPDATE ingest_events SET status = 'failed', failed_at = now(), "
+            "error = $2, retry_count = retry_count + 1 WHERE id = $1::uuid",
+            event_id, f"budget_exceeded: {exc}"[:1024],
+        )
+        log.warning("pipeline_budget_exceeded",
+                    extra={"event_id": event_id, "stage": "extract"})
+        return {"event_id": event_id, "status": "failed", "stage": "budget", "error": str(exc)}
+    except BudgetUnknown as exc:
+        # Operator misconfig: a configured model can't be priced. Fail
+        # loudly so it gets fixed rather than silently bypassing the cap.
+        await conn.execute(
+            "UPDATE ingest_events SET status = 'failed', failed_at = now(), "
+            "error = $2, retry_count = retry_count + 1 WHERE id = $1::uuid",
+            event_id, f"budget_unknown: {exc}"[:1024],
+        )
+        log.error("pipeline_budget_unknown",
+                  extra={"event_id": event_id, "stage": "extract", "err": repr(exc)})
+        return {"event_id": event_id, "status": "failed", "stage": "budget_unknown", "error": str(exc)}
     except Exception as exc:
         await conn.execute(
             "UPDATE ingest_events SET status = 'failed', failed_at = now(), "
@@ -209,6 +279,10 @@ async def process_event(conn, event_id: str) -> dict:
 
     # ---- Retrieve + Choose + Validate per candidate ----
     review_count = 0
+    # Set inside the choose-loop's BudgetExceeded handler. After the loop,
+    # we short-circuit to a 'failed' event before the pending_review UPDATE
+    # so the operator sees the budget reason.
+    budget_breach: BudgetExceeded | BudgetUnknown | None = None
     biz_map_rows = await conn.fetch("SELECT id::text AS id, slug::text AS slug FROM businesses")
     business_id_by_slug = {r["slug"]: r["id"] for r in biz_map_rows}
     business_slug_by_id = {v: k for k, v in business_id_by_slug.items()}
@@ -240,7 +314,17 @@ async def process_event(conn, event_id: str) -> dict:
                 retrieval_skipped=retrieval_skipped,
                 prompt_name=source_config.choose_prompt,
                 on_call=on_choose_call_for_cand,
+                pre_check=budget_pre_check,
             )
+        except (BudgetExceeded, BudgetUnknown) as exc:
+            # Halt the whole event; remaining candidates would also fail
+            # the budget check. Don't re-raise — set a sentinel so the
+            # post-loop short-circuit can mark the event with the
+            # specific budget reason. Already-inserted review_items for
+            # earlier candidates remain visible (operator can approve
+            # them); next-day retry re-runs extract from raw_content.
+            budget_breach = exc
+            break
         except Exception as exc:
             log.warning("pipeline_choose_failed", extra={"event_id": event_id, "err": repr(exc)})
             decision = {
@@ -334,6 +418,23 @@ async def process_event(conn, event_id: str) -> dict:
             validation_errors,
         )
         review_count += 1
+
+    # ---- Budget short-circuit (set inside the choose loop) ----
+    if budget_breach is not None:
+        kind = "budget_unknown" if isinstance(budget_breach, BudgetUnknown) else "budget_exceeded"
+        await conn.execute(
+            "UPDATE ingest_events SET status = 'failed', failed_at = now(), "
+            "error = $2, retry_count = retry_count + 1 WHERE id = $1::uuid",
+            event_id, f"{kind}: {budget_breach}"[:1024],
+        )
+        log_fn = log.error if isinstance(budget_breach, BudgetUnknown) else log.warning
+        log_fn(
+            f"pipeline_{kind}",
+            extra={"event_id": event_id, "stage": "choose",
+                   "partial_review_items": review_count},
+        )
+        return {"event_id": event_id, "status": "failed", "stage": kind,
+                "error": str(budget_breach), "review_items": review_count}
 
     # ---- Mark pending_review ----
     await conn.execute(

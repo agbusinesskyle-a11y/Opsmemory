@@ -25,6 +25,7 @@ async def extract(
     raw_content: str,
     source_metadata: dict | None = None,
     on_call=None,
+    pre_check=None,
 ) -> tuple[list[dict], Any]:
     """Run the extract step for one ingest event. Returns
     (candidates_list, last_llm_call_record).
@@ -105,6 +106,7 @@ async def extract(
         prompt_body=prompt,
         prompt_hash=digest,
         on_call=on_call,
+        pre_check=pre_check,
     )
     candidates = response.get("candidates", []) if isinstance(response, dict) else []
     if not isinstance(candidates, list):

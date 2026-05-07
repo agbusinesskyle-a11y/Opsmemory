@@ -28,6 +28,7 @@ async def choose_action(
     retrieval_skipped: bool = False,
     prompt_name: str = "task_choose.v1",
     on_call=None,
+    pre_check=None,
 ) -> tuple[dict, Any | None]:
     """Run the choose step. Returns (decision_dict, llm_call_record_or_None).
 
@@ -78,6 +79,7 @@ async def choose_action(
         prompt_body=prompt,
         prompt_hash=digest,
         on_call=on_call,
+        pre_check=pre_check,
     )
 
     # Validate response shape; return a safe fallback if the LLM emitted
