@@ -1,0 +1,47 @@
+[Unit]
+Description=OpsMemory notification digest scheduler (Chunk 10)
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/opsmemory
+
+# Run the scheduler inside a one-shot container off the API image.
+# The container has DATABASE_URL + VAPID env from docker-compose
+# env_file, plus the asyncpg + pywebpush wheels from the chunk-1
+# requirements. The host doesn't have those deps directly, so the
+# host-side python3 path won't work for this script.
+#
+# --rm cleans up the container after the run.
+# -v mounts scripts/ into /app/scripts/ since the Dockerfile only
+#    COPYs api/ and web/ — not scripts/.
+# --send makes the runner actually claim rows + ship pushes (vs.
+#    dry-run, which just logs payloads).
+#
+# NOTIFICATIONS_DRY_RUN=1 env in /opt/opsmemory/.env (if set)
+# overrides --send and forces dry-run — the kill switch.
+#
+# Lazy per-channel preflight (chunk-10 step 6 close-fix): missing
+# N8N_NOTIFICATION_WEBHOOK_URL doesn't fail the run; slack_dm
+# rows just skip with [SEND-SKIP] reason=channel_preflight_failed.
+ExecStart=/usr/bin/docker compose run --rm \
+  -v /opt/opsmemory/scripts:/app/scripts \
+  opsmemory-api \
+  python3 /app/scripts/run_notification_scheduler.py --send
+
+# tolson is in the docker group; running as that user keeps the
+# unit out of root and matches how OpsMemory's existing deploy
+# operations run.
+User=tolson
+
+# Don't leave a hanging service unit if the run finishes.
+RemainAfterExit=no
+
+# Per-run log lines go to journald automatically via stdout/stderr.
+# Operator: journalctl -u opsmemory-notifications.service -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Not Wanted-by anything user-facing — the timer wakes us up.

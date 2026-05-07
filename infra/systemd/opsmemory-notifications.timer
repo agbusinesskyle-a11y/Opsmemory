@@ -1,0 +1,25 @@
+[Unit]
+Description=Run OpsMemory notification scheduler every 5 minutes
+
+[Timer]
+# 5-min cadence. Combined with the runner's
+# DEFAULT_LOOKBACK_MINUTES=60 (configurable via
+# NOTIFICATIONS_LOOKBACK_MINUTES env), a digest scheduled for
+# e.g. 7:00 Phoenix fires within 5 min of that moment, and a
+# missed window (Spark reboot etc.) up to an hour catches up
+# on next tick.
+OnCalendar=*:0/5
+
+# Persistent=true: if the system was off when a tick should
+# have fired, run the missed tick on next boot.
+Persistent=true
+
+# Modest randomization so two timers (this + chunk-11 weekly
+# digest) don't always start at the exact same second.
+RandomizedDelaySec=15s
+
+# Don't queue up multiple runs if one is slow.
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,41 @@
+[Unit]
+Description=OpsMemory weekly Gmail digest builder (Chunk 11)
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/opsmemory
+
+# Default mode is DRY-RUN: no DB writes, no n8n call, no Gmail
+# drafts. Just builds + logs the would-have-been-sent payload to
+# journalctl. Useful audit while the operator decides who to
+# actually send weekly status to.
+#
+# To FLIP TO SEND: edit this file and add --send to ExecStart:
+#   python3 /app/scripts/run_weekly_digest.py --send
+# Then: sudo systemctl daemon-reload && sudo systemctl restart
+# opsmemory-weekly-digest.timer (timer reload picks up the new
+# service file on next firing).
+#
+# Prerequisites for --send mode:
+#   - At least one row in weekly_digest_allowlist with a real
+#     recipient email
+#   - N8N_GMAIL_DIGEST_WEBHOOK_URL set in /opt/opsmemory/.env
+#     (and optional N8N_GMAIL_DIGEST_WEBHOOK_BEARER)
+#   - n8n workflow at the URL configured to call
+#     Gmail drafts.create with the webhook body fields
+#   See docs/12-weekly-digest-runbook.md for setup details.
+ExecStart=/usr/bin/docker compose run --rm \
+  -v /opt/opsmemory/scripts:/app/scripts \
+  opsmemory-api \
+  python3 /app/scripts/run_weekly_digest.py
+
+User=tolson
+RemainAfterExit=no
+
+# Operator: journalctl -u opsmemory-weekly-digest.service -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]

@@ -1,0 +1,20 @@
+[Unit]
+Description=Run OpsMemory weekly Gmail digest every Monday 8am Phoenix
+
+[Timer]
+# Mon 15:00 UTC = Mon 8:00 AM America/Phoenix (Arizona doesn't
+# observe DST, so the UTC offset is stable year-round at -7).
+OnCalendar=Mon 15:00:00
+
+# Persistent=true: if Spark was off when the Monday tick should
+# have fired, run the missed week on next boot. Per-business
+# idempotency_key (weekly_digest:<slug>:<week_start>) prevents
+# double-claim, so a missed-then-recovered tick is safe.
+Persistent=true
+
+# Modest randomization so chunk-10 + chunk-11 timers don't always
+# fire at the exact same second on coincident calendar moments.
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target
