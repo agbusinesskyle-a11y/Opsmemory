@@ -65,6 +65,14 @@ SCOPE_PIPELINE_READ_ALL = "pipeline:read:all_businesses"
 # tasks, it just authenticates the n8n forwarder.
 SCOPE_SLACK_QUERY = "slack:query"
 
+# Chunk 12: read-only MCP. The mcp-server (api/mcp/server.py)
+# acts as a service principal carrying ONLY this scope. It
+# proxies stdio MCP tool calls (list_tasks, get_task,
+# list_businesses) to the OpsMemory /v1 API. The narrow scope
+# stops a leaked MCP key from doing anything beyond reads — no
+# ingest, no slack, no pipeline access.
+SCOPE_MCP_READ = "mcp:read"
+
 
 def require_scope(principal: Principal, scope: str) -> None:
     """Allow if principal is admin user OR service-with-scope.
@@ -88,12 +96,25 @@ def visible_business_ids(principal: Principal) -> list[str] | None:
 
     None means "no scoping — return everything". Admins get None.
     Owners get the list of their business_membership business ids.
-    Services get [] (default-deny until per-scope rules land).
+    Services default-deny ([]) unless they hold a read scope:
+      - SCOPE_TASKS_READ_ALL: legacy, unrestricted
+      - SCOPE_MCP_READ: chunk 12, unrestricted (single-tenant
+        deploy; revisit when multi-tenant lands)
+      - SCOPE_PIPELINE_READ_ALL: reconciliation worker;
+        the worker uses it for retrieval, but it ALSO unblocks
+        the /v1 read path so a future audit query from the
+        worker doesn't silently see nothing.
     """
     if principal.principal_type == "user" and principal.role == "admin":
         return None
     if principal.principal_type == "user" and principal.role == "owner":
         return [b["id"] for b in principal.businesses]
-    # Service principals: default-deny task visibility for Chunk 2.
-    # Specific scopes will widen this later.
+    if principal.principal_type == "service":
+        scopes = set(principal.scopes or [])
+        if (SCOPE_TASKS_READ_ALL in scopes
+                or SCOPE_MCP_READ in scopes
+                or SCOPE_PIPELINE_READ_ALL in scopes):
+            return None
+        return []
+    # Should be unreachable.
     return []
