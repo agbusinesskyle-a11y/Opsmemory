@@ -1,0 +1,25 @@
+[Unit]
+Description=Run OpsMemory reconciliation worker every 5 minutes
+
+[Timer]
+# Every 5 minutes of every hour. The worker re-claims any event in
+# status='received' (or stale 'extracting'/'failed') and processes
+# up to 10 in one tick. ingest_events_status_idx + FOR UPDATE SKIP
+# LOCKED in run_pipeline.py's claim loop makes overlapping ticks
+# safe (no two workers can own the same row).
+OnCalendar=*:0/5
+
+# Persistent=true: if Spark was off when a tick should have fired,
+# run it once on next boot. Events are durable in postgres so a
+# catch-up tick just processes the backlog. SKIP LOCKED prevents
+# double-processing if multiple ticks race on first boot.
+Persistent=true
+
+# Randomize so the worker doesn't fire at the same wall-clock
+# second as opsmemory-notifications.timer (also *:0/5) or other
+# system timers. Avoids upstream rate-limit stampedes when several
+# things tick on the same minute.
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,32 @@
+[Unit]
+Description=OpsMemory reconciliation worker (Chunk 3)
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/opsmemory
+
+# Pull the next batch of pending ingest_events through extract /
+# normalize / retrieve / choose / queue-review. --limit 10 bounds
+# a single tick's blast radius — if a poison-pill event keeps
+# failing, it doesn't burn the whole queue or the daily LLM budget
+# (INGEST_LLM_DAILY_USD_CAP) in one tick.
+#
+# The scripts bind-mount mirrors chunk-11's weekly digest service;
+# run_pipeline.py is shipped on the host, not baked into the image.
+#
+# Operator: journalctl -u opsmemory-worker.service -f
+ExecStart=/usr/bin/docker compose run --rm \
+  -v /opt/opsmemory/scripts:/app/scripts \
+  opsmemory-api \
+  python3 /app/scripts/run_pipeline.py --limit 10
+
+User=tolson
+RemainAfterExit=no
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

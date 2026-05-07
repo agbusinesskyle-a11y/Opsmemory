@@ -70,8 +70,11 @@ def _build_budget_pre_check(conn) -> Callable[[], Awaitable[None]]:
         )
         spent = float(row["spent"]) if row else 0.0
         if spent >= cap:
+            # Format both sides with 4 decimals so sub-cent caps used
+            # for testing (e.g. INGEST_LLM_DAILY_USD_CAP=0.001) don't
+            # render as "$0.00" in the operator-visible error.
             raise BudgetExceeded(
-                f"daily LLM cap reached: ${spent:.4f} of ${cap:.2f} "
+                f"daily LLM cap reached: ${spent:.4f} of ${cap:.4f} "
                 f"(INGEST_LLM_DAILY_USD_CAP)"
             )
 
