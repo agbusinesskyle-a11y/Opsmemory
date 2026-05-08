@@ -421,6 +421,42 @@ async def ingest_slack_message(
 
     pool = request.app.state.db
     async with pool.acquire() as conn:
+        # Hard channel gate: refuse messages from channels that aren't
+        # in slack_channel_mappings with status='active'. Per Codex
+        # Phase-C-plan review: AMBIGUOUS review_items are fine for
+        # unresolved owners, NOT for unknown channels. n8n already
+        # filters via its own allowlist as a first-line check; this is
+        # the authoritative server-side gate so a misconfigured n8n
+        # forward (or future direct service-account caller) can't
+        # bypass it. Distinguish 'not_mapped' from 'paused' so the
+        # operator can fix either case without a stack trace.
+        mapping = await conn.fetchrow(
+            "SELECT status::text AS status, business_id::text AS business_id "
+            "FROM slack_channel_mappings "
+            "WHERE team_id = $1 AND channel_id = $2",
+            body.team_id, body.channel_id,
+        )
+        if not mapping:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "channel_not_mapped",
+                        "team_id": body.team_id,
+                        "channel_id": body.channel_id,
+                        "detail": "no slack_channel_mappings row; add one "
+                                  "with status='active' to enable ingest"},
+            )
+        if mapping["status"] != "active":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "channel_paused",
+                        "team_id": body.team_id,
+                        "channel_id": body.channel_id,
+                        "status": mapping["status"],
+                        "detail": "slack_channel_mappings.status is "
+                                  "not 'active'; flip to 'active' to "
+                                  "resume or remove the n8n forward"},
+            )
+
         # Slack idempotency is by source_external_id ONLY (the
         # canonical message ts). NO content-hash dedup — short
         # repeated messages across channels are legitimately distinct
