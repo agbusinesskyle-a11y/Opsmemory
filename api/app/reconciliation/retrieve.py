@@ -119,14 +119,20 @@ async def retrieve_candidates(
 
     if time_low and time_high:
         where.append(
-            f"(t.due_at IS NULL OR (t.due_at >= {p(time_low.isoformat())}::timestamptz "
-            f"AND t.due_at <= {p(time_high.isoformat())}::timestamptz))"
+            f"(t.due_at IS NULL OR (t.due_at >= {p(time_low)}::timestamptz "
+            f"AND t.due_at <= {p(time_high)}::timestamptz))"
         )
     elif recency_low is not None:
         # No due hint, source set a recency fallback (Slack 14d).
         # last_activity_at is non-null on every task, so no IS NULL escape.
+        # NOTE: pass the datetime object directly. asyncpg encodes it to
+        # the timestamptz wire format; .isoformat() would send a string
+        # which asyncpg rejects ("expected datetime ... got str") for the
+        # ::timestamptz parameter. This bug only surfaced for slack_message
+        # because meeting_recap has retrieval_recency_fallback_days=None
+        # and therefore never hits this branch.
         where.append(
-            f"t.last_activity_at >= {p(recency_low.isoformat())}::timestamptz"
+            f"t.last_activity_at >= {p(recency_low)}::timestamptz"
         )
 
     if tokens:
