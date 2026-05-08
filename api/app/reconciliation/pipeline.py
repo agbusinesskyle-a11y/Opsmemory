@@ -271,6 +271,30 @@ async def process_event(conn, event_id: str) -> dict:
                 source_metadata=event["source_metadata"],
             )
 
+    # ---- Source-agnostic owner-name resolution -----------------------------
+    # normalize.py mapped owner_hint (free-form name from the LLM) to a
+    # canonical owner_display via OWNER_ALIASES_DISPLAY. We now look that
+    # canonical name up in the users table to populate owner_user_id, so
+    # the CREATE_TASK patch's _apply_create_task can write a
+    # task_assignees row on approve. Slack mention-based resolution
+    # (slack_resolve) takes priority — only run this for candidates
+    # without an already-resolved owner_user_id. case-insensitive match
+    # so "Joanna Noriega" / "joanna noriega" both resolve.
+    for cand in normalized:
+        if cand.get("owner_user_id"):
+            continue
+        display = cand.get("owner_display")
+        if not display:
+            continue
+        row = await conn.fetchrow(
+            "SELECT id::text AS id FROM users "
+            "WHERE display_name ILIKE $1 AND status = 'active' "
+            "LIMIT 1",
+            display,
+        )
+        if row:
+            cand["owner_user_id"] = row["id"]
+
     if not normalized:
         # No actionable candidates extracted — completed with zero review items.
         await conn.execute(
