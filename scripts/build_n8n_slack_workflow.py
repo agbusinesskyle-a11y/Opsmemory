@@ -63,6 +63,42 @@ REACTION_JS_PATH = REPO_ROOT / "infra" / "n8n" / "slack-ingest-build-reaction-bo
 MEMO_EMOJI = "memo"  # without colons; matches reaction.event.reaction
 
 
+# Codex post-launch v2 review (2026-05-08): flatten body.event.* into
+# top-level fields so the IF dispatch nodes can route on simple
+# string equality instead of optional-chained `body?.event?.type`
+# expressions, which were silently routing the reaction event down
+# the wrong branch in n8n 2.18.5. Also makes the workflow human-
+# readable in the n8n editor — the IF parameters show
+# `slackEventType === 'reaction_added'` instead of nested chain.
+NORMALIZE_JS = """\
+// Normalize Slack event — flatten body.event.* into top-level fields
+// so downstream IF dispatch nodes can route on $json.slackEventType
+// and $json.slackReaction directly. Codex 2026-05-08 review found
+// optional-chained expressions in IF nodes were silently routing
+// reaction events down the wrong branch. The fix is to do the
+// chain-walk once here, in JS, and surface flat fields.
+
+const item = $input.first().json;
+const body = item.body || {};
+const ev = body.event || {};
+const target = ev.item || {};
+
+return [{
+  json: {
+    // Pass through everything from HMAC Verify so downstream code
+    // nodes can still see body.* if they need it.
+    ...item,
+    // New flat fields the IF dispatch nodes route on:
+    slackEventType: ev.type || '',
+    slackReaction: ev.reaction || '',
+    slackItemType: target.type || '',
+    slackItemChannel: target.channel || '',
+    slackItemTs: target.ts || '',
+  }
+}];
+"""
+
+
 def _id() -> str:
     return str(uuid.uuid4())
 
@@ -80,7 +116,10 @@ def build_workflow() -> dict:
     nid_resp_401 = _id()
     nid_if_urlv = _id()
     nid_resp_challenge = _id()
+    nid_normalize = _id()
     nid_if_reaction = _id()
+    nid_if_prep_skip = _id()  # NEW: IF skip? after Reaction prep
+    nid_resp_prep_skip = _id()  # NEW: silent drop on prep skip
 
     # Mention path
     nid_build = _id()
@@ -220,6 +259,23 @@ def build_workflow() -> dict:
             "typeVersion": 1,
             "position": [XCOL(4), Y_MID],
         },
+        # ----- Normalize Slack event (flatten body.event.* to top-level) -----
+        # Codex 2026-05-08 review: optional-chained expressions in n8n
+        # IF nodes were silently routing reaction events the wrong way.
+        # This Code node walks body.event.* once and surfaces the
+        # critical fields as plain top-level strings so downstream
+        # IF nodes can compare with simple equality.
+        {
+            "parameters": {
+                "language": "javaScript",
+                "jsCode": NORMALIZE_JS,
+            },
+            "id": nid_normalize,
+            "name": "Normalize Slack event",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [XCOL(4), Y_MID + 100],
+        },
         # ----- Dispatch by event type (reaction vs mention/other) -----
         {
             "parameters": {
@@ -232,7 +288,7 @@ def build_workflow() -> dict:
                     "conditions": [
                         {
                             "id": _id(),
-                            "leftValue": "={{ $json.body?.event?.type }}",
+                            "leftValue": "={{ $json.slackEventType }}",
                             "rightValue": "reaction_added",
                             "operator": {
                                 "type": "string",
@@ -351,7 +407,7 @@ def build_workflow() -> dict:
                     "conditions": [
                         {
                             "id": _id(),
-                            "leftValue": "={{ $json.body?.event?.reaction }}",
+                            "leftValue": "={{ $json.slackReaction }}",
                             "rightValue": MEMO_EMOJI,
                             "operator": {
                                 "type": "string",
@@ -391,6 +447,52 @@ def build_workflow() -> dict:
             "typeVersion": 2,
             "position": [XCOL(6), Y_REACT - 60],
         },
+        # IF the prep returned skip:true (reaction not on a message,
+        # missing channel/ts, etc), bail to a 200 silent before we'd
+        # otherwise call Slack API with undefined params. Codex
+        # 2026-05-08 review caught this — the original v2 always
+        # called conversations.history regardless of prep output.
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": True,
+                        "leftValue": "",
+                        "typeValidation": "strict",
+                    },
+                    "conditions": [
+                        {
+                            "id": _id(),
+                            "leftValue": "={{ $json.skip }}",
+                            "rightValue": True,
+                            "operator": {
+                                "type": "boolean",
+                                "operation": "true",
+                                "singleValue": True,
+                            },
+                        }
+                    ],
+                    "combinator": "and",
+                },
+                "options": {},
+            },
+            "id": nid_if_prep_skip,
+            "name": "IF prep skip?",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [XCOL(6) + 100, Y_REACT - 60],
+        },
+        {
+            "parameters": {
+                "respondWith": "noData",
+                "options": {"responseCode": 200},
+            },
+            "id": nid_resp_prep_skip,
+            "name": "Respond 200 prep skip",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [XCOL(6) + 100, Y_REACT - 200],
+        },
         {
             "parameters": {
                 "method": "GET",
@@ -402,6 +504,11 @@ def build_workflow() -> dict:
                     "parameters": [
                         {"name": "channel",
                          "value": "={{ $json.slackChannel }}"},
+                        # Bracket the target ts on both sides so Slack
+                        # returns exactly the message we want, not the
+                        # nearest visible neighbor (Codex review).
+                        {"name": "oldest",
+                         "value": "={{ $json.slackLatest }}"},
                         {"name": "latest",
                          "value": "={{ $json.slackLatest }}"},
                         {"name": "inclusive", "value": "true"},
@@ -532,8 +639,11 @@ def build_workflow() -> dict:
         "IF url_verification?": {
             "main": [
                 [{"node": "Respond 200 challenge", "type": "main", "index": 0}],
-                [{"node": "IF reaction_added?", "type": "main", "index": 0}],
+                [{"node": "Normalize Slack event", "type": "main", "index": 0}],
             ]
+        },
+        "Normalize Slack event": {
+            "main": [[{"node": "IF reaction_added?", "type": "main", "index": 0}]]
         },
         "IF reaction_added?": {
             "main": [
@@ -564,7 +674,15 @@ def build_workflow() -> dict:
             ]
         },
         "Reaction prep": {
-            "main": [[{"node": "Slack: fetch reacted message", "type": "main", "index": 0}]]
+            "main": [[{"node": "IF prep skip?", "type": "main", "index": 0}]]
+        },
+        "IF prep skip?": {
+            "main": [
+                # true branch (prep returned skip:true) -> 200 silent
+                [{"node": "Respond 200 prep skip", "type": "main", "index": 0}],
+                # false branch -> proceed to Slack history
+                [{"node": "Slack: fetch reacted message", "type": "main", "index": 0}],
+            ]
         },
         "Slack: fetch reacted message": {
             "main": [[{"node": "Build reaction body", "type": "main", "index": 0}]]

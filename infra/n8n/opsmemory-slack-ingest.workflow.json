@@ -10,7 +10,7 @@
           "rawBody": true
         }
       },
-      "id": "e7904e2e-eed0-42be-9817-5aae02da3d7e",
+      "id": "bd7f13c2-1c69-4b89-ba45-ea1b98bd712c",
       "name": "Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
@@ -18,14 +18,14 @@
         240,
         300
       ],
-      "webhookId": "c520018a-d0ae-499c-81d3-4523a959425b"
+      "webhookId": "48ab6978-29ad-4480-95ae-89854247d1cb"
     },
     {
       "parameters": {
         "language": "javaScript",
         "jsCode": "// n8n Code node script \u2014 Slack HMAC v0 verify.\n//\n// Drop this verbatim into the FIRST Code node after the Webhook\n// trigger in the slack-ingest workflow.\n//\n// Companion docs:\n//   docs/15-slack-edge-adapter-contract.md (the contract)\n//   docs/16-slack-n8n-build-runbook.md     (step-by-step n8n setup)\n//   scripts/slack_hmac_fixture.py          (Python reference + tests)\n//\n// Prerequisites:\n//   - Webhook node configured with \"Raw Body\" enabled. The raw bytes\n//     must arrive via $binary.data.data (base64); if you parse the\n//     body before HMAC, the canonical key ordering shifts and the\n//     signature will not match.\n//   - n8n credential 'Slack Signing Secret' (Generic Credentials\n//     type, single 'value' field). Reference it via\n//     $credentials.slackSigningSecret in n8n's credentials helper,\n//     OR \u2014 if your version doesn't expose it that way \u2014 fall back\n//     to an n8n environment variable SLACK_SIGNING_SECRET.\n//\n// Output (single item):\n//   { reject: true, reason: '<why>' }              - n8n returns 401\n//   { reject: false, eventType: 'url_verification', challenge: '...' } - 200 + challenge\n//   { reject: false, eventType: 'event_callback', body: {...} } - continue downstream\n//\n// The output schema is the contract for the next node (the IF /\n// router). Keep the field names stable.\n\nconst crypto = require('crypto');\n\n// ---- Get signing secret from credential or env --------------------\nlet signingSecret = null;\ntry {\n  // Preferred: a Generic Credentials credential in n8n.\n  signingSecret = $credentials?.slackSigningSecret?.value ?? null;\n} catch (e) { /* credential not bound; fall through */ }\nif (!signingSecret) {\n  signingSecret = $env?.SLACK_SIGNING_SECRET ?? null;\n}\nif (!signingSecret) {\n  throw new Error(\n    'Slack signing secret not found. Bind the \"Slack Signing Secret\" ' +\n    'credential to this Code node OR set SLACK_SIGNING_SECRET in n8n env.'\n  );\n}\n\n// ---- Pull headers (case-insensitive) -----------------------------\nconst item = $input.first();\nconst headers = item.json?.headers ?? {};\nconst h = {};\nfor (const k in headers) h[k.toLowerCase()] = headers[k];\n\nconst sigHeader = h['x-slack-signature'];\nconst tsHeader = h['x-slack-request-timestamp'];\n\nif (!sigHeader) {\n  return [{ json: { reject: true, reason: 'missing_signature_header' } }];\n}\nif (!tsHeader) {\n  return [{ json: { reject: true, reason: 'missing_timestamp_header' } }];\n}\n\n// ---- Replay protection: 5-min skew (Slack-recommended) -----------\nconst now = Math.floor(Date.now() / 1000);\nconst ts = parseInt(tsHeader, 10);\nif (Number.isNaN(ts) || Math.abs(now - ts) > 300) {\n  return [{ json: { reject: true, reason: 'timestamp_skew_exceeded' } }];\n}\n\n// ---- Raw body -----------------------------------------------------\n// Webhook node with \"Raw Body\" puts bytes here. Some n8n versions\n// route them slightly differently \u2014 try the documented path first\n// then fall back to alternatives we've seen in 2.x deployments.\nlet rawBody = null;\ntry {\n  const b64 = item.binary?.data?.data;  // n8n 2.x default for Raw Body\n  if (b64) rawBody = Buffer.from(b64, 'base64');\n} catch (_e) { /* fall through */ }\nif (!rawBody) {\n  // Fallback: some webhook configs leave the raw string at item.json.body\n  // when the request had Content-Type application/json. NOT\n  // canonical \u2014 only safe if no JSON re-serialization happened\n  // upstream. Use only if Raw Body binary path is unavailable.\n  const bodyStr = typeof item.json?.body === 'string'\n    ? item.json.body : null;\n  if (bodyStr) rawBody = Buffer.from(bodyStr, 'utf8');\n}\nif (!rawBody) {\n  return [{ json: { reject: true, reason: 'raw_body_unavailable' } }];\n}\n\n// ---- Compute expected signature ---------------------------------\nconst base = Buffer.concat([Buffer.from(`v0:${tsHeader}:`), rawBody]);\nconst expected =\n  'v0=' + crypto.createHmac('sha256', signingSecret).update(base).digest('hex');\n\n// ---- Constant-time compare (lengths must match) -----------------\nif (sigHeader.length !== expected.length) {\n  return [{ json: { reject: true, reason: 'signature_length_mismatch' } }];\n}\nconst a = Buffer.from(sigHeader);\nconst b = Buffer.from(expected);\nif (!crypto.timingSafeEqual(a, b)) {\n  return [{ json: { reject: true, reason: 'signature_mismatch' } }];\n}\n\n// ---- Verified. Parse body for downstream nodes ------------------\nlet parsed;\ntry {\n  parsed = JSON.parse(rawBody.toString('utf8'));\n} catch (e) {\n  return [{ json: { reject: true, reason: 'body_not_json' } }];\n}\n\nif (parsed.type === 'url_verification') {\n  return [{\n    json: {\n      reject: false,\n      eventType: 'url_verification',\n      challenge: parsed.challenge,\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    reject: false,\n    eventType: parsed.type || 'unknown',\n    body: parsed,\n  }\n}];\n"
       },
-      "id": "583fa791-39df-4920-98d3-384260cff6a4",
+      "id": "d571897c-ad54-40b8-96f3-bc264ed20b0f",
       "name": "HMAC Verify",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -44,7 +44,7 @@
           },
           "conditions": [
             {
-              "id": "f3b124c1-a637-4003-b1ab-987b18f00cf5",
+              "id": "70746576-4638-472a-a1c4-8898c7373547",
               "leftValue": "={{ $json.reject }}",
               "rightValue": true,
               "operator": {
@@ -58,7 +58,7 @@
         },
         "options": {}
       },
-      "id": "511eb5e9-2816-4cb3-81ef-63d003934127",
+      "id": "14758ecf-651e-4ea6-b06c-13c8f6988a1e",
       "name": "IF reject?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
@@ -75,7 +75,7 @@
           "responseCode": 401
         }
       },
-      "id": "e7fa53e0-0895-4e97-80a9-a734da4b50de",
+      "id": "c81ed0aa-f7c8-462e-beb0-af52c0a89238",
       "name": "Respond 401 rejected",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
@@ -94,7 +94,7 @@
           },
           "conditions": [
             {
-              "id": "7039419a-aab7-4171-b6b0-60586e905820",
+              "id": "09ccf374-ab04-40ef-92ea-fa0e06c1b6eb",
               "leftValue": "={{ $json.eventType }}",
               "rightValue": "url_verification",
               "operator": {
@@ -107,7 +107,7 @@
         },
         "options": {}
       },
-      "id": "149f3629-09a6-463d-b87d-1fc11b9ca2ed",
+      "id": "a4e3bede-f33f-46ac-836e-982616020922",
       "name": "IF url_verification?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
@@ -124,13 +124,27 @@
           "responseCode": 200
         }
       },
-      "id": "32ae4193-3772-447c-8174-c6009da3561b",
+      "id": "f65588df-3b32-4b0f-85b7-21a6700473e6",
       "name": "Respond 200 challenge",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
       "position": [
         1120,
         300
+      ]
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Normalize Slack event \u2014 flatten body.event.* into top-level fields\n// so downstream IF dispatch nodes can route on $json.slackEventType\n// and $json.slackReaction directly. Codex 2026-05-08 review found\n// optional-chained expressions in IF nodes were silently routing\n// reaction events down the wrong branch. The fix is to do the\n// chain-walk once here, in JS, and surface flat fields.\n\nconst item = $input.first().json;\nconst body = item.body || {};\nconst ev = body.event || {};\nconst target = ev.item || {};\n\nreturn [{\n  json: {\n    // Pass through everything from HMAC Verify so downstream code\n    // nodes can still see body.* if they need it.\n    ...item,\n    // New flat fields the IF dispatch nodes route on:\n    slackEventType: ev.type || '',\n    slackReaction: ev.reaction || '',\n    slackItemType: target.type || '',\n    slackItemChannel: target.channel || '',\n    slackItemTs: target.ts || '',\n  }\n}];\n"
+      },
+      "id": "fd5551bb-2ad5-4500-be10-600ad6ca1cea",
+      "name": "Normalize Slack event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        400
       ]
     },
     {
@@ -143,8 +157,8 @@
           },
           "conditions": [
             {
-              "id": "f5fbf8be-fe74-44cb-8a1e-b44b6ee96889",
-              "leftValue": "={{ $json.body?.event?.type }}",
+              "id": "3ec7e585-fb69-440b-8d47-b8aaf297bd98",
+              "leftValue": "={{ $json.slackEventType }}",
               "rightValue": "reaction_added",
               "operator": {
                 "type": "string",
@@ -156,7 +170,7 @@
         },
         "options": {}
       },
-      "id": "77ee11ac-cd41-4fc4-a645-ea4fa8ed1bba",
+      "id": "aec434ea-aa53-4c19-b436-4056d3007365",
       "name": "IF reaction_added?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
@@ -170,7 +184,7 @@
         "language": "javaScript",
         "jsCode": "// n8n Code node script \u2014 build OpsMemory /v1/ingest/slack body.\n//\n// Drop this verbatim into the Code node AFTER the IF router that\n// has separated event_callback events from url_verification.\n//\n// Input (from HMAC-verify Code node):\n//   { reject: false, eventType: 'event_callback', body: {<full slack event>} }\n//\n// Output (single item, schema below):\n//   skip=true      -> downstream IF routes to \"Respond 200 silent\" (drop)\n//   skip=false     -> downstream HTTP Request node POSTs opsMemoryBody\n//\n// Filtering rules for launch (per Codex Phase C trim):\n//   - Only app_mention events go through. Every other subtype\n//     (message.channels, message.im, reaction_added, etc.)\n//     is dropped silently with skip=true. Reactions are explicitly\n//     deferred until threaded-message handling is tested.\n//   - Empty messages after stripping the bot mention are dropped.\n//   - Bot messages (subtype=bot_message OR ev.bot_id) are dropped\n//     to avoid the bot ingesting itself.\n//\n// Mention stripping:\n//   Slack delivers mention text as \"<@U01OPSMEM> rest of message\".\n//   We strip the LEADING bot mention so the LLM extract step doesn't\n//   waste tokens on the routing token. Original is preserved in\n//   extra.original_text for audit reproduction.\n\nconst item = $input.first().json;\n\n// Defensive: if upstream node passed reject:true through somehow,\n// drop. (The IF router in front of this node should have handled\n// it, but belt-and-braces.)\nif (item.reject) {\n  return [{ json: { skip: true, reason: 'upstream_reject' } }];\n}\n\nconst body = item.body;\nif (!body) {\n  return [{ json: { skip: true, reason: 'no_body' } }];\n}\n\nif (body.type !== 'event_callback') {\n  return [{ json: { skip: true, reason: 'not_event_callback' } }];\n}\n\nconst ev = body.event ?? {};\nif (ev.type !== 'app_mention') {\n  return [{ json: { skip: true, reason: `event_type_${ev.type ?? 'missing'}` } }];\n}\n\n// Drop bot messages (bot ingesting itself, or another bot in channel).\nif (ev.subtype === 'bot_message' || ev.bot_id) {\n  return [{ json: { skip: true, reason: 'bot_message' } }];\n}\n\n// Strip leading <@U...> mentions. Slack only routes app_mention to\n// us when the bot is mentioned, but the user might have multiple\n// mentions in one message (\"<@OPSMEMORY> please assign <@JOANNA>...\").\n// We only strip OUR bot's mention if we know the bot user id; for\n// safety strip ALL leading mentions until non-mention content.\nconst originalText = ev.text ?? '';\nconst mentionStripped = originalText\n  .replace(/^(\\s*<@[UW][A-Z0-9]+>\\s*)+/, '')\n  .trim();\n\nif (mentionStripped.length < 1) {\n  return [{ json: { skip: true, reason: 'empty_after_mention_strip' } }];\n}\n\n// Build the OpsMemory /v1/ingest/slack body.\n// Schema source: api/app/v1_ingest.py SlackIngest pydantic model.\nconst opsMemoryBody = {\n  team_id: body.team_id,\n  channel_id: ev.channel,\n  ts: ev.ts,\n  text: mentionStripped,\n  user_id: ev.user ?? null,\n  thread_ts: ev.thread_ts ?? null,\n  channel_name: null,        // populate via channels:read API if desired\n  user_name: null,           // populate via users:read API if desired\n  team_domain: null,\n  workspace_name: null,\n  enterprise_id: body.authorizations?.[0]?.enterprise_id ?? null,\n  extra: {\n    slack_event_id: body.event_id,\n    slack_event_type: 'app_mention',\n    original_text: originalText,\n    api_app_id: body.api_app_id,\n  },\n};\n\nreturn [{\n  json: {\n    skip: false,\n    opsMemoryBody,\n    // Convenience fields for n8n IF nodes / logs:\n    team_id: body.team_id,\n    channel_id: ev.channel,\n    ts: ev.ts,\n  }\n}];\n"
       },
-      "id": "0a89ecee-76cd-4dd4-b7ac-77fb8872fcbe",
+      "id": "630d2bab-c13e-4f07-981e-e534c66e696d",
       "name": "Build OpsMemory body",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -189,7 +203,7 @@
           },
           "conditions": [
             {
-              "id": "68a05402-8948-4697-9ab9-a8c54ff11ae9",
+              "id": "f8da6107-27a7-4b07-85bd-60c76f91686a",
               "leftValue": "={{ $json.skip }}",
               "rightValue": true,
               "operator": {
@@ -203,7 +217,7 @@
         },
         "options": {}
       },
-      "id": "cb2e5622-5b0c-4efb-b80e-b110346a08b3",
+      "id": "2cb58eb6-1cb9-4c29-b14a-2228ff663e71",
       "name": "IF skip?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
@@ -219,7 +233,7 @@
           "responseCode": 200
         }
       },
-      "id": "9a2b3e70-f659-418b-a35d-4bcbb1a76602",
+      "id": "31afe665-d579-4d49-a43a-be8afd7828a4",
       "name": "Respond 200 silent",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
@@ -246,7 +260,7 @@
           }
         }
       },
-      "id": "64bb63a5-6a45-47ec-bf20-cd099df389a3",
+      "id": "8e75b15f-49a9-4100-aec1-3946d5d0a6f5",
       "name": "POST /v1/ingest/slack",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -267,7 +281,7 @@
           "responseCode": 200
         }
       },
-      "id": "a4a86057-d2bb-4eb0-961c-6c8b22034560",
+      "id": "59f04500-5d9c-4c4a-84f1-325a243d2761",
       "name": "Respond 200 final",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
@@ -286,8 +300,8 @@
           },
           "conditions": [
             {
-              "id": "d241a5bc-4a2e-44f4-9b92-2996329478e3",
-              "leftValue": "={{ $json.body?.event?.reaction }}",
+              "id": "6a5142ba-9654-48b3-a2b7-0b01299f68b1",
+              "leftValue": "={{ $json.slackReaction }}",
               "rightValue": "memo",
               "operator": {
                 "type": "string",
@@ -299,7 +313,7 @@
         },
         "options": {}
       },
-      "id": "5256e78f-ee0d-417e-a29b-3e97c6fd6568",
+      "id": "d13705c7-b2ed-46af-9636-f2f51cda1154",
       "name": "IF reaction is memo?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
@@ -315,7 +329,7 @@
           "responseCode": 200
         }
       },
-      "id": "c49204be-d396-4efa-8c84-dfc2d9566285",
+      "id": "c1b51f03-18a6-4737-b656-dfd273be2160",
       "name": "Respond 200 wrong emoji",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
@@ -329,13 +343,62 @@
         "language": "javaScript",
         "jsCode": "// n8n Code node \u2014 prepare a Slack conversations.history call.\n//\n// Drop this verbatim into the Code node BEFORE the HTTP Request node\n// that calls Slack's API on the reaction_added branch. We use a Code\n// node here (instead of binding query strings directly on the HTTP\n// Request node) because reaction events have several layout variants\n// \u2014 `item.type='message'` always, but `item.ts` is the canonical\n// reacted-to message timestamp regardless of whether the original\n// is top-level or threaded.\n//\n// Companion docs:\n//   docs/15-slack-edge-adapter-contract.md (the contract)\n//   docs/16-slack-n8n-build-runbook.md     (step-by-step n8n setup)\n//\n// Input (from the IF \"reaction is memo?\" upstream):\n//   { reject: false, eventType: 'event_callback',\n//     body: { event: { type: 'reaction_added', user, reaction,\n//                       item: { type, channel, ts }, ... },\n//             team_id, event_id, ... } }\n//\n// Output (single item) \u2014 fields the HTTP Request node will reference:\n//   slackChannel : the channel id to query\n//   slackLatest  : the message ts to look up\n//   reaction     : the emoji name (passed through for build-body audit)\n//   slackUser    : who reacted (for source_metadata.user_id; the\n//                   ingester is the reactor, not the original author \u2014\n//                   the original author is recovered from the fetched\n//                   message body)\n//   teamId       : workspace id\n//   eventId      : Slack event_id (idempotency, audit)\n//   originalEventBody: the full event payload for downstream build.\n//\n// We don't strip thread_ts here \u2014 the build-body node decides whether\n// threaded replies are accepted (they're skipped at launch per Codex\n// 2026-05-08 review until cleanly tested).\n\nconst item = $input.first().json;\nconst body = item.body;\nif (!body) {\n  return [{ json: { skip: true, reason: 'no_body' } }];\n}\n\nconst ev = body.event;\nif (!ev || ev.type !== 'reaction_added') {\n  return [{ json: { skip: true, reason: 'not_reaction_added' } }];\n}\n\nconst target = ev.item;\nif (!target || target.type !== 'message') {\n  // Reactions can also be on file/file_comment items; we only handle\n  // message reactions for the ingest path.\n  return [{ json: { skip: true, reason: 'reaction_target_not_message' } }];\n}\n\nconst channel = target.channel;\nconst ts = target.ts;\nif (!channel || !ts) {\n  return [{ json: { skip: true, reason: 'missing_channel_or_ts' } }];\n}\n\nreturn [{\n  json: {\n    skip: false,\n    slackChannel: channel,\n    slackLatest: ts,\n    reaction: ev.reaction || null,\n    slackUser: ev.user || null,\n    teamId: body.team_id,\n    eventId: body.event_id,\n    originalEventBody: body,\n  }\n}];\n"
       },
-      "id": "b5a6b143-6064-43b1-b319-d3ead5429d67",
+      "id": "53d2c670-1e60-46c6-8923-c16da4cdd4bb",
       "name": "Reaction prep",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
         1560,
         640
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "4112669b-0f68-4ace-81a9-dcfdaf7ea3b7",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e73e0128-c63a-4e85-93d7-1671ccc60e8e",
+      "name": "IF prep skip?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1660,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "noData",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "ed2ce7d9-6b76-475d-9b9c-109d29f9024d",
+      "name": "Respond 200 prep skip",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1660,
+        500
       ]
     },
     {
@@ -350,6 +413,10 @@
             {
               "name": "channel",
               "value": "={{ $json.slackChannel }}"
+            },
+            {
+              "name": "oldest",
+              "value": "={{ $json.slackLatest }}"
             },
             {
               "name": "latest",
@@ -374,7 +441,7 @@
           }
         }
       },
-      "id": "d4f45863-2f79-4265-a479-eeb1b8800754",
+      "id": "0a86e36d-25da-46aa-afff-6c7f88492945",
       "name": "Slack: fetch reacted message",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -393,7 +460,7 @@
         "language": "javaScript",
         "jsCode": "// n8n Code node \u2014 build OpsMemory /v1/ingest/slack body from a\n// reaction_added event whose target message has just been fetched.\n//\n// Drop this verbatim into the Code node AFTER the HTTP Request node\n// that called Slack's conversations.history on the reaction branch.\n//\n// Input shape (the HTTP Request node forwards both its own response\n// AND the prior node's data; in n8n 2.x with default settings the\n// previous-node fields ride along on the same item):\n//\n//   $('Slack: fetch reacted message').first().json   -- conversations.history payload\n//   $('Reaction prep').first().json                  -- prepared event metadata\n//\n// We read both via the `$('<NodeName>')` references rather than\n// $input.first() so the input wiring is explicit and stable across\n// n8n versions.\n//\n// Output shape: same as the mention-path Build OpsMemory body:\n//   { skip: true, reason: '...' }                              -- drop silently\n//   { skip: false, opsMemoryBody: {<SlackIngest body>}, ... }  -- forward to OpsMemory\n//\n// Filtering rules (top-level messages only at launch, per Codex\n// 2026-05-08 review on threaded-reply behavior):\n//   - conversations.history must return exactly one message (the one\n//     we asked for via inclusive=true&limit=1).\n//   - Reject if the message is a reply (thread_ts present and !==\n//     the message ts itself).\n//   - Reject bot messages and the bot's own messages so the bot\n//     can't ingest itself.\n\nconst prep = $('Reaction prep').first().json;\nconst slackResp = $('Slack: fetch reacted message').first().json;\n\nif (prep?.skip) {\n  return [{ json: { skip: true, reason: prep.reason || 'upstream_skip' } }];\n}\n\nif (!slackResp || slackResp.ok !== true) {\n  return [{\n    json: {\n      skip: true,\n      reason: 'slack_history_not_ok',\n      slack_error: slackResp?.error || 'unknown',\n    }\n  }];\n}\n\nconst messages = Array.isArray(slackResp.messages) ? slackResp.messages : [];\nif (messages.length === 0) {\n  // The reacted-to message may have been deleted between Slack's\n  // event delivery and our fetch. Drop silently \u2014 Slack won't retry\n  // this delivery once we 200, and there's nothing to ingest.\n  return [{ json: { skip: true, reason: 'message_not_found' } }];\n}\n\nconst msg = messages[0];\n\n// Drop bot messages.\nif (msg.subtype === 'bot_message' || msg.bot_id) {\n  return [{ json: { skip: true, reason: 'bot_message' } }];\n}\n\n// Top-level only at launch.\nconst isTopLevel = !msg.thread_ts || msg.thread_ts === msg.ts;\nif (!isTopLevel) {\n  return [{ json: { skip: true, reason: 'threaded_reply_not_supported_yet' } }];\n}\n\nconst text = (msg.text || '').trim();\nif (text.length < 1) {\n  return [{ json: { skip: true, reason: 'empty_message_text' } }];\n}\n\nconst opsMemoryBody = {\n  team_id: prep.teamId,\n  channel_id: prep.slackChannel,\n  ts: msg.ts,                    // canonical event id is the original\n                                  // message's ts, NOT the reaction's. Slack\n                                  // retries on the SAME reaction event_id\n                                  // but our idempotency in OpsMemory keys\n                                  // off (team, channel, ts) so multiple\n                                  // reactions on the same message dedupe\n                                  // to one ingest_event.\n  text: text,\n  user_id: msg.user || null,      // ORIGINAL author, not the reactor\n  thread_ts: msg.thread_ts || null,\n  channel_name: null,\n  user_name: null,\n  team_domain: null,\n  workspace_name: null,\n  enterprise_id: null,\n  extra: {\n    slack_event_id: prep.eventId,\n    slack_event_type: 'reaction_added',\n    reaction: prep.reaction,\n    reactor_user_id: prep.slackUser,   // who labeled this as a task\n    original_text: msg.text || null,\n  },\n};\n\nreturn [{\n  json: {\n    skip: false,\n    opsMemoryBody,\n    team_id: prep.teamId,\n    channel_id: prep.slackChannel,\n    ts: msg.ts,\n  }\n}];\n"
       },
-      "id": "e5860e7c-ab8c-4407-8d18-251aec81480a",
+      "id": "f2aa063e-2465-4085-a932-35ea4e5cbdeb",
       "name": "Build reaction body",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -412,7 +479,7 @@
           },
           "conditions": [
             {
-              "id": "48f28e32-907f-4c7d-8185-7a0326d52c4f",
+              "id": "cb563eda-1e2f-4897-8ede-3962b8f11e10",
               "leftValue": "={{ $json.skip }}",
               "rightValue": true,
               "operator": {
@@ -426,7 +493,7 @@
         },
         "options": {}
       },
-      "id": "ff74e09c-1a44-4ce6-ab59-65ccbafb0ffa",
+      "id": "6ca10529-eca8-47b3-9753-2636360ec6c2",
       "name": "IF reaction skip?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
@@ -442,7 +509,7 @@
           "responseCode": 200
         }
       },
-      "id": "382cd763-0ffa-4aff-a6ed-0acb873f176d",
+      "id": "c97f1562-7dbb-4d50-a14e-6be9b7e263d3",
       "name": "Respond 200 reaction silent",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
@@ -469,7 +536,7 @@
           }
         }
       },
-      "id": "3265dbd5-253a-4aba-b347-2f3e89ec04fa",
+      "id": "2e2ca2bd-85d0-4dc1-9dec-18a80807ef9e",
       "name": "POST /v1/ingest/slack (reaction)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -490,7 +557,7 @@
           "responseCode": 200
         }
       },
-      "id": "fd460311-95a4-4071-a15d-0fed6020cd0a",
+      "id": "9d7bf98c-fb2f-41e6-b1ca-ee0d2382df5d",
       "name": "Respond 200 reaction final",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
@@ -550,6 +617,17 @@
             "index": 0
           }
         ],
+        [
+          {
+            "node": "Normalize Slack event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Slack event": {
+      "main": [
         [
           {
             "node": "IF reaction_added?",
@@ -639,6 +717,24 @@
       "main": [
         [
           {
+            "node": "IF prep skip?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF prep skip?": {
+      "main": [
+        [
+          {
+            "node": "Respond 200 prep skip",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
             "node": "Slack: fetch reacted message",
             "type": "main",
             "index": 0
@@ -703,7 +799,7 @@
     "executionOrder": "v1"
   },
   "pinData": {},
-  "versionId": "452a50d9-86ce-4edb-81ad-73141720f8e9",
+  "versionId": "bd0a423a-ed06-41e7-b6ef-89df81d45bb1",
   "meta": {
     "instanceId": "opsmemory-phase-c-import-v2"
   },
