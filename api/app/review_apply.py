@@ -35,10 +35,39 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from .auth import Principal
 from .reconciliation.validate import validate_decision
+
+
+def _coerce_due_at(value: Any) -> datetime | None:
+    """Coerce a due_at value (string from JSONB or already a datetime)
+    into a tz-aware datetime suitable for asyncpg's ::timestamptz cast.
+
+    Why: review_items.proposed_patch is jsonb; datetimes serialize to
+    ISO 8601 strings on write, so on approve we read them back as
+    strings. asyncpg rejects strings bound to ::timestamptz params
+    with "expected datetime ... got str". Codex 2026-05-08 review
+    flagged this as the same class of bug fixed in retrieve.py
+    yesterday; it was latent until normalize._resolve_due started
+    populating non-null due dates from "Friday"-style hints.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
 
 log = logging.getLogger("opsmemory.review_apply")
 
@@ -337,7 +366,7 @@ async def _apply_create_task(
         """,
         summary,
         create.get("description"),
-        create.get("due_at"),
+        _coerce_due_at(create.get("due_at")),
         create.get("category"),
         create.get("priority"),
         create.get("dependency_text"),
@@ -593,6 +622,10 @@ async def _apply_update_task(
     set_fragments: list[str] = []
     params: list[Any] = [target_task_id]
     for fname, fval in update.items():
+        # due_at comes through jsonb as a string; asyncpg::timestamptz
+        # bind requires a datetime instance. _coerce_due_at handles both.
+        if fname == "due_at":
+            fval = _coerce_due_at(fval)
         params.append(fval)
         cast = "::timestamptz" if fname == "due_at" else ""
         set_fragments.append(f"{fname} = ${len(params)}{cast}")

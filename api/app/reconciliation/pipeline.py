@@ -177,7 +177,7 @@ async def process_event(conn, event_id: str) -> dict:
         "       retry_count, actor_type, "
         "       actor_user_id::text AS actor_user_id, "
         "       actor_service_account_id::text AS actor_service_account_id, "
-        "       source_metadata "
+        "       source_metadata, received_at "
         "FROM ingest_events WHERE id = $1::uuid",
         event_id,
     )
@@ -252,7 +252,25 @@ async def process_event(conn, event_id: str) -> dict:
         return {"event_id": event_id, "status": "failed", "stage": "extract", "error": repr(exc)}
 
     # ---- Normalize ----
-    normalized = normalize_candidates(candidates_raw)
+    # Anchor relative-date resolution ("Friday", "tomorrow") to the
+    # message's source timestamp. For Slack the canonical time is the
+    # message ts (epoch seconds in source_metadata.ts); for everything
+    # else we fall back to the ingest received_at, which is "now from
+    # OpsMemory's perspective." Codex 2026-05-08 review: anchoring to
+    # worker-clock UTC instead of message-clock would skew due dates
+    # by hours when the worker tick lags behind the post.
+    message_ts = None
+    src_meta = event["source_metadata"] or {}
+    if event["source"] == "slack_message" and src_meta.get("ts"):
+        try:
+            message_ts = datetime.fromtimestamp(
+                float(src_meta["ts"]), tz=timezone.utc
+            )
+        except (TypeError, ValueError):
+            pass
+    if message_ts is None:
+        message_ts = event["received_at"] or datetime.now(timezone.utc)
+    normalized = normalize_candidates(candidates_raw, now=message_ts)
 
     # ---- Source-specific resolvers (Slack channel + mention -> canonical) ----
     if event["source"] == "slack_message":

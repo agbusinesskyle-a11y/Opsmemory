@@ -3,6 +3,13 @@
 Deterministic. Resolves owner aliases to canonical user_ids, business
 hints to business slugs (validated), date hints to ISO timestamps when
 parseable. Adds a stable dedup_key for use by the retrieve step.
+
+Date resolution anchors to the message's source timestamp when the
+caller supplies one (`now=` kwarg). For Slack this is the Slack ts;
+for meeting_recap it falls back to ingest received_at. The 17:00
+"end-of-business" cutoff is in **Phoenix local time** (Kyle's ops tz,
+year-round UTC-7), not UTC — emitting 17:00 UTC would land tasks at
+10am Phoenix, which is wrong.
 """
 
 from __future__ import annotations
@@ -11,6 +18,10 @@ import hashlib
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+
+PHOENIX = ZoneInfo("America/Phoenix")
 
 # These match the seed in 0001_initial.sql + business_memberships.
 KNOWN_BUSINESSES = {"redhot", "borderline"}
@@ -71,33 +82,78 @@ def _resolve_businesses(hints: list[str] | None) -> list[str]:
     return list(dict.fromkeys(out))  # dedupe, preserve order
 
 
+def _at_5pm_phoenix_to_utc(local_day: datetime) -> str:
+    """Return the ISO 8601 UTC string for 17:00 Phoenix on the given day.
+
+    Caller passes a tz-aware datetime expressed in any zone — we
+    re-express it in Phoenix, replace H/M/S to 17:00 local, then
+    convert back to UTC. End-of-business in Phoenix is UTC-7
+    year-round (no DST) so this is unambiguous.
+    """
+    local = local_day.astimezone(PHOENIX).replace(
+        hour=17, minute=0, second=0, microsecond=0
+    )
+    return local.astimezone(timezone.utc).isoformat()
+
+
 def _resolve_due(hint: str | None, *, now: datetime | None = None) -> str | None:
+    """Parse the LLM's due_hint into an ISO 8601 UTC timestamp.
+
+    Returns None when the hint is unparseable (operator fills in at
+    review time). All relative-date arithmetic is done in Phoenix local
+    so "Friday by EOD" resolves to Friday 17:00 Phoenix, not 17:00 UTC.
+    """
     if not hint:
         return None
     s = hint.strip()
     if not s:
         return None
     base = (now or datetime.now(timezone.utc))
-    # Try strict ISO first.
+    # Force tz awareness so .astimezone() works downstream.
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    base_local = base.astimezone(PHOENIX)
+
+    # Try strict ISO first. Trust whatever tz the LLM emitted.
     try:
         d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
         return d.astimezone(timezone.utc).isoformat()
     except ValueError:
         pass
+
     # Today / tomorrow.
     if re.fullmatch(r"today", s, flags=re.I):
-        return base.replace(hour=17, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+        return _at_5pm_phoenix_to_utc(base_local)
     if re.fullmatch(r"tomorrow", s, flags=re.I):
-        return (base + timedelta(days=1)).replace(hour=17, minute=0, second=0, microsecond=0).isoformat()
-    # "next <day-of-week>".
+        return _at_5pm_phoenix_to_utc(base_local + timedelta(days=1))
+
+    # "next <day-of-week>" — explicit-next-week phrasing.
     m = re.fullmatch(r"next\s+(\w+)", s, flags=re.I)
     if m:
         target_dow = _DOW.get(m.group(1).lower())
         if target_dow is not None:
-            current = base.weekday()
+            current = base_local.weekday()
             delta = (target_dow - current) % 7 or 7
-            target = base + timedelta(days=delta)
-            return target.replace(hour=17, minute=0, second=0, microsecond=0).isoformat()
+            return _at_5pm_phoenix_to_utc(base_local + timedelta(days=delta))
+
+    # Bare day-of-week ("Friday", "Tuesday"). Same-day cutoff at 17:00
+    # Phoenix: "Friday" said Friday morning → same day; said Friday after
+    # 5pm → next Friday. Codex 2026-05-08 review.
+    m = re.fullmatch(r"(monday|mon|tuesday|tue|tues|wednesday|wed|"
+                     r"thursday|thu|thurs|friday|fri|saturday|sat|"
+                     r"sunday|sun)", s, flags=re.I)
+    if m:
+        target_dow = _DOW.get(m.group(1).lower())
+        if target_dow is not None:
+            current = base_local.weekday()
+            if target_dow == current:
+                delta = 0 if base_local.hour < 17 else 7
+            else:
+                delta = (target_dow - current) % 7
+            return _at_5pm_phoenix_to_utc(base_local + timedelta(days=delta))
+
     # Give up — leave as null. Reviewer can set the date manually.
     return None
 
