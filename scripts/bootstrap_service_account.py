@@ -124,11 +124,14 @@ def insert_service_account(
     scopes_csv = ",".join(scopes)  # empty string when no scopes
     expires_iso = expires_at.isoformat() if expires_at else ""
 
-    # NOTE: schema also has key_prefix as the lookup column. Auth.py
-    # validates by SELECT WHERE key_prefix = '<env>_<kid>'. The kid
-    # value passed in is just the 16-char random token; we expand
-    # to the full prefix here so the row matches what auth expects.
-    key_prefix = f"opsmem_live_{kid}"
+    # service_accounts.key_prefix is the 16-char kid alone — auth.py
+    # _load_service queries WHERE key_prefix = parsed["kid"] (the 16-char
+    # random token from _parse_service_key). An earlier "fix" wrote the
+    # full opsmem_<env>_<kid> string here, which made every service key
+    # fail validation with "invalid service key" because auth.py was
+    # looking for the bare kid. Reverted 2026-05-08; both chunk-1
+    # generation (this script) and chunk-1 validation (auth.py) agree
+    # that kid IS the key_prefix.
 
     sql = (
         "INSERT INTO service_accounts "
@@ -137,7 +140,7 @@ def insert_service_account(
         ":'name', "
         ":'description', "
         "'service', 'active', "
-        ":'key_prefix', "
+        ":'kid', "
         ":'key_hash', "
         "string_to_array(NULLIF(:'scopes_csv', ''), ',')::text[], "
         "NULLIF(:'expires_iso', '')::timestamptz, "
@@ -152,7 +155,7 @@ def insert_service_account(
             "-v", "ON_ERROR_STOP=1",
             "-v", f"name={name}",
             "-v", f"description={description}",
-            "-v", f"key_prefix={key_prefix}",
+            "-v", f"kid={kid}",
             "-v", f"key_hash={key_hash}",
             "-v", f"scopes_csv={scopes_csv}",
             "-v", f"expires_iso={expires_iso}",

@@ -338,11 +338,20 @@ async def require_principal(request: Request) -> Principal:
     # Service-account key short-circuits user auth.
     service_key = request.headers.get("X-OpsMemory-Service-Key")
     if service_key:
-        # In production, Cloudflare Access service tokens still gate the edge.
-        # Verify the JWT (without requiring an email claim) to ensure the call
-        # came through the tunnel, then validate the app-level service key.
-        if auth_mode == "cloudflare":
-            _verify_cf_jwt(request, require_email=False)
+        # Trust model (Codex Phase A→E review, 2026-05-07):
+        #   - External callers reach the API via the Cloudflare tunnel
+        #     (tracker.kyleconway.ai). Cloudflare Access policy at the
+        #     edge gates that path — including service-token requirements
+        #     for /v1/ingest/* if the operator chooses to configure them.
+        #   - Internal callers (n8n on Spark posting to
+        #     http://opsmemory-api:8000 over the docker network) bypass
+        #     the tunnel entirely. The HMAC-protected service key
+        #     (X-OpsMemory-Service-Key) is the sole auth for that path.
+        # Earlier versions required a Cf-Access-Jwt-Assertion on every
+        # service-key call. That broke the docker-network path and was
+        # redundant for external callers (CF gates them at the edge
+        # before the request hits FastAPI). The check is removed; the
+        # app-level key remains the durable boundary for both paths.
         return await _load_service(request, service_key)
 
     if auth_mode == "local":
