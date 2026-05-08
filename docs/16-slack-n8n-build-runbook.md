@@ -52,6 +52,32 @@ Create two credentials:
 - **Type:** **Header Auth**
 - **Name:** `OpsMemory Service Key (slack ingest)`
 - **Header Name:** `X-OpsMemory-Service-Key`
+- **Header Value:** `opsmem_live_iMK7ayhAShAH0hp6_<secret>`
+
+This is the n8n-slack-ingest service account key. Scopes:
+**`ingest:write,pipeline:read:all_businesses`** (NOT
+`ingest:write` only as an earlier draft of this runbook said —
+the worker uses the actor's scope for retrieval, so the key
+needs read access too even though n8n itself only POSTs).
+
+### 1c. Slack Bot Token (NEW for v2 — reaction path)
+
+The reaction path needs to call Slack's `conversations.history`
+to fetch the reacted-to message text. That call requires the
+bot's OAuth token in an `Authorization: Bearer xoxb-...` header.
+
+- **Type:** **Header Auth**
+- **Name:** `Slack Bot Token`
+- **Header Name:** `Authorization`
+- **Header Value:** `Bearer xoxb-...` (paste the bot token from
+  Slack admin's OAuth & Permissions page)
+
+If you only run the mention path and want to skip reactions,
+this credential is optional — but the imported workflow JSON
+references it, so the import will warn about an unmapped
+credential. Either create it (recommended) or delete the
+`Slack: fetch reacted message` HTTP Request node from the
+imported workflow.
 - **Header Value:** `opsmem_live_iMK7ayhAShAH0hp6_<your-secret-half>`
 
 This is the n8n-slack-ingest key minted today. Scope is
@@ -281,10 +307,21 @@ Once the fixture passes:
    - **Request URL:** paste the n8n webhook URL
    - Slack will ping it and verify (this is vector 08); should
      show "Verified" with green check
-2. Under **Subscribe to bot events**, add: `app_mention`
+2. Under **Subscribe to bot events**, add:
+   - `app_mention`   (mention path)
+   - `reaction_added` (reaction path — v2 only)
 3. **Save Changes** (bottom right)
 4. Slack will prompt to **Reinstall App** — do it; the bot
    re-authorizes with the new event subscription.
+
+For the reaction path (v2), also confirm the Slack app's
+**OAuth & Permissions** has:
+- `app_mentions:read`
+- `reactions:read`     (v2 only)
+- `channels:history`   (v2 only — needed by conversations.history)
+- `chat:write`
+- `channels:read`
+- `users:read`
 
 ---
 
@@ -316,6 +353,36 @@ Seed Kyle's user_identity row (so mention->owner resolution works):
 ```bash
 docker exec postgres psql -U opsmemory_owner -d action_tracker -c "INSERT INTO user_identities (user_id, provider, provider_subject, email) SELECT id, 'slack', '<TEAM_ID>:<KYLE_SLACK_USER_ID>', email FROM users WHERE email='<kyle's-opsmemory-email>' RETURNING id, provider_subject;"
 ```
+
+---
+
+## Step 14b — Reaction path smoke test (v2 only)
+
+After the mention path is verified working, validate the
+reaction path:
+
+1. Find ANY past message in `#ops-redhot` (or any mapped
+   channel). Doesn't matter who posted it or what it says, as
+   long as it's a top-level message (not a thread reply).
+2. Hover, click the reaction icon, search for `memo`, and
+   click `:memo:` (📝).
+3. Within ~5-10 minutes (one worker tick + processing time),
+   open the PWA Review tab. The message text should appear
+   as a candidate, with `extra.slack_event_type='reaction_added'`
+   recorded in the source_metadata for audit.
+
+The reaction path has 4 silent-drop conditions (return 200 to
+Slack but skip ingestion):
+- Wrong emoji (anything other than `:memo:`)
+- Reaction on a threaded reply (top-level only at launch per
+  Codex's review until threaded handling is tested)
+- Original message was a bot message
+- Original message text is empty
+
+If the reaction doesn't show up in the review queue and you
+expected it to, check n8n executions log first — the reaction
+path should fire even on wrong-emoji reacts (just terminating
+silent at the "Respond 200 wrong emoji" node).
 
 ---
 

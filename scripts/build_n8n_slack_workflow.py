@@ -2,15 +2,16 @@
 """Build an importable n8n workflow JSON for the opsmemory-slack-ingest
 flow described in docs/16-slack-n8n-build-runbook.md.
 
-This is the one-shot alternative to the click-by-click runbook. The
-output JSON imports cleanly into n8n 2.18.5 (and recent 2.x);
-operator's only manual step after import is mapping the HTTP Request
-node's Header Auth credential to the `OpsMemory Service Key (slack
-ingest)` credential they already created.
+V2 (2026-05-08): adds the reaction_added ingest path. Posting in
+Slack with `@OpsMemory ...` continues to work as before; *also*
+react to any past message in a mapped channel with `:memo:` to
+file that message as a task.
 
 Embeds the full bodies of:
-  infra/n8n/slack-ingest-hmac-verify.js
-  infra/n8n/slack-ingest-build-body.js
+  infra/n8n/slack-ingest-hmac-verify.js          (HMAC verifier)
+  infra/n8n/slack-ingest-build-body.js           (mention path body builder)
+  infra/n8n/slack-ingest-fetch-message.js        (reaction-prep before Slack API)
+  infra/n8n/slack-ingest-build-reaction-body.js  (reaction path body builder)
 
 Topology:
   Webhook (POST /slack-ingest, raw body)
@@ -19,11 +20,27 @@ Topology:
           true  -> Respond 401 (with reason)
           false -> IF url_verification?
              true  -> Respond 200 + {challenge}
-             false -> Build OpsMemory body (Code)
-                -> IF skip?
-                   true  -> Respond 200 silent
-                   false -> POST /v1/ingest/slack (HTTP Request)
-                      -> Respond 200 final
+             false -> IF reaction_added?
+                true (reaction event):
+                   -> IF reaction is memo?
+                      true:
+                         -> Reaction prep (Code)
+                         -> Slack: fetch reacted message (HTTP)
+                         -> Build reaction body (Code)
+                         -> IF reaction skip?
+                            true  -> Respond 200 reaction silent
+                            false -> POST /v1/ingest/slack (reaction)
+                                  -> Respond 200 reaction final
+                      false -> Respond 200 wrong emoji
+                false (mention or other event_callback):
+                   -> Build OpsMemory body (mention) (Code)
+                   -> IF skip?
+                      true  -> Respond 200 mention silent
+                      false -> POST /v1/ingest/slack (mention)
+                            -> Respond 200 mention final
+
+Trigger emoji: `:memo:` (built-in, available in every workspace).
+To change: edit `MEMO_EMOJI` below, regenerate, reimport.
 
 Usage:
     python3 scripts/build_n8n_slack_workflow.py \\
@@ -40,6 +57,10 @@ import uuid
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 HMAC_JS_PATH = REPO_ROOT / "infra" / "n8n" / "slack-ingest-hmac-verify.js"
 BUILD_JS_PATH = REPO_ROOT / "infra" / "n8n" / "slack-ingest-build-body.js"
+PREP_JS_PATH = REPO_ROOT / "infra" / "n8n" / "slack-ingest-fetch-message.js"
+REACTION_JS_PATH = REPO_ROOT / "infra" / "n8n" / "slack-ingest-build-reaction-body.js"
+
+MEMO_EMOJI = "memo"  # without colons; matches reaction.event.reaction
 
 
 def _id() -> str:
@@ -49,6 +70,8 @@ def _id() -> str:
 def build_workflow() -> dict:
     hmac_js = HMAC_JS_PATH.read_text(encoding="utf-8")
     build_js = BUILD_JS_PATH.read_text(encoding="utf-8")
+    prep_js = PREP_JS_PATH.read_text(encoding="utf-8")
+    reaction_js = REACTION_JS_PATH.read_text(encoding="utf-8")
 
     # Stable IDs so re-imports overwrite cleanly.
     nid_webhook = _id()
@@ -57,11 +80,32 @@ def build_workflow() -> dict:
     nid_resp_401 = _id()
     nid_if_urlv = _id()
     nid_resp_challenge = _id()
+    nid_if_reaction = _id()
+
+    # Mention path
     nid_build = _id()
     nid_if_skip = _id()
     nid_resp_silent = _id()
     nid_http = _id()
     nid_resp_final = _id()
+
+    # Reaction path
+    nid_if_memo = _id()
+    nid_resp_wrong_emoji = _id()
+    nid_reaction_prep = _id()
+    nid_slack_history = _id()
+    nid_build_reaction = _id()
+    nid_if_skip_reaction = _id()
+    nid_resp_silent_reaction = _id()
+    nid_http_reaction = _id()
+    nid_resp_final_reaction = _id()
+
+    # ---- Layout columns (px). Top half is mention; bottom is reaction. ----
+    Y_TOP = 200    # 401 reject branch
+    Y_MID = 300    # main flow
+    Y_MENT = 460   # mention sub-flow
+    Y_REACT = 700  # reaction sub-flow
+    XCOL = lambda n: 240 + n * 220  # noqa: E731
 
     nodes = [
         {
@@ -75,7 +119,7 @@ def build_workflow() -> dict:
             "name": "Webhook",
             "type": "n8n-nodes-base.webhook",
             "typeVersion": 2,
-            "position": [240, 300],
+            "position": [XCOL(0), Y_MID],
             "webhookId": _id(),
         },
         {
@@ -87,7 +131,7 @@ def build_workflow() -> dict:
             "name": "HMAC Verify",
             "type": "n8n-nodes-base.code",
             "typeVersion": 2,
-            "position": [460, 300],
+            "position": [XCOL(1), Y_MID],
         },
         {
             "parameters": {
@@ -117,7 +161,7 @@ def build_workflow() -> dict:
             "name": "IF reject?",
             "type": "n8n-nodes-base.if",
             "typeVersion": 2,
-            "position": [680, 300],
+            "position": [XCOL(2), Y_MID],
         },
         {
             "parameters": {
@@ -131,7 +175,7 @@ def build_workflow() -> dict:
             "name": "Respond 401 rejected",
             "type": "n8n-nodes-base.respondToWebhook",
             "typeVersion": 1,
-            "position": [900, 200],
+            "position": [XCOL(3), Y_TOP],
         },
         {
             "parameters": {
@@ -160,7 +204,7 @@ def build_workflow() -> dict:
             "name": "IF url_verification?",
             "type": "n8n-nodes-base.if",
             "typeVersion": 2,
-            "position": [900, 400],
+            "position": [XCOL(3), Y_MID + 100],
         },
         {
             "parameters": {
@@ -174,8 +218,39 @@ def build_workflow() -> dict:
             "name": "Respond 200 challenge",
             "type": "n8n-nodes-base.respondToWebhook",
             "typeVersion": 1,
-            "position": [1120, 300],
+            "position": [XCOL(4), Y_MID],
         },
+        # ----- Dispatch by event type (reaction vs mention/other) -----
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": True,
+                        "leftValue": "",
+                        "typeValidation": "strict",
+                    },
+                    "conditions": [
+                        {
+                            "id": _id(),
+                            "leftValue": "={{ $json.body?.event?.type }}",
+                            "rightValue": "reaction_added",
+                            "operator": {
+                                "type": "string",
+                                "operation": "equals",
+                            },
+                        }
+                    ],
+                    "combinator": "and",
+                },
+                "options": {},
+            },
+            "id": nid_if_reaction,
+            "name": "IF reaction_added?",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [XCOL(4), Y_MID + 200],
+        },
+        # ===== Mention path (false branch of IF reaction_added?) =====
         {
             "parameters": {
                 "language": "javaScript",
@@ -185,7 +260,7 @@ def build_workflow() -> dict:
             "name": "Build OpsMemory body",
             "type": "n8n-nodes-base.code",
             "typeVersion": 2,
-            "position": [1120, 500],
+            "position": [XCOL(5), Y_MENT],
         },
         {
             "parameters": {
@@ -215,20 +290,18 @@ def build_workflow() -> dict:
             "name": "IF skip?",
             "type": "n8n-nodes-base.if",
             "typeVersion": 2,
-            "position": [1340, 500],
+            "position": [XCOL(6), Y_MENT],
         },
         {
             "parameters": {
                 "respondWith": "noData",
-                "options": {
-                    "responseCode": 200,
-                },
+                "options": {"responseCode": 200},
             },
             "id": nid_resp_silent,
             "name": "Respond 200 silent",
             "type": "n8n-nodes-base.respondToWebhook",
             "typeVersion": 1,
-            "position": [1560, 400],
+            "position": [XCOL(7), Y_MENT - 60],
         },
         {
             "parameters": {
@@ -248,7 +321,7 @@ def build_workflow() -> dict:
             "name": "POST /v1/ingest/slack",
             "type": "n8n-nodes-base.httpRequest",
             "typeVersion": 4.2,
-            "position": [1560, 600],
+            "position": [XCOL(7), Y_MENT + 60],
             "credentials": {
                 "httpHeaderAuth": {
                     "name": "OpsMemory Service Key (slack ingest)"
@@ -258,15 +331,186 @@ def build_workflow() -> dict:
         {
             "parameters": {
                 "respondWith": "noData",
-                "options": {
-                    "responseCode": 200,
-                },
+                "options": {"responseCode": 200},
             },
             "id": nid_resp_final,
             "name": "Respond 200 final",
             "type": "n8n-nodes-base.respondToWebhook",
             "typeVersion": 1,
-            "position": [1780, 600],
+            "position": [XCOL(8), Y_MENT + 60],
+        },
+        # ===== Reaction path (true branch of IF reaction_added?) =====
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": True,
+                        "leftValue": "",
+                        "typeValidation": "strict",
+                    },
+                    "conditions": [
+                        {
+                            "id": _id(),
+                            "leftValue": "={{ $json.body?.event?.reaction }}",
+                            "rightValue": MEMO_EMOJI,
+                            "operator": {
+                                "type": "string",
+                                "operation": "equals",
+                            },
+                        }
+                    ],
+                    "combinator": "and",
+                },
+                "options": {},
+            },
+            "id": nid_if_memo,
+            "name": "IF reaction is memo?",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [XCOL(5), Y_REACT],
+        },
+        {
+            "parameters": {
+                "respondWith": "noData",
+                "options": {"responseCode": 200},
+            },
+            "id": nid_resp_wrong_emoji,
+            "name": "Respond 200 wrong emoji",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [XCOL(6), Y_REACT + 120],
+        },
+        {
+            "parameters": {
+                "language": "javaScript",
+                "jsCode": prep_js,
+            },
+            "id": nid_reaction_prep,
+            "name": "Reaction prep",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [XCOL(6), Y_REACT - 60],
+        },
+        {
+            "parameters": {
+                "method": "GET",
+                "url": "https://slack.com/api/conversations.history",
+                "authentication": "predefinedCredentialType",
+                "nodeCredentialType": "httpHeaderAuth",
+                "sendQuery": True,
+                "queryParameters": {
+                    "parameters": [
+                        {"name": "channel",
+                         "value": "={{ $json.slackChannel }}"},
+                        {"name": "latest",
+                         "value": "={{ $json.slackLatest }}"},
+                        {"name": "inclusive", "value": "true"},
+                        {"name": "limit", "value": "1"},
+                    ]
+                },
+                "options": {
+                    "timeout": 4000,
+                    "response": {"response": {"neverError": True}},
+                },
+            },
+            "id": nid_slack_history,
+            "name": "Slack: fetch reacted message",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [XCOL(7), Y_REACT - 60],
+            "credentials": {
+                "httpHeaderAuth": {
+                    "name": "Slack Bot Token"
+                }
+            },
+        },
+        {
+            "parameters": {
+                "language": "javaScript",
+                "jsCode": reaction_js,
+            },
+            "id": nid_build_reaction,
+            "name": "Build reaction body",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [XCOL(8), Y_REACT - 60],
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": True,
+                        "leftValue": "",
+                        "typeValidation": "strict",
+                    },
+                    "conditions": [
+                        {
+                            "id": _id(),
+                            "leftValue": "={{ $json.skip }}",
+                            "rightValue": True,
+                            "operator": {
+                                "type": "boolean",
+                                "operation": "true",
+                                "singleValue": True,
+                            },
+                        }
+                    ],
+                    "combinator": "and",
+                },
+                "options": {},
+            },
+            "id": nid_if_skip_reaction,
+            "name": "IF reaction skip?",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [XCOL(9), Y_REACT - 60],
+        },
+        {
+            "parameters": {
+                "respondWith": "noData",
+                "options": {"responseCode": 200},
+            },
+            "id": nid_resp_silent_reaction,
+            "name": "Respond 200 reaction silent",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [XCOL(10), Y_REACT - 120],
+        },
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "http://opsmemory-api:8000/v1/ingest/slack",
+                "authentication": "predefinedCredentialType",
+                "nodeCredentialType": "httpHeaderAuth",
+                "sendBody": True,
+                "specifyBody": "json",
+                "jsonBody": "={{ JSON.stringify($json.opsMemoryBody) }}",
+                "options": {
+                    "timeout": 5000,
+                    "response": {"response": {"neverError": True}},
+                },
+            },
+            "id": nid_http_reaction,
+            "name": "POST /v1/ingest/slack (reaction)",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [XCOL(10), Y_REACT],
+            "credentials": {
+                "httpHeaderAuth": {
+                    "name": "OpsMemory Service Key (slack ingest)"
+                }
+            },
+        },
+        {
+            "parameters": {
+                "respondWith": "noData",
+                "options": {"responseCode": 200},
+            },
+            "id": nid_resp_final_reaction,
+            "name": "Respond 200 reaction final",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [XCOL(11), Y_REACT],
         },
     ]
 
@@ -288,9 +532,18 @@ def build_workflow() -> dict:
         "IF url_verification?": {
             "main": [
                 [{"node": "Respond 200 challenge", "type": "main", "index": 0}],
+                [{"node": "IF reaction_added?", "type": "main", "index": 0}],
+            ]
+        },
+        "IF reaction_added?": {
+            "main": [
+                # true branch -> reaction sub-flow
+                [{"node": "IF reaction is memo?", "type": "main", "index": 0}],
+                # false branch -> mention sub-flow
                 [{"node": "Build OpsMemory body", "type": "main", "index": 0}],
             ]
         },
+        # ----- Mention sub-flow -----
         "Build OpsMemory body": {
             "main": [[{"node": "IF skip?", "type": "main", "index": 0}]]
         },
@@ -302,6 +555,31 @@ def build_workflow() -> dict:
         },
         "POST /v1/ingest/slack": {
             "main": [[{"node": "Respond 200 final", "type": "main", "index": 0}]]
+        },
+        # ----- Reaction sub-flow -----
+        "IF reaction is memo?": {
+            "main": [
+                [{"node": "Reaction prep", "type": "main", "index": 0}],
+                [{"node": "Respond 200 wrong emoji", "type": "main", "index": 0}],
+            ]
+        },
+        "Reaction prep": {
+            "main": [[{"node": "Slack: fetch reacted message", "type": "main", "index": 0}]]
+        },
+        "Slack: fetch reacted message": {
+            "main": [[{"node": "Build reaction body", "type": "main", "index": 0}]]
+        },
+        "Build reaction body": {
+            "main": [[{"node": "IF reaction skip?", "type": "main", "index": 0}]]
+        },
+        "IF reaction skip?": {
+            "main": [
+                [{"node": "Respond 200 reaction silent", "type": "main", "index": 0}],
+                [{"node": "POST /v1/ingest/slack (reaction)", "type": "main", "index": 0}],
+            ]
+        },
+        "POST /v1/ingest/slack (reaction)": {
+            "main": [[{"node": "Respond 200 reaction final", "type": "main", "index": 0}]]
         },
     }
 
@@ -316,7 +594,7 @@ def build_workflow() -> dict:
         "pinData": {},
         "versionId": _id(),
         "meta": {
-            "instanceId": "opsmemory-phase-c-import",
+            "instanceId": "opsmemory-phase-c-import-v2",
         },
         "id": "opsmemory-slack-ingest",
         "tags": [],
