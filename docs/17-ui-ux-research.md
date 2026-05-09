@@ -367,7 +367,195 @@ context — answers will be wrong.
 
 ---
 
-## 12. Open questions for next-session decision
+## 12. Charts and dashboards (Phase UI-8, fold into Activity)
+
+Operator question 2026-05-09: "what about graphs and charts that
+show progress?" Right answer is *yes, but after UI-1 through UI-5*.
+Charts are weekly-felt; daily-felt UX comes first.
+
+**Audience split.** OpsMemory has two user-modes that want
+different visualizations:
+
+- *Operator-mode* (Kyle daily, Joanna daily on her businesses,
+  Caleb daily on his): "am I keeping up with the queue, what's
+  costing money, what just happened."
+- *Owner-mode* (Kyle weekly, Sarah weekly on the Family room):
+  "what got done last week, who's blocked, where are we falling
+  behind."
+
+### What to chart
+
+| Chart | Mode | Drives what action |
+|---|---|---|
+| Pending-review count over time (line) | Operator | "I'm falling behind — block out 30 min" |
+| Approved/rejected/snoozed per day (stacked bar) | Operator + LLM tuning | Reject ratio drift = prompt or model needs work |
+| LLM spend $/day with `INGEST_LLM_DAILY_USD_CAP` line | Operator | Cost transparency, budget ceiling visibility |
+| Tasks open vs completed per business per week (line) | Owner | "Are we shipping work?" |
+| Overdue heatmap by category × space (matrix) | Owner | Where attention is needed this week |
+| Time-from-ingest-to-task-creation distribution (histogram) | Operator (latency) | When something feels slow |
+| SOP adherence: anchors fired → tasks completed % | Owner | SOP fitness over time |
+
+### Where to put them
+
+**Fold the operator-mode charts into the new Activity tab**
+(§6). Activity already streams ingest_events + task_history +
+llm_calls; a charts strip at top showing queue health and
+$/day complements that. Concretely:
+
+```
+ACTIVITY
+[Pending now: 7] [Today's spend: $0.34 / $20] [Last 24h ingests: 12]
+
+Queue size last 7d (sparkline)         Cost last 7d (sparkline)
+[graph]                                [graph]
+
+Recent events
+3m  reaction_added on "warehouse closes 6pm Sat" -> CREATE_TASK
+9m  app_mention "@OpsMemory check the broken display"
+1h  ingest failed: malformed Slack body  ->  view error
+...
+```
+
+Owner-mode charts go on a **separate Dashboard tab** (Phase
+UI-8) targeted at weekly review. Default scope = "this week,
+all spaces I have membership in." Includes the open/completed
+chart, the overdue heatmap, and SOP adherence.
+
+### Tech
+
+- **Vanilla SVG** for the simplest sparklines (~30 lines each).
+- **Chart.js** (50 KB, no build, drops into a `<script>` tag)
+  for richer bars/heatmaps. Stays consistent with the no-build
+  PWA philosophy.
+- Skip D3 + React-based charting; too heavy for the existing
+  3.4K-line vanilla setup.
+
+### Phasing
+
+Phase UI-8a — operator strip on Activity (3 sparklines + 3
+counters): ~1 day.
+Phase UI-8b — Dashboard tab with Owner-mode charts: ~2-3 days,
+depends on Phase UI-3 (saved views) shipping first so we have
+the query primitives.
+
+---
+
+## 13. Multi-space scoping (banked, not building)
+
+Operator confirmed 2026-05-09: OpsMemory's surface area will
+expand beyond the current 2 businesses. Concretely:
+
+- **Conway Feed** — Selah Financial Trust portfolio company.
+  Caleb is ops manager; Joanna does NOT have access. Caleb is
+  also ops at RedHot (M2M membership).
+- **Family room** — Kyle + Sarah personal tasks. Not a business
+  context; same data model but `kind=personal` semantically.
+  Joanna and Caleb do NOT have access. Sarah has access here +
+  Borderline only.
+
+So the membership matrix isn't fully shared:
+
+| User | RedHot | Borderline | Conway Feed | Family |
+|---|---|---|---|---|
+| Kyle (admin) | ✓ | ✓ | ✓ | ✓ |
+| Joanna (admin) | ✓ | ✓ | – | – |
+| Caleb (owner) | ✓ | – | ✓ | – |
+| Sarah (owner) | – | ✓ | – | ✓ |
+
+The current `businesses` + `business_memberships` schema already
+supports this. The build issue isn't the data model; it's the
+**UI assumption that "there are 2 business pills, always shown
+to everyone."** The redesign needs to:
+
+### Constraints to bake into UI-1 through UI-7
+
+1. **Filter pills are membership-scoped.** If Joanna logs in,
+   she sees `[RedHot] [Borderline]` — never Conway Feed or
+   Family pills. If Caleb logs in, he sees
+   `[RedHot] [Conway Feed]` — never Borderline or Family.
+   Implementation: filter pill list comes from
+   `SELECT business_id FROM business_memberships WHERE user_id =
+   $current_user`, joined to `businesses`.
+2. **Saved views are per-user-per-space-context.** Caleb's
+   "stale" view shouldn't expose RedHot tasks Joanna can see.
+   Each saved view stores its scoping criteria including the
+   business_ids it operates over.
+3. **Triage queue scope.** Default Triage = candidates targeted
+   at spaces I'm a member of. Admins (Kyle, Joanna) might want
+   a "see all" toggle; owners (Caleb, Sarah) shouldn't.
+4. **Activity tab scope.** Recent ingest_events / task_history
+   filtered to "things happening in spaces I belong to." LLM
+   spend chart is admin-only (or shows only that user's spend
+   if we ever split per-user budgeting).
+5. **Notifications.** Push and Slack DM digests already filter
+   per-user; the Notification settings UI needs to mirror the
+   user's membership matrix, not show all spaces.
+6. **No hardcoded business slugs anywhere in the PWA.** The
+   render functions today reference `redhot` and `borderline`
+   as known values in places. UI-1+ should treat business slug
+   as data, not a constant.
+7. **Personal/family `kind`.** Add a `kind text` column to
+   `businesses` with values `business | personal | family`. The
+   Family room renders without "Owner" tag (everyone in it has
+   the same role), and without business-style metadata
+   (channel mapping, etc., are optional). For now treat as a
+   render-time hint; no schema migration needed if we just use
+   slug naming convention (`family-conway` etc).
+
+### Tenancy considerations to defer
+
+These are the questions that don't need answering YET but the
+build shouldn't make harder:
+
+- Caleb's auth: he's not currently a CF Access user on the PWA.
+  Onboarding him = adding his email to CF Access policy + a
+  `users` row + `business_memberships`. Same path as Joanna
+  yesterday.
+- Conway Feed Slack workspace: probably a different Slack
+  workspace than Kyle's main one. New `slack_channel_mappings`
+  rows + decision on whether to install OpsMemory bot in that
+  workspace too OR run a 2nd Slack app. Smaller of the two
+  decisions; defer.
+- Family room ingest source: probably NOT Slack (different
+  workspace per family member is unlikely). More likely an
+  email forward or a `/v1/ingest/manual_paste` web form on the
+  PWA. Defer endpoint design until UI-1+ ships.
+- LLM cost segmentation: today's $20 daily cap is global. If
+  Conway Feed grows volume we may want per-space caps to avoid
+  one space starving the others. Trivial schema bump
+  (`businesses.daily_usd_cap`), low priority until volumes
+  warrant it.
+
+### What this means for §10 phasing
+
+**Phase UI-1 (keyboard + selection) is unchanged.** Single
+operator at a time, no membership concerns.
+
+**Phase UI-2 (Triage rename + sub-views + bulk bar)** needs to
+honor membership — the Triage Inbox should show only candidates
+targeted at the user's accessible spaces. Trivial query change.
+
+**Phase UI-3 (saved views)** needs to scope-store per user.
+
+**Phase UI-7 (visual polish)** needs to render the family-room
+visually distinct from business spaces (different color tier,
+no business-tag chip), so users intuit the boundary at a
+glance.
+
+**Phase UI-8 (Dashboard)** needs membership-aware default
+scope on the owner-mode charts.
+
+**Don't refactor `businesses` table now.** The schema supports
+M2M memberships already; the work is purely UI-side
+assumptions. Adding Conway Feed = `INSERT INTO businesses (slug,
+display_name, kind) VALUES ('conway_feed', 'Conway Feed',
+'business')` plus the appropriate `business_memberships` rows.
+Family room = same INSERT with `kind='family'`. No code change
+needed at the data layer.
+
+---
+
+## 14. Open questions for next-session decision
 
 - Build phasing UI-1 first (cheap keyboard+selection win) **OR**
   start with UI-2 (Triage rename + bulk bar) for more visible
@@ -381,3 +569,11 @@ context — answers will be wrong.
 - Cmd+K palette: build it as a navigation-only first cut (no
   fuzzy search across data), or wait until we have better
   search infra?
+- Charts: ship UI-8a (operator-mode strip on Activity) as part
+  of UI-2/UI-3 sweep, or defer to its own session after the
+  daily-ops UX is solid?
+- Multi-space scoping: confirm we want to ADD Conway Feed and
+  Family rooms incrementally (just `INSERT INTO businesses`,
+  no schema change) — vs migrate to a `spaces` abstraction.
+  Default answer is incremental, but worth one more sanity
+  check before the first new space goes in.
