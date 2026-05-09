@@ -30,6 +30,15 @@ const state = {
     expandedDetail: null,
     pendingAction: null,        // 'approve' | 'reject' | null while a write is in flight
     actionError: null,
+    // Phase UI-1 (2026-05-09): keyboard + selection state.
+    // focusedIndex tracks which row in items[] has the focus
+    // outline (J/K + arrow keys move it). selectedIds is the set
+    // of ids the operator has marked with X / shift-arrow /
+    // Cmd+A; the 1/2 action shortcuts apply to the focused row
+    // when the set is empty, or to every selected row when ≥1.
+    focusedIndex: null,         // null | int index into items[]
+    selectedIds: new Set(),     // Set<reviewItemId>
+    bulkInProgress: false,      // true while a multi-row 1/2 is iterating
   },
   // SOPs view (chunk 7 step 4 — admin-only).
   sops: {
@@ -529,8 +538,11 @@ function renderTaskList() {
   `;
 }
 
-function renderReviewItem(item) {
+function renderReviewItem(item, index) {
   const expanded = state.review.expandedId === item.id;
+  // Phase UI-1: keyboard focus + selection visuals
+  const focused = state.review.focusedIndex === index;
+  const selected = state.review.selectedIds.has(item.id);
   const detail = expanded ? state.review.expandedDetail : null;
   const action = item.proposed_action;
   const conf = (item.confidence != null) ? Number(item.confidence).toFixed(2) : '—';
@@ -597,9 +609,17 @@ function renderReviewItem(item) {
   }
 
   const statusClass = (item.status || 'pending').replace('_', '-');
+  const focusClass = focused ? ' focused' : '';
+  const selectedClass = selected ? ' selected' : '';
+  const selectionToggle = selected
+    ? '<span class="rv-checkbox checked" aria-label="selected">☑</span>'
+    : '<span class="rv-checkbox" aria-label="not selected">☐</span>';
   return `
-    <li class="rv-item ${statusClass}${expanded ? ' expanded' : ''}" data-review-id="${escapeHtml(item.id)}">
+    <li class="rv-item ${statusClass}${expanded ? ' expanded' : ''}${focusClass}${selectedClass}"
+        data-review-id="${escapeHtml(item.id)}"
+        data-review-index="${index}">
       <div class="rv-item-header">
+        ${selectionToggle}
         <span class="rv-action-pill ${escapeHtml(action.toLowerCase())}">${escapeHtml(action)}</span>
         <span class="rv-conf">conf ${conf}</span>
         <span class="rv-status ${statusClass}">${escapeHtml(item.status)}</span>
@@ -617,9 +637,22 @@ function renderReviewList() {
   if (!state.review.items.length) {
     return `<div class="empty-state">No items in the review queue.</div>`;
   }
+  const selCount = state.review.selectedIds.size;
+  const totalLine = `<div class="task-count">${state.review.total} review item${state.review.total === 1 ? '' : 's'}${selCount ? ` <span class="rv-sel-count">· ${selCount} selected</span>` : ''}</div>`;
+  // Sticky bottom bar appears when ≥1 selected (Phase UI-1 partial — bulk
+  // approve/reject only; snooze + edit-then-approve land in UI-2).
+  const bulkBar = selCount > 0
+    ? `<div class="rv-bulk-bar">
+         <span class="rv-bulk-count"><strong>${selCount}</strong> selected</span>
+         <button class="rv-bulk-approve" ${state.review.bulkInProgress ? 'disabled' : ''}>Approve all (1)</button>
+         <button class="rv-bulk-reject" ${state.review.bulkInProgress ? 'disabled' : ''}>Reject all (2)</button>
+         <button class="rv-bulk-clear">Clear (Esc)</button>
+       </div>`
+    : '';
   return `
-    <div class="task-count">${state.review.total} review item${state.review.total === 1 ? '' : 's'}</div>
-    <ul class="rv-list">${state.review.items.map(renderReviewItem).join('')}</ul>
+    ${totalLine}
+    <ul class="rv-list">${state.review.items.map((item, i) => renderReviewItem(item, i)).join('')}</ul>
+    ${bulkBar}
   `;
 }
 
@@ -3388,6 +3421,431 @@ async function _bootBusinesses() {
     return [];
   }
 }
+
+// =====================================================================
+// Phase UI-1 (2026-05-09) — keyboard navigation, selection, action
+// shortcuts, command palette stub, ? overlay.
+//
+// Mostly self-contained: one document-level keydown listener routes to
+// per-view handlers; one document-level click listener picks up the
+// bulk-bar buttons and the row-checkbox clicks via event delegation.
+// State lives on state.review.{focusedIndex, selectedIds, ...}.
+// =====================================================================
+
+const _UI1 = {
+  // Tracks "g <next>" multi-key sequences. Set when 'g' is pressed,
+  // cleared after the next keypress (or after 1s). Used for
+  // 'g r' / 'g t' / 'g s' navigation a la Linear / GitHub.
+  gPending: false,
+  gTimer: null,
+  // True while the ? overlay is open.
+  shortcutsOpen: false,
+  // True while the Cmd+K palette is open.
+  paletteOpen: false,
+};
+
+function _ui1IsTypingTarget(el) {
+  if (!el) return false;
+  const tag = (el.tagName || '').toUpperCase();
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (el.isContentEditable) return true;
+  return false;
+}
+
+function _ui1FocusRow(newIndex) {
+  const items = state.review.items;
+  if (!items.length) {
+    state.review.focusedIndex = null;
+    return;
+  }
+  const clamped = Math.max(0, Math.min(items.length - 1, newIndex));
+  state.review.focusedIndex = clamped;
+  // After re-render, scroll the focused row into view.
+  requestAnimationFrame(() => {
+    const el = document.querySelector(`.rv-item.focused`);
+    if (el && el.scrollIntoView) {
+      el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  });
+}
+
+function _ui1ToggleSelectionAtIndex(index) {
+  const item = state.review.items[index];
+  if (!item) return;
+  if (state.review.selectedIds.has(item.id)) {
+    state.review.selectedIds.delete(item.id);
+  } else {
+    state.review.selectedIds.add(item.id);
+  }
+}
+
+function _ui1ClearSelection() {
+  state.review.selectedIds = new Set();
+}
+
+function _ui1SelectAll() {
+  state.review.selectedIds = new Set(state.review.items.map(i => i.id));
+}
+
+async function _ui1RunApproveOnTargets(ids) {
+  if (!ids.length || state.review.bulkInProgress) return;
+  state.review.bulkInProgress = true;
+  state.review.actionError = null;
+  render();
+  let okCount = 0;
+  const errors = [];
+  for (const id of ids) {
+    try {
+      await approveReview(id);
+      okCount++;
+    } catch (err) {
+      errors.push({ id, message: err.message || 'approve failed' });
+    }
+  }
+  state.review.bulkInProgress = false;
+  state.review.selectedIds = new Set();
+  state.review.actionError = errors.length
+    ? `Approved ${okCount}/${ids.length}; ${errors.length} failed (${errors[0].message}).`
+    : null;
+  // Refetch the queue so completed items drop out.
+  try {
+    const result = await loadReviewItems(state.review.statusFilter);
+    state.review.items = result.items;
+    state.review.total = result.total;
+    if (state.review.focusedIndex !== null) {
+      state.review.focusedIndex = Math.min(state.review.focusedIndex, state.review.items.length - 1);
+      if (state.review.focusedIndex < 0) state.review.focusedIndex = null;
+    }
+  } catch (_e) { /* leave stale list */ }
+  render();
+}
+
+async function _ui1RunRejectOnTargets(ids) {
+  if (!ids.length || state.review.bulkInProgress) return;
+  const reason = window.prompt(
+    ids.length === 1
+      ? 'Reject reason (optional):'
+      : `Reject ${ids.length} items — reason applied to all (optional):`,
+    ''
+  );
+  if (reason === null) return;  // user cancelled
+  state.review.bulkInProgress = true;
+  state.review.actionError = null;
+  render();
+  let okCount = 0;
+  const errors = [];
+  for (const id of ids) {
+    try {
+      await rejectReview(id, reason);
+      okCount++;
+    } catch (err) {
+      errors.push({ id, message: err.message || 'reject failed' });
+    }
+  }
+  state.review.bulkInProgress = false;
+  state.review.selectedIds = new Set();
+  state.review.actionError = errors.length
+    ? `Rejected ${okCount}/${ids.length}; ${errors.length} failed (${errors[0].message}).`
+    : null;
+  try {
+    const result = await loadReviewItems(state.review.statusFilter);
+    state.review.items = result.items;
+    state.review.total = result.total;
+    if (state.review.focusedIndex !== null) {
+      state.review.focusedIndex = Math.min(state.review.focusedIndex, state.review.items.length - 1);
+      if (state.review.focusedIndex < 0) state.review.focusedIndex = null;
+    }
+  } catch (_e) { /* leave stale list */ }
+  render();
+}
+
+function _ui1ActionTargets() {
+  // Action shortcuts (1/2) target: selected ids if ≥1, else focused single.
+  if (state.review.selectedIds.size > 0) {
+    return Array.from(state.review.selectedIds);
+  }
+  if (state.review.focusedIndex !== null) {
+    const item = state.review.items[state.review.focusedIndex];
+    return item ? [item.id] : [];
+  }
+  return [];
+}
+
+function _ui1ToggleShortcutsOverlay() {
+  _UI1.shortcutsOpen = !_UI1.shortcutsOpen;
+  const existing = document.getElementById('ui1-shortcuts-overlay');
+  if (_UI1.shortcutsOpen) {
+    if (existing) return;
+    const el = document.createElement('div');
+    el.id = 'ui1-shortcuts-overlay';
+    el.className = 'ui1-overlay';
+    el.innerHTML = `
+      <div class="ui1-overlay-card">
+        <h2>Keyboard shortcuts</h2>
+        <table class="ui1-shortcuts-table">
+          <tr><td><kbd>J</kbd> / <kbd>↓</kbd></td><td>Move focus down</td></tr>
+          <tr><td><kbd>K</kbd> / <kbd>↑</kbd></td><td>Move focus up</td></tr>
+          <tr><td><kbd>Enter</kbd></td><td>Expand / open focused row</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Collapse detail · clear selection · close overlay</td></tr>
+          <tr><td><kbd>X</kbd></td><td>Toggle selection on focused row</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>J</kbd>/<kbd>K</kbd></td><td>Extend selection</td></tr>
+          <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>A</kbd></td><td>Select all visible</td></tr>
+          <tr><td><kbd>1</kbd></td><td>Approve focused/selected</td></tr>
+          <tr><td><kbd>2</kbd></td><td>Reject focused/selected (prompts for reason)</td></tr>
+          <tr><td><kbd>G</kbd> then <kbd>R</kbd></td><td>Go to Review</td></tr>
+          <tr><td><kbd>G</kbd> then <kbd>T</kbd></td><td>Go to Tasks</td></tr>
+          <tr><td><kbd>G</kbd> then <kbd>S</kbd></td><td>Go to SOPs</td></tr>
+          <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>K</kbd></td><td>Command palette</td></tr>
+          <tr><td><kbd>?</kbd></td><td>Show this overlay</td></tr>
+        </table>
+        <div class="ui1-overlay-hint">Press <kbd>Esc</kbd> or <kbd>?</kbd> to close.</div>
+      </div>
+    `;
+    document.body.appendChild(el);
+    el.addEventListener('click', (ev) => {
+      if (ev.target === el) _ui1ToggleShortcutsOverlay();
+    });
+  } else if (existing) {
+    existing.remove();
+  }
+}
+
+function _ui1TogglePalette() {
+  _UI1.paletteOpen = !_UI1.paletteOpen;
+  const existing = document.getElementById('ui1-palette-overlay');
+  if (_UI1.paletteOpen) {
+    if (existing) return;
+    const el = document.createElement('div');
+    el.id = 'ui1-palette-overlay';
+    el.className = 'ui1-overlay';
+    el.innerHTML = `
+      <div class="ui1-overlay-card ui1-palette-card">
+        <h2>Quick navigation</h2>
+        <ul class="ui1-palette-list">
+          <li data-nav="review"><kbd>G R</kbd> · Review queue</li>
+          <li data-nav="tasks"><kbd>G T</kbd> · Tasks</li>
+          <li data-nav="sops"><kbd>G S</kbd> · SOPs</li>
+          <li data-nav="settings">·  Settings</li>
+        </ul>
+        <div class="ui1-overlay-hint">Real fuzzy search lands in UI-2. Press <kbd>Esc</kbd> to close.</div>
+      </div>
+    `;
+    document.body.appendChild(el);
+    el.addEventListener('click', (ev) => {
+      const li = ev.target.closest('[data-nav]');
+      if (li) {
+        state.view = li.dataset.nav;
+        _ui1TogglePalette();
+        render();
+        return;
+      }
+      if (ev.target === el) _ui1TogglePalette();
+    });
+  } else if (existing) {
+    existing.remove();
+  }
+}
+
+function _ui1HandleKey(e) {
+  // Bail on typing targets.
+  if (_ui1IsTypingTarget(e.target)) return;
+  // Don't intercept browser shortcuts that include modifiers we
+  // don't own (Alt, Meta+X for cut, etc.) unless we explicitly want
+  // them.
+  const isMeta = e.ctrlKey || e.metaKey;
+
+  // Handle the 'g <next>' two-key sequence first.
+  if (_UI1.gPending) {
+    _UI1.gPending = false;
+    if (_UI1.gTimer) { clearTimeout(_UI1.gTimer); _UI1.gTimer = null; }
+    if (e.key === 'r' || e.key === 'R') {
+      e.preventDefault(); state.view = 'review'; render(); return;
+    }
+    if (e.key === 't' || e.key === 'T') {
+      e.preventDefault(); state.view = 'tasks'; render(); return;
+    }
+    if (e.key === 's' || e.key === 'S') {
+      e.preventDefault();
+      // Only admins see the SOPs tab in the existing nav; honor that.
+      if (state.principal && state.principal.role === 'admin') {
+        state.view = 'sops'; render();
+      }
+      return;
+    }
+    // Otherwise fall through to normal handling.
+  }
+
+  // Esc: close overlays first; else clear selection / collapse.
+  if (e.key === 'Escape') {
+    if (_UI1.shortcutsOpen) { _ui1ToggleShortcutsOverlay(); e.preventDefault(); return; }
+    if (_UI1.paletteOpen) { _ui1TogglePalette(); e.preventDefault(); return; }
+    if (state.view === 'review') {
+      let changed = false;
+      if (state.review.expandedId !== null) {
+        state.review.expandedId = null;
+        state.review.expandedDetail = null;
+        changed = true;
+      }
+      if (state.review.selectedIds.size > 0) {
+        state.review.selectedIds = new Set();
+        changed = true;
+      }
+      if (changed) { render(); e.preventDefault(); }
+    }
+    return;
+  }
+
+  // Cmd+K palette
+  if (isMeta && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault();
+    _ui1TogglePalette();
+    return;
+  }
+
+  // ? overlay
+  if (e.key === '?' && !isMeta) {
+    e.preventDefault();
+    _ui1ToggleShortcutsOverlay();
+    return;
+  }
+
+  // 'g' starts a sequence
+  if ((e.key === 'g' || e.key === 'G') && !isMeta) {
+    e.preventDefault();
+    _UI1.gPending = true;
+    _UI1.gTimer = setTimeout(() => { _UI1.gPending = false; _UI1.gTimer = null; }, 1200);
+    return;
+  }
+
+  // Cmd+A: select all visible (review tab only)
+  if (isMeta && (e.key === 'a' || e.key === 'A') && state.view === 'review' && state.review.items.length) {
+    e.preventDefault();
+    _ui1SelectAll();
+    render();
+    return;
+  }
+
+  // The rest are review-tab-only.
+  if (state.view !== 'review') return;
+  if (!state.review.items.length) return;
+
+  const cur = state.review.focusedIndex;
+  const last = state.review.items.length - 1;
+
+  // Movement: J/K + arrows
+  if (e.key === 'j' || e.key === 'J' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    const next = cur === null ? 0 : Math.min(cur + 1, last);
+    if (e.shiftKey && cur !== null) {
+      // Extend selection: include both old + new.
+      const oldItem = state.review.items[cur];
+      const newItem = state.review.items[next];
+      if (oldItem) state.review.selectedIds.add(oldItem.id);
+      if (newItem) state.review.selectedIds.add(newItem.id);
+    }
+    _ui1FocusRow(next);
+    render();
+    return;
+  }
+  if (e.key === 'k' || e.key === 'K' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    const next = cur === null ? 0 : Math.max(cur - 1, 0);
+    if (e.shiftKey && cur !== null) {
+      const oldItem = state.review.items[cur];
+      const newItem = state.review.items[next];
+      if (oldItem) state.review.selectedIds.add(oldItem.id);
+      if (newItem) state.review.selectedIds.add(newItem.id);
+    }
+    _ui1FocusRow(next);
+    render();
+    return;
+  }
+
+  // X: toggle selection on focused row
+  if ((e.key === 'x' || e.key === 'X') && !isMeta && cur !== null) {
+    e.preventDefault();
+    _ui1ToggleSelectionAtIndex(cur);
+    render();
+    return;
+  }
+
+  // Enter: expand focused row
+  if (e.key === 'Enter' && cur !== null) {
+    e.preventDefault();
+    const item = state.review.items[cur];
+    if (item) {
+      // Re-use the existing expand-handler logic by simulating a click
+      // on the row header. Cleaner than duplicating the load path.
+      const headerEl = document.querySelector(
+        `.rv-item[data-review-id="${item.id}"] .rv-item-header`
+      );
+      if (headerEl) headerEl.click();
+    }
+    return;
+  }
+
+  // 1: approve focused/selected
+  if (e.key === '1' && !isMeta) {
+    e.preventDefault();
+    const ids = _ui1ActionTargets();
+    if (ids.length === 0) return;
+    if (ids.length > 1) {
+      const ok = window.confirm(`Approve ${ids.length} items?`);
+      if (!ok) return;
+    }
+    _ui1RunApproveOnTargets(ids);
+    return;
+  }
+
+  // 2: reject focused/selected
+  if (e.key === '2' && !isMeta) {
+    e.preventDefault();
+    const ids = _ui1ActionTargets();
+    if (ids.length === 0) return;
+    _ui1RunRejectOnTargets(ids);
+    return;
+  }
+}
+
+function _ui1HandleClick(e) {
+  // Checkbox click on a row toggles selection without opening detail.
+  const cb = e.target.closest('.rv-checkbox');
+  if (cb) {
+    const li = cb.closest('.rv-item[data-review-index]');
+    if (li) {
+      const idx = parseInt(li.dataset.reviewIndex, 10);
+      if (!Number.isNaN(idx)) {
+        e.stopPropagation();
+        _ui1ToggleSelectionAtIndex(idx);
+        render();
+      }
+    }
+    return;
+  }
+  // Bulk bar buttons
+  if (e.target.classList.contains('rv-bulk-approve')) {
+    const ids = Array.from(state.review.selectedIds);
+    if (ids.length > 1) {
+      const ok = window.confirm(`Approve ${ids.length} items?`);
+      if (!ok) return;
+    }
+    _ui1RunApproveOnTargets(ids);
+    return;
+  }
+  if (e.target.classList.contains('rv-bulk-reject')) {
+    const ids = Array.from(state.review.selectedIds);
+    _ui1RunRejectOnTargets(ids);
+    return;
+  }
+  if (e.target.classList.contains('rv-bulk-clear')) {
+    state.review.selectedIds = new Set();
+    render();
+    return;
+  }
+}
+
+document.addEventListener('keydown', _ui1HandleKey);
+document.addEventListener('click', _ui1HandleClick);
 
 (async function () {
   // Boot with offline tolerance. /whoami and /v1/businesses fall back

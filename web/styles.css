@@ -1111,3 +1111,173 @@ ul.businesses li {
   margin-bottom: 16px;
   font-size: 13px;
 }
+
+/* =====================================================================
+   Phase UI-1 (2026-05-09) — keyboard focus, selection, bulk bar,
+   shortcut overlay, palette.
+   ===================================================================== */
+
+/* Focused row gets a left bar accent + slight background tint. */
+.rv-item.focused {
+  position: relative;
+  background: var(--row-focus-bg, rgba(80, 130, 240, 0.08));
+}
+.rv-item.focused::before {
+  content: "";
+  position: absolute;
+  left: -1px;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--accent, #5082f0);
+  border-radius: 0 2px 2px 0;
+}
+
+/* Selected row visually distinct from focused. */
+.rv-item.selected {
+  background: var(--row-selected-bg, rgba(80, 200, 130, 0.10));
+}
+.rv-item.focused.selected {
+  background: var(--row-focus-selected-bg, rgba(80, 160, 200, 0.14));
+}
+
+/* Selection checkbox in row header. */
+.rv-checkbox {
+  display: inline-block;
+  margin-right: 8px;
+  font-size: 14px;
+  color: var(--muted, #888);
+  cursor: pointer;
+  user-select: none;
+}
+.rv-checkbox.checked {
+  color: var(--accent, #5082f0);
+}
+
+/* Selection-count line next to "N review items". */
+.rv-sel-count {
+  color: var(--accent, #5082f0);
+  font-weight: 600;
+}
+
+/* Sticky bottom bulk-action bar. */
+.rv-bulk-bar {
+  position: sticky;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  margin-top: 16px;
+  padding: 10px 14px;
+  background: var(--bulk-bar-bg, #1a1a1a);
+  color: var(--bulk-bar-fg, #fff);
+  border-top: 1px solid var(--rule, #333);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  border-radius: 6px 6px 0 0;
+  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.15);
+  z-index: 5;
+}
+.rv-bulk-count strong {
+  font-size: 15px;
+  margin-right: 4px;
+}
+.rv-bulk-bar button {
+  background: transparent;
+  color: var(--bulk-bar-fg, #fff);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.rv-bulk-bar button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+}
+.rv-bulk-bar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.rv-bulk-approve {
+  border-color: rgba(80, 200, 130, 0.6) !important;
+}
+.rv-bulk-reject {
+  border-color: rgba(220, 100, 100, 0.6) !important;
+}
+
+/* ? shortcut overlay + Cmd+K palette overlay (shared shell). */
+.ui1-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.ui1-overlay-card {
+  background: var(--bg, #1a1a1a);
+  color: var(--fg, #eee);
+  padding: 24px 28px;
+  border-radius: 10px;
+  max-width: 520px;
+  width: 90%;
+  max-height: 80vh;
+  overflow-y: auto;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+}
+.ui1-overlay-card h2 {
+  margin: 0 0 14px;
+  font-size: 18px;
+}
+.ui1-overlay-hint {
+  margin-top: 14px;
+  font-size: 12px;
+  color: var(--muted, #888);
+}
+
+.ui1-shortcuts-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.ui1-shortcuts-table td {
+  padding: 5px 4px;
+  vertical-align: middle;
+}
+.ui1-shortcuts-table td:first-child {
+  white-space: nowrap;
+  width: 40%;
+}
+
+.ui1-overlay-card kbd {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  margin: 0 2px;
+}
+
+.ui1-palette-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.ui1-palette-list li {
+  padding: 10px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.ui1-palette-list li:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.ui1-palette-list li kbd {
+  margin-right: 8px;
+  min-width: 50px;
+  display: inline-block;
+  text-align: center;
+}
