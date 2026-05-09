@@ -60,7 +60,48 @@ BUILD_JS_PATH = REPO_ROOT / "infra" / "n8n" / "slack-ingest-build-body.js"
 PREP_JS_PATH = REPO_ROOT / "infra" / "n8n" / "slack-ingest-fetch-message.js"
 REACTION_JS_PATH = REPO_ROOT / "infra" / "n8n" / "slack-ingest-build-reaction-body.js"
 
-MEMO_EMOJI = "memo"  # without colons; matches reaction.event.reaction
+# Accept any of these emojis as the "this is a task" trigger — without
+# colons, matches reaction.event.reaction. Codex 2026-05-09 review:
+# operator naturally reaches for ✅/☑️/📌 as much as 📝, and forcing one
+# specific emoji creates a discoverability problem. Easier to widen
+# the allowlist than to teach every reactor.
+TRIGGER_EMOJIS = [
+    # Tier 1 — explicit "this is a task / save this":
+    "memo",                       # 📝
+    "white_check_mark",           # ✅
+    "ballot_box_with_check",      # ☑️
+    "pushpin",                    # 📌
+    "round_pushpin",              # 📍
+    "spiral_notepad",             # 🗒️
+    "clipboard",                  # 📋
+    "pencil",                     # ✏️
+    "pencil2",                    # ✏️ (alt)
+    "scroll",                     # 📜
+    "page_facing_up",             # 📄
+    "paperclip",                  # 📎
+    "inbox_tray",                 # 📥
+    "file_folder",                # 📁
+    "bookmark",                   # 🔖
+    # Tier 2 — "I'm/we're on it":
+    "raised_hands",               # 🙌
+    "ok_hand",                    # 👌
+    "muscle",                     # 💪
+    "eyes",                       # 👀
+    "point_up",                   # 👆
+    "point_right",                # 👉
+    # Tier 3 — urgency / timing markers:
+    "exclamation",                # ❗
+    "fire",                       # 🔥
+    "rotating_light",             # 🚨
+    "alarm_clock",                # ⏰
+    "hourglass",                  # ⏳
+    "stopwatch",                  # ⏱️
+    "calendar",                   # 📅
+    "date",                       # 📆
+    "briefcase",                  # 💼
+    # Skipped intentionally: thumbsup, thumbsdown — too generic and
+    # would route every casual ack into the review queue.
+]
 
 
 # Codex post-launch v2 review (2026-05-08): flatten body.event.* into
@@ -70,18 +111,28 @@ MEMO_EMOJI = "memo"  # without colons; matches reaction.event.reaction
 # the wrong branch in n8n 2.18.5. Also makes the workflow human-
 # readable in the n8n editor — the IF parameters show
 # `slackEventType === 'reaction_added'` instead of nested chain.
-NORMALIZE_JS = """\
+NORMALIZE_JS_TEMPLATE = """\
 // Normalize Slack event — flatten body.event.* into top-level fields
 // so downstream IF dispatch nodes can route on $json.slackEventType
-// and $json.slackReaction directly. Codex 2026-05-08 review found
-// optional-chained expressions in IF nodes were silently routing
-// reaction events down the wrong branch. The fix is to do the
-// chain-walk once here, in JS, and surface flat fields.
+// and $json.slackIsTriggerEmoji directly. Codex 2026-05-08 review
+// found optional-chained expressions in IF nodes were silently
+// routing reaction events down the wrong branch. The fix is to do
+// the chain-walk once here, in JS, and surface flat fields.
+//
+// slackIsTriggerEmoji is a precomputed boolean — true when the
+// reaction emoji is in the trigger allowlist (memo, white_check_mark,
+// ballot_box_with_check, pushpin, round_pushpin, spiral_notepad).
+// Easier to maintain the allowlist here than juggle multi-condition
+// IF nodes in the n8n UI.
+
+const TRIGGER_EMOJIS = __TRIGGER_EMOJIS_JSON__;
 
 const item = $input.first().json;
 const body = item.body || {};
 const ev = body.event || {};
 const target = ev.item || {};
+
+const reaction = ev.reaction || '';
 
 return [{
   json: {
@@ -90,13 +141,18 @@ return [{
     ...item,
     // New flat fields the IF dispatch nodes route on:
     slackEventType: ev.type || '',
-    slackReaction: ev.reaction || '',
+    slackReaction: reaction,
+    slackIsTriggerEmoji: TRIGGER_EMOJIS.includes(reaction),
     slackItemType: target.type || '',
     slackItemChannel: target.channel || '',
     slackItemTs: target.ts || '',
   }
 }];
 """
+
+NORMALIZE_JS = NORMALIZE_JS_TEMPLATE.replace(
+    "__TRIGGER_EMOJIS_JSON__", json.dumps(TRIGGER_EMOJIS)
+)
 
 
 def _id() -> str:
@@ -407,11 +463,12 @@ def build_workflow() -> dict:
                     "conditions": [
                         {
                             "id": _id(),
-                            "leftValue": "={{ $json.slackReaction }}",
-                            "rightValue": MEMO_EMOJI,
+                            "leftValue": "={{ $json.slackIsTriggerEmoji }}",
+                            "rightValue": True,
                             "operator": {
-                                "type": "string",
-                                "operation": "equals",
+                                "type": "boolean",
+                                "operation": "true",
+                                "singleValue": True,
                             },
                         }
                     ],

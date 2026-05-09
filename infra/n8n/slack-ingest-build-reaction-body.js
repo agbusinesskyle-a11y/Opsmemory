@@ -28,6 +28,18 @@
 //   - Reject bot messages and the bot's own messages so the bot
 //     can't ingest itself.
 
+// Codex 2026-05-09 review: split the 30 trigger emojis into "strong"
+// (operator clearly tagging this as a task) vs "weak" (noting /
+// acknowledging). Pass the intent through as source_metadata.extra
+// .reaction_intent so the slack_message_extract prompt can lower
+// its skip threshold on strong, and only nudge it on weak.
+const STRONG_EMOJIS = new Set([
+  "memo","white_check_mark","ballot_box_with_check","pushpin","round_pushpin",
+  "spiral_notepad","clipboard","pencil","pencil2","scroll",
+  "page_facing_up","paperclip","inbox_tray","file_folder","bookmark",
+  "alarm_clock","hourglass","stopwatch","calendar","date","briefcase"
+]);
+
 const prep = $('Reaction prep').first().json;
 const slackResp = $('Slack: fetch reacted message').first().json;
 
@@ -93,6 +105,8 @@ const opsMemoryBody = {
     slack_event_id: prep.eventId,
     slack_event_type: 'reaction_added',
     reaction: prep.reaction,
+    reaction_intent: STRONG_EMOJIS.has(prep.reaction) ? 'strong' : 'weak',
+    explicit_user_tagged: true,        // any reaction in trigger list = explicit signal
     reactor_user_id: prep.slackUser,   // who labeled this as a task
     original_text: msg.text || null,
   },

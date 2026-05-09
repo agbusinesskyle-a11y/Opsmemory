@@ -53,7 +53,7 @@ SOURCES: dict[str, SourceConfig] = {
     ),
     "slack_message": SourceConfig(
         source="slack_message",
-        extract_prompt="slack_message_extract.v1",
+        extract_prompt="slack_message_extract.v2",
         choose_prompt="task_choose.v1",
         retrieval_due_window_days=30,
         # Slack messages are present-tense and noisy — bound retrieval

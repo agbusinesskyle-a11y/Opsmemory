@@ -86,6 +86,18 @@ async def extract(
             v = md.get(key)
             return str(v) if v else "(not provided)"
 
+        # v2 prompt addition (Codex 2026-05-09): expose
+        # extra.reaction_intent so the prompt can adapt for
+        # explicitly-tagged-via-reaction messages. Falls back to
+        # "(not provided)" for passive ingest / @-mention paths.
+        extra = md.get("extra") or {}
+        reaction_intent_raw = extra.get("reaction_intent")
+        reaction_intent = (
+            str(reaction_intent_raw)
+            if reaction_intent_raw in ("strong", "weak")
+            else "(not provided)"
+        )
+
         prompt = (body
                   .replace("{{MESSAGE_BODY}}", raw_content)
                   .replace("{{WORKSPACE_NAME}}", ctx("workspace_name"))
@@ -94,7 +106,8 @@ async def extract(
                   .replace("{{CHANNEL_ID}}", ctx("channel_id"))
                   .replace("{{USER_NAME}}", ctx("user_name"))
                   .replace("{{USER_ID}}", ctx("user_id"))
-                  .replace("{{THREAD_TS}}", ctx("thread_ts")))
+                  .replace("{{THREAD_TS}}", ctx("thread_ts"))
+                  .replace("{{REACTION_INTENT}}", reaction_intent))
     else:
         # Should be unreachable — pipeline.process_event refuses
         # unregistered sources before reaching here.
