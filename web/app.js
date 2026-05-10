@@ -48,6 +48,10 @@ const state = {
     snoozeModal: null,                       // null | { ids, selectedKey, customIso, reasonText }
     toast: null,                             // null | { msg, kind }
     items_visible: [],                       // computed at render time; filtered subset focused/selected indexes into
+    editingId: null,                         // null | review_item id currently in inline edit mode
+    editDraft: null,                         // { action, summary, due_at, category, dependency_text, completion_note, edit_reason }
+    editSaving: false,
+    editError: null,
   },
   // Phase UI-2B2: Quick Add compose modal — Slack-style ad-hoc task
   // capture. Lives at the top level (not under review.) so Q can
@@ -888,10 +892,92 @@ function tgRenderSubtabs(counts) {
   `;
 }
 
+function tgEditForm(item) {
+  // Render the inline edit form for a review_item. Action-specific
+  // field set; fields are pre-populated from candidate_facts +
+  // current proposed_patch. Save triggers PATCH /v1/review/{id}.
+  const d = state.review.editDraft || {};
+  const action = item.proposed_action;
+  const cf = item.candidate_facts || {};
+  const errBlock = state.review.editError
+    ? `<div class="tg-qa-error">${escapeHtml(state.review.editError)}</div>`
+    : '';
+  // Convert ISO -> datetime-local string for the input.
+  function isoToLocal(iso) {
+    if (!iso) return '';
+    try {
+      const dt = new Date(iso);
+      if (isNaN(dt.getTime())) return '';
+      const pad = n => String(n).padStart(2, '0');
+      return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`
+           + `T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+    } catch (_e) { return ''; }
+  }
+  // Driven by action:
+  // CREATE_TASK -> summary, due_at, category, dependency_text
+  // UPDATE_TASK -> same patch fields (any subset)
+  // COMPLETE_TASK -> completion_note
+  let fields = '';
+  if (action === 'CREATE_TASK' || action === 'UPDATE_TASK') {
+    fields = `
+      <div>
+        <div class="tg-field-lbl">Summary</div>
+        <input type="text" id="tg-edit-summary" maxlength="4096"
+               value="${escapeHtml(d.summary != null ? d.summary : (cf.summary || ''))}">
+      </div>
+      <div class="tg-qa-row">
+        <div class="tg-qa-field">
+          <div class="tg-field-lbl">Due / when</div>
+          <input type="datetime-local" id="tg-edit-due"
+                 value="${escapeHtml(d.due_at_local != null ? d.due_at_local : isoToLocal(cf.due_at))}">
+        </div>
+        <div class="tg-qa-field">
+          <div class="tg-field-lbl">Category</div>
+          <input type="text" id="tg-edit-category" maxlength="64"
+                 value="${escapeHtml(d.category != null ? d.category : (cf.category || ''))}">
+        </div>
+      </div>
+      <div>
+        <div class="tg-field-lbl">Dependency / blocked on (optional)</div>
+        <input type="text" id="tg-edit-dependency" maxlength="2048"
+               value="${escapeHtml(d.dependency_text != null ? d.dependency_text : (cf.dependency_text || ''))}">
+      </div>
+    `;
+  } else if (action === 'COMPLETE_TASK') {
+    fields = `
+      <div>
+        <div class="tg-field-lbl">Completion note (optional)</div>
+        <textarea id="tg-edit-completion-note" maxlength="4096">${escapeHtml(d.completion_note != null ? d.completion_note : (cf.completion_note || ''))}</textarea>
+      </div>
+    `;
+  } else {
+    fields = `<div class="tg-qa-error">Edit not supported for action ${escapeHtml(action)}.</div>`;
+  }
+  const saveDisabled = state.review.editSaving ? 'disabled' : '';
+  return `
+    <div class="tg-edit-form">
+      ${errBlock}
+      ${fields}
+      <div>
+        <div class="tg-field-lbl">Edit reason (optional)</div>
+        <input type="text" id="tg-edit-reason" maxlength="2048" placeholder="why are you editing this proposal?"
+               value="${escapeHtml(d.edit_reason != null ? d.edit_reason : '')}">
+      </div>
+      <div class="tg-actions-row">
+        <button class="tg-btn primary" data-tg-edit-save ${saveDisabled}>
+          ${state.review.editSaving ? 'Saving…' : 'Save edits'}
+        </button>
+        <button class="tg-btn" data-tg-edit-cancel ${saveDisabled}>Cancel</button>
+      </div>
+    </div>
+  `;
+}
+
 function tgRenderDetail(item) {
   if (!item) {
     return `<aside class="tg-detail"><div class="tg-detail-empty">Focus a row (J/K) to see source + facts here.</div></aside>`;
   }
+  const isEditing = state.review.editingId === item.id;
   const ageMin = tgAgeMinutes(item);
   const cf = item.candidate_facts || {};
   const ev = cf.source_event || cf.source_metadata || {};
@@ -931,15 +1017,17 @@ function tgRenderDetail(item) {
           </div>
         </div>
         <div>
-          <div class="tg-sec-h">Proposed facts</div>
-          <dl class="tg-kvgrid">
-            <dt>Summary</dt><dd>${escapeHtml(cf.summary || '—')}</dd>
-            <dt>Business</dt><dd>${escapeHtml(businesses) || '<span class="missing">— missing —</span>'}</dd>
-            <dt>Assignee</dt><dd>${owner}</dd>
-            <dt>Priority</dt><dd>${priority}</dd>
-            <dt>Due</dt><dd>${due}</dd>
-            <dt>Category</dt><dd>${category}</dd>
-          </dl>
+          <div class="tg-sec-h">${isEditing ? 'Edit proposal' : 'Proposed facts'}</div>
+          ${isEditing ? tgEditForm(item) : `
+            <dl class="tg-kvgrid">
+              <dt>Summary</dt><dd>${escapeHtml(cf.summary || '—')}</dd>
+              <dt>Business</dt><dd>${escapeHtml(businesses) || '<span class="missing">— missing —</span>'}</dd>
+              <dt>Assignee</dt><dd>${owner}</dd>
+              <dt>Priority</dt><dd>${priority}</dd>
+              <dt>Due</dt><dd>${due}</dd>
+              <dt>Category</dt><dd>${category}</dd>
+            </dl>
+          `}
         </div>
         ${retrieved.length ? `
           <div>
@@ -965,12 +1053,12 @@ function tgRenderDetail(item) {
           }
         </div>
       </div>
-      ${item.status === 'pending' || item.status === 'needs_changes' ? `
+      ${(item.status === 'pending' || item.status === 'needs_changes') && !isEditing ? `
         <div class="tg-actions-row">
           <button class="tg-btn primary" data-tg-detail-approve>
             Approve <span class="tg-pill-kbd">1</span>
           </button>
-          <button class="tg-btn" data-tg-detail-edit title="Edit + approve (coming next chunk)">
+          <button class="tg-btn" data-tg-detail-edit title="Edit proposal then approve">
             Edit <span class="tg-pill-kbd">3</span>
           </button>
           <button class="tg-btn danger" data-tg-detail-reject>
@@ -1208,6 +1296,177 @@ async function _tgApplySnooze() {
     tgShowToast(`Snoozed ${okCount}`, 'ok');
   } else {
     tgShowToast(`Snoozed ${okCount}/${ids.length}; ${errors.length} failed`, 'err');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase UI-2B4: Edit-then-approve.
+// Inline form on the focused review_item that PATCHes proposed_patch
+// then leaves the item in edit-then-pending so the operator can hit
+// 1 to approve or step away.
+// ---------------------------------------------------------------------------
+
+function _tgEnterEditMode(item) {
+  const cf = item.candidate_facts || {};
+  // Convert ISO due_at -> datetime-local string for the input.
+  let dueLocal = '';
+  if (cf.due_at) {
+    try {
+      const dt = new Date(cf.due_at);
+      if (!isNaN(dt.getTime())) {
+        const pad = n => String(n).padStart(2, '0');
+        dueLocal = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`
+                 + `T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+      }
+    } catch (_e) {}
+  }
+  state.review.editingId = item.id;
+  state.review.editDraft = {
+    action: item.proposed_action,
+    summary: cf.summary || '',
+    due_at_local: dueLocal,
+    category: cf.category || '',
+    dependency_text: cf.dependency_text || '',
+    completion_note: cf.completion_note || '',
+    edit_reason: '',
+  };
+  state.review.editError = null;
+  state.review.editSaving = false;
+  render();
+  requestAnimationFrame(() => {
+    const sumEl = document.getElementById('tg-edit-summary');
+    if (sumEl) {
+      sumEl.focus();
+      try { sumEl.setSelectionRange(sumEl.value.length, sumEl.value.length); } catch (_e) {}
+    }
+  });
+}
+
+function _tgSnapshotEditForm() {
+  const sumEl = document.getElementById('tg-edit-summary');
+  const dueEl = document.getElementById('tg-edit-due');
+  const catEl = document.getElementById('tg-edit-category');
+  const depEl = document.getElementById('tg-edit-dependency');
+  const noteEl = document.getElementById('tg-edit-completion-note');
+  const reasonEl = document.getElementById('tg-edit-reason');
+  const d = state.review.editDraft || {};
+  if (sumEl) d.summary = sumEl.value;
+  if (dueEl) d.due_at_local = dueEl.value;
+  if (catEl) d.category = catEl.value;
+  if (depEl) d.dependency_text = depEl.value;
+  if (noteEl) d.completion_note = noteEl.value;
+  if (reasonEl) d.edit_reason = reasonEl.value;
+  state.review.editDraft = d;
+  return d;
+}
+
+async function _tgSaveEdit() {
+  const id = state.review.editingId;
+  if (!id) return;
+  const d = _tgSnapshotEditForm();
+  // datetime-local local time -> UTC ISO.
+  let dueIso = null;
+  if (d.due_at_local) {
+    const dt = new Date(d.due_at_local);
+    if (!isNaN(dt.getTime())) dueIso = dt.toISOString();
+  }
+  // Build the typed PATCH body. The endpoint requires exactly one of
+  // create/update/complete and the key MUST match proposed_action.
+  let body = { edit_reason: (d.edit_reason || '').trim() || null };
+  if (d.action === 'CREATE_TASK') {
+    if (!d.summary || !d.summary.trim()) {
+      state.review.editError = 'Summary is required';
+      render();
+      return;
+    }
+    // Pull current businesses from the item (PATCH endpoint requires
+    // them in the body for CREATE; we don't change them in this UI).
+    const focused = state.review.items_visible.find(i => i.id === id);
+    const cf = (focused && focused.candidate_facts) || {};
+    const businesses = cf.businesses || [];
+    if (!businesses.length) {
+      state.review.editError = 'No business slug on the item — cannot save';
+      render();
+      return;
+    }
+    body.create = {
+      summary: d.summary.trim(),
+      due_at: dueIso,
+      category: (d.category || '').trim() || null,
+      dependency_text: (d.dependency_text || '').trim() || null,
+      businesses,
+    };
+  } else if (d.action === 'UPDATE_TASK') {
+    body.update = {};
+    if (d.summary && d.summary.trim()) body.update.summary = d.summary.trim();
+    if (dueIso) body.update.due_at = dueIso;
+    if ((d.category || '').trim()) body.update.category = d.category.trim();
+    if ((d.dependency_text || '').trim()) body.update.dependency_text = d.dependency_text.trim();
+    if (Object.keys(body.update).length === 0) {
+      state.review.editError = 'No fields changed';
+      render();
+      return;
+    }
+  } else if (d.action === 'COMPLETE_TASK') {
+    body.complete = {
+      completion_note: (d.completion_note || '').trim() || null,
+    };
+  } else {
+    state.review.editError = `Edit not supported for ${d.action}`;
+    render();
+    return;
+  }
+  state.review.editSaving = true;
+  state.review.editError = null;
+  render();
+  try {
+    await api(`/v1/review/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body,
+    });
+  } catch (e) {
+    state.review.editSaving = false;
+    state.review.editError = (e && e.message) || 'Save failed';
+    render();
+    return;
+  }
+  // Re-fetch the queue so the edited item shows updated facts, then
+  // exit edit mode. Operator can now press 1 to approve.
+  const editedId = id;
+  state.review.editSaving = false;
+  state.review.editingId = null;
+  state.review.editDraft = null;
+  state.review.editError = null;
+  try {
+    const result = await loadReviewItems(state.review.statusFilter);
+    state.review.items = result.items;
+    state.review.total = result.total;
+  } catch (_e) {}
+  // B4 blocker: re-focus by id, not by stale index. Refetch may
+  // have shifted the queue; "press 1 to approve" must hit the
+  // edited row, not whatever now sits at the previous index.
+  // tgSubviewItems() rebuilds from the current state, so we have
+  // to mirror the visible-list filter logic.
+  render();
+  // The render() call has set state.review.items_visible. Find the
+  // edited item's NEW index there.
+  const visible = state.review.items_visible || [];
+  const newIdx = visible.findIndex(i => i.id === editedId);
+  if (newIdx >= 0) {
+    state.review.focusedIndex = newIdx;
+    render();
+    tgShowToast('Edits saved — press 1 to approve', 'ok');
+  } else {
+    // Edited item dropped out of the current visible set under
+    // the active sub-tab + forecast + search filter. Clear focus
+    // AND any stale multi-select so the global '1' shortcut
+    // can't approve whatever row(s) the operator picked before
+    // editing (Codex round-3 blocker — _ui1ActionTargets prefers
+    // selectedIds over focusedIndex when both are present).
+    state.review.focusedIndex = null;
+    state.review.selectedIds = new Set();
+    render();
+    tgShowToast('Edits saved — clear filters to find the row', 'ok');
   }
 }
 
@@ -2480,6 +2739,22 @@ function renderAppShell(viewContent) {
 function render() {
   const root = document.getElementById('root');
   if (!root) return;
+  // B4 blocker: capture edit-form focus + caret BEFORE root.innerHTML
+  // wipes the DOM, so we can restore it AFTER. Without this, async
+  // re-render triggers (replayOutbox 10s tick) destroy the focused
+  // input and the operator's keystrokes start hitting body, where
+  // global 1/2 shortcuts can fire and approve/reject the wrong row.
+  let _editFocusSnapshot = null;
+  if (state.review && state.review.editingId) {
+    const ae = document.activeElement;
+    if (ae && ae.id && ae.id.startsWith('tg-edit-')) {
+      _editFocusSnapshot = {
+        id: ae.id,
+        selStart: typeof ae.selectionStart === 'number' ? ae.selectionStart : null,
+        selEnd: typeof ae.selectionEnd === 'number' ? ae.selectionEnd : null,
+      };
+    }
+  }
   // The shell takes over the viewport — root needs to give up its
   // legacy max-width / centering. Adding the class flips that.
   root.classList.add('has-shell');
@@ -2513,6 +2788,22 @@ function render() {
   root.innerHTML = renderAppShell(viewContent);
   attachEventHandlers();
   _tgRenderQuickAddHost();
+  // Restore edit-form focus + caret if we snapshotted before render.
+  if (_editFocusSnapshot) {
+    requestAnimationFrame(() => {
+      const el = document.getElementById(_editFocusSnapshot.id);
+      if (el) {
+        el.focus();
+        try {
+          if (_editFocusSnapshot.selStart != null
+              && _editFocusSnapshot.selEnd != null) {
+            el.setSelectionRange(_editFocusSnapshot.selStart,
+                                 _editFocusSnapshot.selEnd);
+          }
+        } catch (_e) {}
+      }
+    });
+  }
 }
 
 function renderError(err) {
@@ -5161,6 +5452,19 @@ function _ui1HandleKey(e) {
     }
   }
 
+  // B4 blocker: when an edit form is open, do NOT let global Triage
+  // shortcuts (1 = approve, 2 = reject, X = toggle, J/K = navigate,
+  // etc.) fire from a body-focused state. The race is: render() wipes
+  // the focused input, focus moves to body, operator types '1' and
+  // approves the unsaved original proposal. Esc to cancel, Save
+  // button to commit.
+  if (state.review && state.review.editingId
+      && !state.quickAdd?.dedup
+      && e.key !== 'Escape'
+      && !_ui1IsTypingTarget(e.target)) {
+    return;
+  }
+
   // Bail on typing targets.
   if (_ui1IsTypingTarget(e.target)) {
     // Quick Add submit shortcut: Cmd/Ctrl+Enter only. Plain Enter
@@ -5239,6 +5543,13 @@ function _ui1HandleKey(e) {
         state.review.rejectModal = null;
         changed = true;
       }
+      // B4: edit mode counts as a "modal" for Esc priority.
+      else if (state.review.editingId && !state.review.editSaving) {
+        state.review.editingId = null;
+        state.review.editDraft = null;
+        state.review.editError = null;
+        changed = true;
+      }
       // Then search filter
       else if (state.review.searchQuery) {
         state.review.searchQuery = '';
@@ -5308,10 +5619,22 @@ function _ui1HandleKey(e) {
     return;
   }
 
-  // 3 = edit-then-approve (still placeholder for B2 chunk).
+  // 3 = enter inline edit mode for the focused row (B4 active).
   if (e.key === '3' && !isMeta) {
     e.preventDefault();
-    tgShowToast('Edit + approve ships in B2', 'err');
+    const visible = state.review.items_visible || [];
+    const focused = state.review.focusedIndex != null
+      ? visible[state.review.focusedIndex]
+      : null;
+    if (!focused) {
+      tgShowToast('Focus a row first', 'err');
+      return;
+    }
+    if (focused.status !== 'pending' && focused.status !== 'needs_changes') {
+      tgShowToast('Only pending items can be edited', 'err');
+      return;
+    }
+    _tgEnterEditMode(focused);
     return;
   }
   // H = snooze. Targets selected ids if >=1, else focused single.
@@ -5493,7 +5816,22 @@ function _ui1HandleClick(e) {
     return;
   }
   if (e.target.closest('[data-tg-detail-edit]')) {
-    tgShowToast('Edit + approve ships in next chunk', 'err');
+    const focused = state.review.items_visible
+      && state.review.items_visible[state.review.focusedIndex];
+    if (focused) _tgEnterEditMode(focused);
+    return;
+  }
+  if (e.target.closest('[data-tg-edit-cancel]')) {
+    if (state.review.editSaving) return;
+    state.review.editingId = null;
+    state.review.editDraft = null;
+    state.review.editError = null;
+    render();
+    return;
+  }
+  if (e.target.closest('[data-tg-edit-save]')) {
+    if (state.review.editSaving) return;
+    _tgSaveEdit();
     return;
   }
   if (e.target.closest('[data-tg-detail-snooze]')) {
@@ -5807,11 +6145,26 @@ const _QA_FIELD_KEYS = {
   'tg-qa-kind': 'kind',
   'tg-qa-owner': 'ownerUserId',
 };
+// B4 edit-form fields. Same live-sync pattern as Quick Add.
+const _EDIT_FIELD_KEYS = {
+  'tg-edit-summary': 'summary',
+  'tg-edit-due': 'due_at_local',
+  'tg-edit-category': 'category',
+  'tg-edit-dependency': 'dependency_text',
+  'tg-edit-completion-note': 'completion_note',
+  'tg-edit-reason': 'edit_reason',
+};
 document.addEventListener('input', function (e) {
   if (!e.target || !e.target.id) return;
   if (state.quickAdd && state.quickAdd.open
       && _QA_FIELD_KEYS[e.target.id]) {
     state.quickAdd[_QA_FIELD_KEYS[e.target.id]] = e.target.value;
+    return;
+  }
+  // B4 edit form live sync.
+  if (state.review.editingId && state.review.editDraft
+      && _EDIT_FIELD_KEYS[e.target.id]) {
+    state.review.editDraft[_EDIT_FIELD_KEYS[e.target.id]] = e.target.value;
     return;
   }
 });
@@ -5821,6 +6174,10 @@ document.addEventListener('change', function (e) {
   if (state.quickAdd && state.quickAdd.open
       && _QA_FIELD_KEYS[e.target.id]) {
     state.quickAdd[_QA_FIELD_KEYS[e.target.id]] = e.target.value;
+  }
+  if (state.review.editingId && state.review.editDraft
+      && _EDIT_FIELD_KEYS[e.target.id]) {
+    state.review.editDraft[_EDIT_FIELD_KEYS[e.target.id]] = e.target.value;
   }
 });
 
