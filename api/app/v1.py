@@ -228,6 +228,186 @@ async def list_users(
     return {"users": [dict(r) for r in rows]}
 
 
+@router.get("/dashboard/summary")
+async def dashboard_summary(
+    request: Request,
+    principal: Principal = Depends(require_principal),
+    business_slug: str | None = Query(default=None, max_length=64),
+) -> dict:
+    """Aggregate metrics for the operator dashboard tiles.
+
+    Phase UI-3: scoped by visible_business_ids (admins unrestricted;
+    owners scoped to their memberships). Returns enough to render
+    three tiles + a sparkline without follow-up requests:
+      - totals: open count, done in last 7d / 30d
+      - open_aging: counts in today / 1-3d / 3-7d / 7d+ buckets,
+        anchored on last_activity_at so freshly-touched tasks reset
+      - by_business: open count per visible business (for the
+        per-business bar)
+      - spark_daily_done: 14-day daily series of completed-tasks
+        count, zero-filled via generate_series so the sparkline has
+        a stable x-axis even on quiet days.
+    Optional ?business_slug filter scopes everything to one business.
+    """
+    pool = request.app.state.db
+    visible = visible_business_ids(principal)
+
+    # Resolve optional business filter -> intersect with visible.
+    # Codex UI-3 R1 blocker: this MUST run before the no-visibility
+    # short-circuit, otherwise a service principal (or owner with
+    # zero memberships) would get a 200 with zeros instead of the
+    # expected 404 (unknown slug) or 403 (slug not visible to them).
+    biz_filter_ids: list[str] | None
+    if business_slug:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id::text AS id FROM businesses "
+                "WHERE slug::text = $1 AND deletion_state = 'active'",
+                business_slug,
+            )
+        if not row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "business_not_found", "slug": business_slug},
+            )
+        if visible is not None and row["id"] not in visible:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "business_not_visible"},
+            )
+        biz_filter_ids = [row["id"]]
+    else:
+        biz_filter_ids = visible  # may be None for platform_admin
+
+    # No-visibility short-circuit AFTER slug resolution.
+    if visible is not None and not visible:
+        return {
+            "totals": {"open": 0, "done_7d": 0, "done_30d": 0},
+            "open_aging": {"today": 0, "1_3d": 0, "3_7d": 0, "7d_plus": 0},
+            "by_business": [],
+            "spark_daily_done": [],
+        }
+
+    # When biz_filter_ids is None (platform_admin, no slug filter),
+    # we want ALL active businesses. Materialize that explicitly so
+    # the SQL below can always filter on a concrete list.
+    async with pool.acquire() as conn:
+        if biz_filter_ids is None:
+            all_biz = await conn.fetch(
+                "SELECT id::text AS id FROM businesses WHERE deletion_state = 'active'"
+            )
+            biz_filter_ids = [r["id"] for r in all_biz]
+
+        # Totals + aging in one pass over the scoped task set.
+        totals_row = await conn.fetchrow(
+            """
+            WITH scoped AS (
+              SELECT DISTINCT t.id,
+                     t.status::text AS status,
+                     t.last_activity_at,
+                     t.completed_at
+                FROM tasks t
+                JOIN task_businesses tb ON tb.task_id = t.id
+               WHERE t.deletion_state = 'active'
+                 AND tb.business_id::text = ANY($1::text[])
+            )
+            SELECT
+              count(*) FILTER (WHERE status = 'open') AS open_total,
+              count(*) FILTER (WHERE status = 'done'
+                               AND completed_at >= now() - interval '7 days') AS done_7d,
+              count(*) FILTER (WHERE status = 'done'
+                               AND completed_at >= now() - interval '30 days') AS done_30d,
+              count(*) FILTER (WHERE status = 'open'
+                               AND last_activity_at >= now() - interval '24 hours') AS age_today,
+              count(*) FILTER (WHERE status = 'open'
+                               AND last_activity_at <  now() - interval '24 hours'
+                               AND last_activity_at >= now() - interval '3 days') AS age_1_3d,
+              count(*) FILTER (WHERE status = 'open'
+                               AND last_activity_at <  now() - interval '3 days'
+                               AND last_activity_at >= now() - interval '7 days') AS age_3_7d,
+              count(*) FILTER (WHERE status = 'open'
+                               AND last_activity_at <  now() - interval '7 days') AS age_7d_plus
+            FROM scoped
+            """,
+            biz_filter_ids,
+        )
+
+        # Per-business open counts (only the businesses in scope).
+        by_biz_rows = await conn.fetch(
+            """
+            SELECT b.slug::text AS slug, b.name AS name,
+                   count(DISTINCT t.id)
+                     FILTER (WHERE t.status = 'open') AS open_count
+              FROM businesses b
+              LEFT JOIN task_businesses tb ON tb.business_id = b.id
+              LEFT JOIN tasks t ON t.id = tb.task_id
+                                AND t.deletion_state = 'active'
+             WHERE b.id::text = ANY($1::text[])
+               AND b.deletion_state = 'active'
+             GROUP BY b.id, b.slug, b.name
+             ORDER BY b.name
+            """,
+            biz_filter_ids,
+        )
+
+        # Sparkline: completed tasks per day for the last 14 days,
+        # zero-filled via generate_series. Day boundaries in UTC; the
+        # PWA can re-bucket to local TZ if it cares (today's tile
+        # uses the UTC day number which is close-enough for ops at
+        # this scale).
+        spark_rows = await conn.fetch(
+            """
+            WITH days AS (
+              SELECT generate_series(
+                       date_trunc('day', now() - interval '13 days'),
+                       date_trunc('day', now()),
+                       interval '1 day'
+                     ) AS day
+            ),
+            done AS (
+              SELECT date_trunc('day', t.completed_at) AS day,
+                     count(DISTINCT t.id) AS c
+                FROM tasks t
+                JOIN task_businesses tb ON tb.task_id = t.id
+               WHERE t.deletion_state = 'active'
+                 AND t.status = 'done'
+                 AND t.completed_at >= date_trunc('day', now() - interval '13 days')
+                 AND tb.business_id::text = ANY($1::text[])
+               GROUP BY 1
+            )
+            SELECT to_char(d.day, 'YYYY-MM-DD') AS day,
+                   COALESCE(done.c, 0) AS count
+              FROM days d
+              LEFT JOIN done ON done.day = d.day
+             ORDER BY d.day
+            """,
+            biz_filter_ids,
+        )
+
+    return {
+        "totals": {
+            "open": int(totals_row["open_total"] or 0),
+            "done_7d": int(totals_row["done_7d"] or 0),
+            "done_30d": int(totals_row["done_30d"] or 0),
+        },
+        "open_aging": {
+            "today": int(totals_row["age_today"] or 0),
+            "1_3d": int(totals_row["age_1_3d"] or 0),
+            "3_7d": int(totals_row["age_3_7d"] or 0),
+            "7d_plus": int(totals_row["age_7d_plus"] or 0),
+        },
+        "by_business": [
+            {"slug": r["slug"], "name": r["name"],
+             "open": int(r["open_count"] or 0)}
+            for r in by_biz_rows
+        ],
+        "spark_daily_done": [
+            {"day": r["day"], "count": int(r["count"])}
+            for r in spark_rows
+        ],
+    }
+
+
 @router.get("/tasks")
 async def list_tasks(
     request: Request,

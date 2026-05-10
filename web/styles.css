@@ -2063,6 +2063,138 @@ html, body {
   margin: 12px 0 6px;
 }
 
+/* Phase UI-3: Tasks dashboard tiles */
+.tg-dash {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin: 0 0 6px;
+}
+.tg-dash-tile {
+  background: var(--tg-bg-elev);
+  border: 1px solid var(--tg-bd-soft);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.tg-dash-tile.tg-dash-biz { grid-column: span 2; }
+@media (max-width: 700px) {
+  .tg-dash-tile.tg-dash-biz { grid-column: span 1; }
+}
+.tg-dash-lbl {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--tg-fg-dim);
+  font-weight: 500;
+}
+.tg-dash-num {
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--tg-fg);
+  line-height: 1.05;
+}
+.tg-dash-sub {
+  font-size: 11.5px;
+  color: var(--tg-fg-mut);
+}
+.tg-dash-skel,
+.tg-dash-err {
+  grid-column: 1 / -1;
+  padding: 14px;
+  font-size: 12.5px;
+  color: var(--tg-fg-mut);
+  background: var(--tg-bg-elev);
+  border: 1px solid var(--tg-bd-soft);
+  border-radius: 8px;
+}
+.tg-dash-err { color: var(--tg-c-redhot); }
+.tg-dash-empty { font-size: 12px; color: var(--tg-fg-dim); padding: 4px 0; }
+
+/* Aging stacked bar */
+.tg-dash-aging-bar {
+  display: flex;
+  height: 22px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--tg-bg-elev2);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.tg-dash-aging-bar.empty {
+  align-items: center;
+  justify-content: center;
+  color: var(--tg-fg-dim);
+  background: transparent;
+  border: 1px dashed var(--tg-bd-soft);
+  font-size: 11px;
+}
+.tg-dash-aging-bar .seg {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(0, 0, 0, .72);
+  font-weight: 600;
+  min-width: 14px;
+  padding: 0 4px;
+}
+.tg-dash-aging-bar .seg.fresh  { background: var(--tg-c-create); }
+.tg-dash-aging-bar .seg.warm   { background: var(--tg-c-update); }
+.tg-dash-aging-bar .seg.stale  { background: var(--tg-c-amb); }
+.tg-dash-aging-bar .seg.vstale { background: var(--tg-c-redhot); color: #fff; }
+
+/* Sparkline */
+.tg-spark {
+  width: 100%;
+  height: 32px;
+  display: block;
+  color: var(--tg-acc);
+}
+
+/* Per-business open list */
+.tg-dash-bizlist {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tg-dash-bizrow {
+  display: grid;
+  grid-template-columns: 1fr 1fr 32px;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+}
+.tg-dash-bizrow .biz-name {
+  color: var(--tg-fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tg-dash-bizrow .biz-bar {
+  display: block;
+  height: 6px;
+  background: var(--tg-bg-elev2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.tg-dash-bizrow .biz-bar .fill {
+  display: block;
+  height: 100%;
+  background: var(--tg-acc);
+  border-radius: 3px;
+}
+.tg-dash-bizrow .biz-count {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--tg-fg-mut);
+  font-size: 12px;
+}
+
 /* Phase UI-2B3-2 + B3-3: Dedup confirm modal stacked on Quick Add */
 .tg-dedup-wrap { z-index: 70; background: rgba(0,0,0,.72); }
 .tg-dedup-modal { width: 560px; max-width: calc(100vw - 32px); }

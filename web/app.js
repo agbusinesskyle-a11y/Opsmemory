@@ -115,6 +115,19 @@ const state = {
   // pending in-flight mutations on the rendered task. Cleared when a
   // mutation reaches a terminal state.
   optimistic: {},
+  // Phase UI-3: dashboard tiles state. Loaded on Tasks tab open and
+  // refreshed when the business filter changes. Shape mirrors the
+  // GET /v1/dashboard/summary response.
+  dashboard: {
+    loaded: false,
+    loading: false,
+    loadError: null,
+    totals: { open: 0, done_7d: 0, done_30d: 0 },
+    open_aging: { today: 0, '1_3d': 0, '3_7d': 0, '7d_plus': 0 },
+    by_business: [],
+    spark_daily_done: [],
+    forBusiness: 'all',          // 'all' | <slug>; refresh when this drifts from filters.business
+  },
   // Chunk 10 step 3 sub-(a): Settings tab (read-only). Displays
   // notification prefs, web-push subscriptions, and the server's
   // VAPID config status. NO permission prompts, NO subscribe, NO
@@ -464,6 +477,97 @@ function renderHeader() {
       <div class="biz-list">${businesses}</div>
     </div>
     ${tabs}
+  `;
+}
+
+function renderDashboardTiles() {
+  const d = state.dashboard;
+  // First load: skeletons. Refresh-while-loaded: keep the prior
+  // numbers visible (no flicker).
+  if (!d.loaded && d.loading) {
+    return `<div class="tg-dash"><div class="tg-dash-skel">Loading dashboard…</div></div>`;
+  }
+  if (d.loadError && !d.loaded) {
+    return `<div class="tg-dash"><div class="tg-dash-err">⚠ ${escapeHtml(d.loadError)}</div></div>`;
+  }
+  const t = d.totals || {};
+  const a = d.open_aging || {};
+  const totalAging = (a.today || 0) + (a['1_3d'] || 0) + (a['3_7d'] || 0) + (a['7d_plus'] || 0);
+  // Stacked aging bar segments. When all 0, render a faint full-width "0".
+  function pct(n) {
+    if (!totalAging) return 0;
+    return Math.round((n / totalAging) * 100);
+  }
+  const seg = [
+    { key: 'today',   cls: 'fresh',  n: a.today || 0 },
+    { key: '1_3d',    cls: 'warm',   n: a['1_3d'] || 0 },
+    { key: '3_7d',    cls: 'stale',  n: a['3_7d'] || 0 },
+    { key: '7d_plus', cls: 'vstale', n: a['7d_plus'] || 0 },
+  ];
+  const agingBar = totalAging === 0
+    ? `<div class="tg-dash-aging-bar empty"><span>nothing open</span></div>`
+    : `<div class="tg-dash-aging-bar">
+         ${seg.map(s => s.n
+            ? `<span class="seg ${s.cls}" style="width:${pct(s.n)}%" title="${s.n} ${s.key}">${s.n}</span>`
+            : '').join('')}
+       </div>`;
+  // Sparkline (14d daily done).
+  const sparkSvg = renderSparkline(d.spark_daily_done || []);
+  // Per-business open count tile (only when more than one biz visible).
+  const bizRows = (d.by_business || []).filter(b => b.open > 0 || (d.by_business.length <= 4));
+  const maxBizOpen = bizRows.reduce((m, b) => Math.max(m, b.open || 0), 1);
+  const bizList = bizRows.length > 0 ? bizRows.map(b => `
+    <div class="tg-dash-bizrow">
+      <span class="biz-name">${escapeHtml(b.name)}</span>
+      <span class="biz-bar"><span class="fill" style="width:${Math.round((b.open / maxBizOpen) * 100)}%"></span></span>
+      <span class="biz-count">${b.open}</span>
+    </div>
+  `).join('') : `<div class="tg-dash-empty">No open tasks anywhere.</div>`;
+
+  return `
+    <div class="tg-dash">
+      <div class="tg-dash-tile">
+        <div class="tg-dash-lbl">Open</div>
+        <div class="tg-dash-num">${t.open || 0}</div>
+        <div class="tg-dash-sub">${t.done_7d || 0} done in 7d · ${t.done_30d || 0} in 30d</div>
+      </div>
+      <div class="tg-dash-tile">
+        <div class="tg-dash-lbl">Open by age</div>
+        ${agingBar}
+        <div class="tg-dash-sub">today · 1–3d · 3–7d · 7d+</div>
+      </div>
+      <div class="tg-dash-tile">
+        <div class="tg-dash-lbl">Daily completed (14d)</div>
+        ${sparkSvg}
+        <div class="tg-dash-sub">${t.done_7d || 0} this past week</div>
+      </div>
+      <div class="tg-dash-tile tg-dash-biz">
+        <div class="tg-dash-lbl">Open by business</div>
+        <div class="tg-dash-bizlist">${bizList}</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderSparkline(points) {
+  if (!points || points.length === 0) return '<svg class="tg-spark" viewBox="0 0 100 24"></svg>';
+  const w = 100;
+  const h = 24;
+  const max = Math.max(1, ...points.map(p => p.count || 0));
+  const stepX = points.length > 1 ? w / (points.length - 1) : w;
+  const coords = points.map((p, i) => {
+    const x = i * stepX;
+    const y = h - 2 - ((p.count || 0) / max) * (h - 4);
+    return [x.toFixed(2), y.toFixed(2)];
+  });
+  const path = coords.map((c, i) => `${i === 0 ? 'M' : 'L'} ${c[0]} ${c[1]}`).join(' ');
+  // Area fill below the line for a softer look.
+  const areaPath = `${path} L ${(points.length - 1) * stepX} ${h - 1} L 0 ${h - 1} Z`;
+  return `
+    <svg class="tg-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+      <path d="${areaPath}" fill="var(--tg-acc-soft)" />
+      <path d="${path}" fill="none" stroke="var(--tg-acc)" stroke-width="1.5" />
+    </svg>
   `;
 }
 
@@ -2781,6 +2885,7 @@ function render() {
     viewContent = `
       <div class="tg-page">
         <h1 class="tg-page-h1">Tasks</h1>
+        ${renderDashboardTiles()}
         ${renderFilters()}
         <div id="task-area">${renderTaskList()}</div>
       </div>`;
@@ -4615,6 +4720,44 @@ async function refreshTasks() {
   } catch (err) {
     renderError(err);
   }
+  // Phase UI-3: fire dashboard refresh in parallel (don't block
+  // tasks list render on it). Errors are swallowed — tiles render
+  // a "—" placeholder if the request fails, but the tasks list
+  // still appears.
+  refreshDashboard().catch(() => {});
+}
+
+async function refreshDashboard() {
+  // Skip when off the Tasks view (we re-fetch on tab change anyway).
+  if (state.view !== 'tasks') return;
+  const wantBiz = state.filters.business || 'all';
+  state.dashboard.loading = true;
+  state.dashboard.loadError = null;
+  try {
+    const params = new URLSearchParams();
+    if (wantBiz && wantBiz !== 'all') params.set('business_slug', wantBiz);
+    const data = await api('/v1/dashboard/summary'
+      + (params.toString() ? '?' + params.toString() : ''));
+    // Codex UI-3 R1 blocker: discard the response if the operator
+    // changed the business filter while this request was in flight.
+    // Without this check, a slow request for "borderline" can land
+    // AFTER a fast request for "redhot" and overwrite the redhot
+    // numbers with stale borderline data.
+    if ((state.filters.business || 'all') !== wantBiz) return;
+    state.dashboard.loaded = true;
+    state.dashboard.loading = false;
+    state.dashboard.loadError = null;
+    state.dashboard.totals = data.totals || state.dashboard.totals;
+    state.dashboard.open_aging = data.open_aging || state.dashboard.open_aging;
+    state.dashboard.by_business = data.by_business || [];
+    state.dashboard.spark_daily_done = data.spark_daily_done || [];
+    state.dashboard.forBusiness = wantBiz;
+  } catch (e) {
+    if ((state.filters.business || 'all') !== wantBiz) return;
+    state.dashboard.loading = false;
+    state.dashboard.loadError = (e && e.message) || 'dashboard failed';
+  }
+  if (state.view === 'tasks') render();
 }
 
 async function refreshReviewItems() {
