@@ -2168,6 +2168,29 @@ html, body {
   align-items: center;
   gap: 8px;
   font-size: 12.5px;
+  /* Button reset — the row IS a button so it's keyboard-accessible. */
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--tg-fg);
+  padding: 4px 6px;
+  margin: 0;
+  border-radius: 4px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+}
+.tg-dash-bizrow:hover {
+  background: var(--tg-bg-row-h);
+  border-color: var(--tg-bd-soft);
+}
+.tg-dash-bizrow.active {
+  background: var(--tg-acc-soft);
+  border-color: var(--tg-acc-bd);
+}
+.tg-dash-bizrow:focus-visible {
+  outline: 2px solid var(--tg-acc);
+  outline-offset: 1px;
 }
 .tg-dash-bizrow .biz-name {
   color: var(--tg-fg);

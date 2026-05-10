@@ -516,13 +516,22 @@ function renderDashboardTiles() {
   // Per-business open count tile (only when more than one biz visible).
   const bizRows = (d.by_business || []).filter(b => b.open > 0 || (d.by_business.length <= 4));
   const maxBizOpen = bizRows.reduce((m, b) => Math.max(m, b.open || 0), 1);
-  const bizList = bizRows.length > 0 ? bizRows.map(b => `
-    <div class="tg-dash-bizrow">
+  // Active filter highlight + clickable rows. Clicking a row sets
+  // the business filter to that slug; clicking the same slug again
+  // clears it back to 'all'.
+  const activeBiz = state.filters.business || 'all';
+  const bizList = bizRows.length > 0 ? bizRows.map(b => {
+    const isActive = activeBiz === b.slug;
+    return `
+    <button type="button" class="tg-dash-bizrow${isActive ? ' active' : ''}"
+            data-tg-dash-biz-slug="${escapeHtml(b.slug)}"
+            title="${isActive ? 'Click to clear filter' : 'Filter Tasks to ' + b.name}">
       <span class="biz-name">${escapeHtml(b.name)}</span>
       <span class="biz-bar"><span class="fill" style="width:${Math.round((b.open / maxBizOpen) * 100)}%"></span></span>
       <span class="biz-count">${b.open}</span>
-    </div>
-  `).join('') : `<div class="tg-dash-empty">No open tasks anywhere.</div>`;
+    </button>
+  `;
+  }).join('') : `<div class="tg-dash-empty">No open tasks anywhere.</div>`;
 
   return `
     <div class="tg-dash">
@@ -3500,6 +3509,19 @@ function renderSettings() {
 // ---------------------------------------------------------------------------
 
 function attachEventHandlers() {
+  // ----- dashboard tile drill-down -----
+  document.querySelectorAll('[data-tg-dash-biz-slug]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const slug = btn.dataset.tgDashBizSlug;
+      const cur = state.filters.business || 'all';
+      // Toggle: clicking the active row clears, clicking another sets.
+      state.filters.business = (cur === slug) ? 'all' : slug;
+      state.expandedTaskId = null;
+      state.expandedTaskDetail = null;
+      await refreshTasks();
+    });
+  });
+
   // ----- view tabs -----
   document.querySelectorAll('.view-tab').forEach(btn => {
     btn.addEventListener('click', async () => {
