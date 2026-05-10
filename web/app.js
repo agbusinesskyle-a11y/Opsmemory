@@ -36,9 +36,17 @@ const state = {
     // of ids the operator has marked with X / shift-arrow /
     // Cmd+A; the 1/2 action shortcuts apply to the focused row
     // when the set is empty, or to every selected row when ≥1.
-    focusedIndex: null,         // null | int index into items[]
+    focusedIndex: null,         // null | int index into items_visible[]
     selectedIds: new Set(),     // Set<reviewItemId>
     bulkInProgress: false,      // true while a multi-row 1/2 is iterating
+    // Phase UI-2 (2026-05-09): Triage redesign state.
+    subview: 'inbox',                        // 'inbox' | 'stale' | 'snoozed' | 'completed'
+    forecastFilter: null,                    // null | 'fresh' | 'warm' | 'stale' | 'vstale' | 'urgent'
+    searchQuery: '',                         // current /-search filter text
+    detailOpen: true,                        // detail pane visible at desktop widths
+    rejectModal: null,                       // null | { ids, preset, reasonText }
+    toast: null,                             // null | { msg, kind }
+    items_visible: [],                       // computed at render time; filtered subset focused/selected indexes into
   },
   // SOPs view (chunk 7 step 4 — admin-only).
   sops: {
@@ -403,7 +411,7 @@ function renderHeader() {
         ? `<button class="view-tab${state.view === 'settings' ? ' active' : ''}" data-view="settings">Settings</button>`
         : ''}
       ${isAdmin
-        ? `<button class="view-tab${state.view === 'review' ? ' active' : ''}" data-view="review">Review</button>`
+        ? `<button class="view-tab${state.view === 'review' ? ' active' : ''}" data-view="review">Triage</button>`
         : ''}
       ${isAdmin
         ? `<button class="view-tab${state.view === 'sops' ? ' active' : ''}" data-view="sops">SOPs</button>`
@@ -538,6 +546,544 @@ function renderTaskList() {
   `;
 }
 
+// =====================================================================
+// Phase UI-2 (2026-05-09) — Triage redesign.
+//
+// renderTriageView replaces the old renderReviewList as the rendered
+// body for state.view === 'review'. It shows: title + sub-tabs +
+// forecast strip + list (with new row layout) + detail pane (right
+// at desktop, drawer on mobile) + sticky bulk bar.
+//
+// Sub-views (Inbox / Stale / Snoozed / Completed today) are computed
+// client-side by filtering state.review.items, with counts shown in
+// the tab badges. The Snoozed sub-view renders nothing meaningful
+// until the 0008 schema bump lands; the tab is shown as a placeholder
+// with `0`.
+//
+// Triage detail pane mirrors the renderReviewItem detail content
+// but in the sidebar layout. Edit-then-approve and Snooze buttons
+// are placeholders (toast on click) until the next chunk.
+// =====================================================================
+
+const TG = {
+  // Reason presets shown in the reject modal.
+  rejectPresets: ['Wrong', 'Duplicate', 'Out of scope', 'Already handled', 'Spam'],
+  // Threshold tier boundaries (days).
+  staleDays: 3,
+  vstaleDays: 7,
+  // Toast auto-dismiss (ms).
+  toastMs: 1800,
+};
+
+function tgAgeMinutes(item) {
+  if (!item || !item.created_at) return 0;
+  const t = Date.parse(item.created_at);
+  if (isNaN(t)) return 0;
+  return Math.max(0, Math.floor((Date.now() - t) / 60000));
+}
+
+function tgAgeStr(min) {
+  if (min < 60) return `${min}m`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
+}
+
+function tgConfTier(c) {
+  if (c == null) return 'low';
+  if (c >= 0.85) return 'high';
+  if (c >= 0.70) return 'med';
+  if (c >= 0.55) return 'low';
+  return 'vlow';
+}
+
+function tgActionClass(action) {
+  const a = (action || '').toUpperCase();
+  if (a === 'CREATE_TASK') return 'create';
+  if (a === 'UPDATE_TASK') return 'update';
+  if (a === 'COMPLETE_TASK') return 'complete';
+  if (a === 'AMBIGUOUS') return 'amb';
+  return 'ignore';
+}
+
+function tgActionLabel(action) {
+  const a = (action || '').toUpperCase();
+  if (a === 'CREATE_TASK') return 'CREATE';
+  if (a === 'UPDATE_TASK') return 'UPDATE';
+  if (a === 'COMPLETE_TASK') return 'COMPLETE';
+  if (a === 'AMBIGUOUS') return 'Ambig.';
+  return 'IGNORE';
+}
+
+function tgSubviewItems() {
+  const items = state.review.items || [];
+  const sv = state.review.subview || 'inbox';
+  if (sv === 'inbox') {
+    return items.filter(i => i.status === 'pending' || i.status === 'needs_changes');
+  }
+  if (sv === 'stale') {
+    return items.filter(i => {
+      if (i.status !== 'pending' && i.status !== 'needs_changes') return false;
+      const ageDays = tgAgeMinutes(i) / (60 * 24);
+      return ageDays >= TG.staleDays;
+    });
+  }
+  if (sv === 'snoozed') {
+    return items.filter(i => i.status === 'snoozed');
+  }
+  if (sv === 'completed') {
+    return items.filter(i => i.status === 'approved' || i.status === 'rejected');
+  }
+  return items;
+}
+
+function tgSubviewCounts() {
+  const items = state.review.items || [];
+  const inbox = items.filter(i => i.status === 'pending' || i.status === 'needs_changes').length;
+  const stale = items.filter(i => {
+    if (i.status !== 'pending' && i.status !== 'needs_changes') return false;
+    const ageDays = tgAgeMinutes(i) / (60 * 24);
+    return ageDays >= TG.staleDays;
+  }).length;
+  const snoozed = items.filter(i => i.status === 'snoozed').length;
+  const completed = items.filter(i => i.status === 'approved' || i.status === 'rejected').length;
+  return { inbox, stale, snoozed, completed };
+}
+
+function tgForecastCounts() {
+  const items = state.review.items.filter(i =>
+    i.status === 'pending' || i.status === 'needs_changes'
+  );
+  let fresh = 0, warm = 0, stale = 0, vstale = 0, urgent = 0;
+  for (const i of items) {
+    const ageDays = tgAgeMinutes(i) / (60 * 24);
+    if (ageDays < 1) fresh++;
+    else if (ageDays < TG.staleDays) warm++;
+    else if (ageDays < TG.vstaleDays) stale++;
+    else vstale++;
+    // urgent: explicit ambiguous OR confidence below 0.55
+    if ((i.proposed_action || '') === 'AMBIGUOUS' ||
+        (i.confidence != null && Number(i.confidence) < 0.55)) {
+      urgent++;
+    }
+  }
+  return { fresh, warm, stale, vstale, urgent };
+}
+
+function tgRenderSpark(values) {
+  // Tiny inline SVG sparkline. values is an array of small ints.
+  if (!values || values.length === 0) {
+    return '<svg class="tg-spark" viewBox="0 0 80 18"></svg>';
+  }
+  const max = Math.max(1, ...values);
+  const w = 80, h = 18;
+  const step = w / Math.max(1, values.length - 1);
+  const points = values.map((v, i) => {
+    const x = i * step;
+    const y = h - (v / max) * (h - 2) - 1;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  return `<svg class="tg-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    <polyline points="${points}" fill="none" stroke="currentColor" stroke-width="1.2"/>
+  </svg>`;
+}
+
+function tgFlags(item) {
+  const flags = [];
+  const cf = item.candidate_facts || {};
+  const businesses = cf.businesses || [];
+  for (const b of businesses) {
+    const lower = (b || '').toLowerCase();
+    if (lower === 'redhot') flags.push({ class: 'redhot', label: 'RedHot' });
+    else if (lower === 'borderline') flags.push({ class: 'borderline', label: 'Borderline' });
+    else if (lower) flags.push({ class: '', label: escapeHtml(b) });
+  }
+  // Due chip
+  if (cf.due_at) {
+    try {
+      const dueDate = new Date(cf.due_at);
+      const now = new Date();
+      const diff = (dueDate - now) / (24 * 60 * 60 * 1000);
+      const overdue = diff < 0.5;
+      const lbl = fmtDate(cf.due_at).split(' ')[0] || 'due';
+      flags.push({ class: 'due' + (overdue ? ' over' : ''), label: `due ${lbl}` });
+    } catch (_e) { /* skip */ }
+  }
+  // Validation conflict
+  if (item.validation_errors && item.validation_errors.length > 0) {
+    flags.push({ class: 'conflict', label: 'conflict' });
+  }
+  // Approved status
+  if (item.status === 'approved') {
+    flags.push({ class: 'approved', label: 'approved' });
+  }
+  return flags;
+}
+
+function tgSourceLabel(item) {
+  const cf = item.candidate_facts || {};
+  const ev = cf.source_event || cf.source_metadata || {};
+  if (ev.channel_name) return `#${ev.channel_name}`;
+  if (ev.channel_id) return ev.channel_id;
+  if (item.source) return item.source.replace(/_/g, ' ');
+  return '—';
+}
+
+function tgRenderRow(item, index) {
+  const focused = state.review.focusedIndex === index;
+  const selected = state.review.selectedIds.has(item.id);
+  const ageMin = tgAgeMinutes(item);
+  const ageDays = ageMin / (60 * 24);
+  const dotClass = ageDays >= TG.vstaleDays ? 'vstale-dot'
+    : ageDays >= TG.staleDays ? 'stale-dot' : '';
+  const actClass = tgActionClass(item.proposed_action);
+  const actLabel = tgActionLabel(item.proposed_action);
+  const conf = item.confidence != null ? Number(item.confidence) : null;
+  const confTier = tgConfTier(conf);
+  const confStr = conf != null ? conf.toFixed(2) : '—';
+  const confPct = conf != null ? Math.max(0, Math.min(100, conf * 100)) : 0;
+  const cf = item.candidate_facts || {};
+  const summary = cf.summary || '—';
+  const source = tgSourceLabel(item);
+  const flags = tgFlags(item);
+  const stateClasses = (item.status === 'approved' ? ' approved' : '')
+    + (item.status === 'snoozed' ? ' suppressed' : '');
+  return `
+    <div class="tg-row ${focused ? 'focused' : ''} ${selected ? 'selected' : ''}${stateClasses}"
+         data-tg-index="${index}" data-tg-id="${escapeHtml(item.id)}">
+      <div class="tg-age">
+        <span class="tg-checkmark" data-tg-checkbox></span>
+        ${dotClass ? `<span class="${dotClass}"></span>` : ''}
+        ${escapeHtml(tgAgeStr(ageMin))}
+      </div>
+      <div class="tg-action ${actClass}">${escapeHtml(actLabel)}</div>
+      <div class="tg-conf ${confTier}">
+        <span>${escapeHtml(confStr)}</span>
+        <div class="tg-confbar"><i style="width:${confPct.toFixed(0)}%"></i></div>
+      </div>
+      <div class="tg-source"><span>${escapeHtml(source)}</span></div>
+      <div class="tg-summary">${escapeHtml(summary)}</div>
+      <div class="tg-flags">
+        ${flags.map(f => `<span class="tg-chip ${f.class}">${f.label}</span>`).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function tgRenderForecast() {
+  const fc = tgForecastCounts();
+  const cards = [
+    { key: 'fresh',  label: 'Fresh today',         num: fc.fresh,  warn: false, danger: false },
+    { key: 'warm',   label: 'Pending 1-3d',        num: fc.warm,   warn: false, danger: false },
+    { key: 'stale',  label: 'Stale 3d+',           num: fc.stale,  warn: fc.stale > 0,  danger: false },
+    { key: 'vstale', label: 'Stale 7d+',           num: fc.vstale, warn: false, danger: fc.vstale > 0 },
+    { key: 'urgent', label: 'Urgent / ambiguous',  num: fc.urgent, warn: false, danger: fc.urgent > 0 },
+  ];
+  // Fake spark history (we don't persist a time series yet) — flat
+  // line for now; populated from real metrics in Phase UI-8.
+  const spark = tgRenderSpark([2, 3, 2, 4, 3, 5, fc.fresh + fc.warm]);
+  return `
+    <div class="tg-forecast" role="tablist" aria-label="Forecast">
+      ${cards.map(c => {
+        const numClass = c.danger ? 'danger' : (c.warn ? 'warn' : '');
+        const active = state.review.forecastFilter === c.key ? 'active' : '';
+        return `
+          <div class="tg-fc ${active}" data-tg-forecast="${c.key}">
+            <div class="tg-fc-lbl">${escapeHtml(c.label)}</div>
+            <div class="tg-fc-num ${numClass}">${c.num}</div>
+            ${spark}
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
+function tgRenderSubtabs(counts) {
+  const tabs = [
+    { key: 'inbox',     label: 'Inbox',           count: counts.inbox },
+    { key: 'stale',     label: 'Stale',           count: counts.stale },
+    { key: 'snoozed',   label: 'Snoozed',         count: counts.snoozed },
+    { key: 'completed', label: 'Completed today', count: counts.completed },
+  ];
+  const cur = state.review.subview || 'inbox';
+  return `
+    <div class="tg-subtabs">
+      ${tabs.map(t => `
+        <button class="tg-subtab ${cur === t.key ? 'active' : ''}" data-tg-subtab="${t.key}">
+          ${escapeHtml(t.label)} <span class="ct">${t.count}</span>
+        </button>
+      `).join('')}
+      <div class="grow"></div>
+      <div class="tg-search">
+        <span style="font-size:12px">/</span>
+        <input type="text" placeholder="Filter..." id="tg-search-input"
+               value="${escapeHtml(state.review.searchQuery || '')}">
+      </div>
+    </div>
+  `;
+}
+
+function tgRenderDetail(item) {
+  if (!item) {
+    return `<aside class="tg-detail"><div class="tg-detail-empty">Focus a row (J/K) to see source + facts here.</div></aside>`;
+  }
+  const ageMin = tgAgeMinutes(item);
+  const cf = item.candidate_facts || {};
+  const ev = cf.source_event || cf.source_metadata || {};
+  const action = item.proposed_action || '—';
+  const conf = item.confidence != null ? Number(item.confidence).toFixed(2) : '—';
+  const businesses = (cf.businesses || []).join(', ');
+  const owner = cf.owner_display || '<span class="missing">— unassigned —</span>';
+  const due = cf.due_at ? fmtDate(cf.due_at) : '<span class="missing">— none —</span>';
+  const priority = cf.priority || '<span class="missing">— normal —</span>';
+  const category = cf.category || '<span class="missing">— uncategorized —</span>';
+  const sourceQuote = cf.source_quote || ev.text || '';
+  const verrors = item.validation_errors || [];
+  const retrieved = item.retrieved_candidates || [];
+  return `
+    <aside class="tg-detail">
+      <div class="tg-detail-h">
+        <div class="tg-detail-meta">
+          <span class="tg-action ${tgActionClass(action)}">${escapeHtml(tgActionLabel(action))}</span>
+          <span class="sep">·</span>
+          <span>conf ${escapeHtml(conf)}</span>
+          <span class="sep">·</span>
+          <span>${escapeHtml(tgAgeStr(ageMin))} old</span>
+          ${item.status !== 'pending' ? `<span class="sep">·</span><span class="tg-chip ${item.status === 'approved' ? 'approved' : ''}">${escapeHtml(item.status)}</span>` : ''}
+        </div>
+        <h2 class="tg-detail-title">${escapeHtml(cf.summary || '—')}</h2>
+      </div>
+      <div class="tg-detail-body">
+        <div>
+          <div class="tg-sec-h">Source</div>
+          <div class="tg-src-card">
+            <div class="tg-src-head">
+              <span class="who">${escapeHtml(ev.user_name || ev.user_id || item.source || 'unknown')}</span>
+              <span>·</span>
+              <span>${escapeHtml(tgSourceLabel(item))}</span>
+            </div>
+            ${sourceQuote ? `<div class="tg-src-quote">"${escapeHtml(sourceQuote)}"</div>` : '<div class="tg-src-quote" style="color:var(--tg-fg-dim)">(no source quote)</div>'}
+          </div>
+        </div>
+        <div>
+          <div class="tg-sec-h">Proposed facts</div>
+          <dl class="tg-kvgrid">
+            <dt>Summary</dt><dd>${escapeHtml(cf.summary || '—')}</dd>
+            <dt>Business</dt><dd>${escapeHtml(businesses) || '<span class="missing">— missing —</span>'}</dd>
+            <dt>Assignee</dt><dd>${owner}</dd>
+            <dt>Priority</dt><dd>${priority}</dd>
+            <dt>Due</dt><dd>${due}</dd>
+            <dt>Category</dt><dd>${category}</dd>
+          </dl>
+        </div>
+        ${retrieved.length ? `
+          <div>
+            <div class="tg-sec-h">Retrieved candidates (${retrieved.length})</div>
+            ${retrieved.map(r => `
+              <div class="tg-candrow">
+                <span>${escapeHtml((r.summary || '').slice(0, 80))}</span>
+                <span class="cand-conf">${r.lex_score != null ? `score ${r.lex_score}` : ''}</span>
+              </div>
+            `).join('')}
+          </div>
+        ` : `
+          <div>
+            <div class="tg-sec-h">Retrieved candidates</div>
+            <div style="color:var(--tg-fg-dim);font-size:12.5px">No prior tasks matched — will create new.</div>
+          </div>
+        `}
+        <div>
+          <div class="tg-sec-h">Validation</div>
+          ${verrors.length === 0
+            ? '<div style="color:var(--tg-c-create);font-size:12.5px">✓ No issues.</div>'
+            : `<div>${verrors.map(e => `<div style="color:var(--tg-c-amb);font-size:12.5px">⚠ <code>${escapeHtml(e.code || '')}</code> ${escapeHtml(e.message || '')}</div>`).join('')}</div>`
+          }
+        </div>
+      </div>
+      ${item.status === 'pending' || item.status === 'needs_changes' ? `
+        <div class="tg-actions-row">
+          <button class="tg-btn primary" data-tg-detail-approve>
+            Approve <span class="tg-pill-kbd">1</span>
+          </button>
+          <button class="tg-btn" data-tg-detail-edit title="Edit + approve (coming next chunk)">
+            Edit <span class="tg-pill-kbd">3</span>
+          </button>
+          <button class="tg-btn danger" data-tg-detail-reject>
+            Reject <span class="tg-pill-kbd">2</span>
+          </button>
+          <button class="tg-btn" data-tg-detail-snooze title="Snooze (next chunk)">
+            Snooze <span class="tg-pill-kbd">H</span>
+          </button>
+        </div>
+      ` : ''}
+    </aside>
+  `;
+}
+
+function tgRenderBulkBar() {
+  const ids = Array.from(state.review.selectedIds);
+  if (ids.length === 0) return '<div class="tg-bulkbar"></div>';
+  // Group by action type for the breakdown
+  const byAction = {};
+  for (const id of ids) {
+    const item = state.review.items.find(i => i.id === id);
+    if (!item) continue;
+    const a = tgActionLabel(item.proposed_action);
+    byAction[a] = (byAction[a] || 0) + 1;
+  }
+  const breakdown = Object.entries(byAction)
+    .map(([k, v]) => `${k} ${v}`).join(' · ');
+  return `
+    <div class="tg-bulkbar show">
+      <div class="tg-bb-count"><span class="acc">${ids.length}</span> selected</div>
+      <div class="tg-bb-grp">${escapeHtml(breakdown)}</div>
+      <button class="tg-btn primary" data-tg-bulk-approve ${state.review.bulkInProgress ? 'disabled' : ''}>
+        Approve <span class="tg-pill-kbd">1</span>
+      </button>
+      <button class="tg-btn danger" data-tg-bulk-reject ${state.review.bulkInProgress ? 'disabled' : ''}>
+        Reject <span class="tg-pill-kbd">2</span>
+      </button>
+      <button class="tg-btn" data-tg-bulk-snooze title="Snooze (coming next chunk)">
+        Snooze <span class="tg-pill-kbd">H</span>
+      </button>
+      <button class="tg-btn" data-tg-bulk-clear>Clear <span class="tg-pill-kbd">Esc</span></button>
+    </div>
+  `;
+}
+
+function tgRenderRejectModal() {
+  const m = state.review.rejectModal;
+  if (!m) return '';
+  const ids = m.ids || [];
+  const items = ids.map(id => state.review.items.find(i => i.id === id)).filter(Boolean);
+  const byAction = {};
+  for (const it of items) {
+    const a = tgActionLabel(it.proposed_action);
+    byAction[a] = (byAction[a] || 0) + 1;
+  }
+  const breakdown = Object.entries(byAction).map(([k, v]) => `${k} ${v}`).join(' · ');
+  return `
+    <div class="tg-modal-wrap" data-tg-modal-backdrop>
+      <div class="tg-modal" role="dialog" aria-label="Reject">
+        <div class="tg-modal-h">
+          Reject ${ids.length} item${ids.length === 1 ? '' : 's'}
+          <span class="small">${escapeHtml(breakdown)}</span>
+        </div>
+        <div class="tg-modal-b">
+          <div>
+            <div class="tg-field-lbl">Quick reason (optional)</div>
+            <div class="tg-reasons">
+              ${TG.rejectPresets.map(p => `
+                <button class="tg-reason ${m.preset === p ? 'on' : ''}" data-tg-reason="${escapeHtml(p)}">${escapeHtml(p)}</button>
+              `).join('')}
+            </div>
+          </div>
+          <div>
+            <div class="tg-field-lbl">Or type a shared reason</div>
+            <textarea id="tg-reject-textarea" placeholder="Why is this not a task?">${escapeHtml(m.reasonText || '')}</textarea>
+          </div>
+        </div>
+        <div class="tg-modal-f">
+          <button class="tg-btn" data-tg-modal-cancel>Cancel</button>
+          <button class="tg-btn danger" data-tg-modal-submit>Reject ${ids.length}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function tgRenderToast() {
+  if (!state.review.toast) return '';
+  const t = state.review.toast;
+  const cls = t.kind === 'err' ? 'err' : 'ok';
+  return `<div class="tg-toast"><span class="${cls}">●</span> ${escapeHtml(t.msg)}</div>`;
+}
+
+function renderTriageView() {
+  const items = state.review.items || [];
+  const counts = tgSubviewCounts();
+  const subview = state.review.subview || 'inbox';
+
+  // Visible items after sub-view filter + forecast filter + search
+  let visible = tgSubviewItems();
+  if (state.review.forecastFilter && (subview === 'inbox' || subview === 'stale')) {
+    visible = visible.filter(i => {
+      const ageDays = tgAgeMinutes(i) / (60 * 24);
+      const f = state.review.forecastFilter;
+      if (f === 'fresh')  return ageDays < 1;
+      if (f === 'warm')   return ageDays >= 1 && ageDays < TG.staleDays;
+      if (f === 'stale')  return ageDays >= TG.staleDays && ageDays < TG.vstaleDays;
+      if (f === 'vstale') return ageDays >= TG.vstaleDays;
+      if (f === 'urgent') return (i.proposed_action === 'AMBIGUOUS') ||
+                                  (i.confidence != null && Number(i.confidence) < 0.55);
+      return true;
+    });
+  }
+  const q = (state.review.searchQuery || '').toLowerCase().trim();
+  if (q) {
+    visible = visible.filter(i => {
+      const cf = i.candidate_facts || {};
+      const summary = (cf.summary || '').toLowerCase();
+      const quote = (cf.source_quote || '').toLowerCase();
+      return summary.includes(q) || quote.includes(q);
+    });
+  }
+  // Re-key state.review.items to the visible subset for keyboard nav
+  // semantics (focusedIndex indexes into the rendered list).
+  state.review.items_visible = visible;
+
+  const focusedItem = state.review.focusedIndex != null
+    ? visible[state.review.focusedIndex] || null
+    : null;
+
+  const detailOpen = state.review.detailOpen !== false;
+  const wrapClass = detailOpen ? '' : 'no-detail';
+
+  const listInner = visible.length === 0
+    ? `<div class="tg-empty">No items in this view.</div>`
+    : `
+      <div class="tg-list-head">
+        <div>Age</div><div>Action</div><div>Conf</div><div>Source</div>
+        <div>Summary</div><div class="col-flags right">Flags</div>
+      </div>
+      ${visible.map((it, i) => tgRenderRow(it, i)).join('')}
+    `;
+
+  return `
+    <div class="triage-view">
+      <div class="tg-head">
+        <div class="tg-head-title">
+          <h1 class="tg-h1">Triage</h1>
+          <div class="tg-head-sub">${counts.inbox} pending</div>
+        </div>
+        ${tgRenderSubtabs(counts)}
+      </div>
+      ${tgRenderForecast()}
+      <div class="tg-listwrap ${wrapClass}">
+        <div class="tg-list" tabindex="0">${listInner}</div>
+        ${detailOpen ? tgRenderDetail(focusedItem) : ''}
+      </div>
+      ${tgRenderBulkBar()}
+      ${tgRenderRejectModal()}
+      ${tgRenderToast()}
+    </div>
+  `;
+}
+
+function tgShowToast(msg, kind) {
+  state.review.toast = { msg, kind: kind || 'ok' };
+  render();
+  setTimeout(() => {
+    if (state.review.toast && state.review.toast.msg === msg) {
+      state.review.toast = null;
+      render();
+    }
+  }, TG.toastMs);
+}
+
+// LEGACY shim — older code paths may still call renderReviewItem.
 function renderReviewItem(item, index) {
   const expanded = state.review.expandedId === item.id;
   // Phase UI-1: keyboard focus + selection visuals
@@ -1041,7 +1587,7 @@ function render() {
   if (state.view === 'review') {
     root.innerHTML = `
       ${renderHeader()}
-      <div id="review-area">${renderReviewList()}</div>
+      <div id="review-area">${renderTriageView()}</div>
     `;
   } else if (state.view === 'sops') {
     root.innerHTML = `
@@ -3565,7 +4111,8 @@ function _ui1ActionTargets() {
     return Array.from(state.review.selectedIds);
   }
   if (state.review.focusedIndex !== null) {
-    const item = state.review.items[state.review.focusedIndex];
+    const visible = state.review.items_visible || state.review.items;
+    const item = visible[state.review.focusedIndex];
     return item ? [item.id] : [];
   }
   return [];
@@ -3675,19 +4222,36 @@ function _ui1HandleKey(e) {
     // Otherwise fall through to normal handling.
   }
 
-  // Esc: close overlays first; else clear selection / collapse.
+  // Esc: close overlays first; else clear modal/search/forecast/selection.
   if (e.key === 'Escape') {
     if (_UI1.shortcutsOpen) { _ui1ToggleShortcutsOverlay(); e.preventDefault(); return; }
     if (_UI1.paletteOpen) { _ui1TogglePalette(); e.preventDefault(); return; }
     if (state.view === 'review') {
       let changed = false;
-      if (state.review.expandedId !== null) {
-        state.review.expandedId = null;
-        state.review.expandedDetail = null;
+      // Reject modal first
+      if (state.review.rejectModal) {
+        state.review.rejectModal = null;
         changed = true;
       }
-      if (state.review.selectedIds.size > 0) {
+      // Then search filter
+      else if (state.review.searchQuery) {
+        state.review.searchQuery = '';
+        changed = true;
+      }
+      // Then forecast filter
+      else if (state.review.forecastFilter) {
+        state.review.forecastFilter = null;
+        changed = true;
+      }
+      // Then selection
+      else if (state.review.selectedIds.size > 0) {
         state.review.selectedIds = new Set();
+        changed = true;
+      }
+      // Then expanded legacy detail
+      else if (state.review.expandedId !== null) {
+        state.review.expandedId = null;
+        state.review.expandedDetail = null;
         changed = true;
       }
       if (changed) { render(); e.preventDefault(); }
@@ -3720,67 +4284,96 @@ function _ui1HandleKey(e) {
   // Cmd+A: select all visible (review tab only)
   if (isMeta && (e.key === 'a' || e.key === 'A') && state.view === 'review' && state.review.items.length) {
     e.preventDefault();
-    _ui1SelectAll();
+    const visible = state.review.items_visible || state.review.items;
+    state.review.selectedIds = new Set(visible.map(i => i.id));
     render();
     return;
   }
 
   // The rest are review-tab-only.
   if (state.view !== 'review') return;
-  if (!state.review.items.length) return;
+
+  // / opens search (focus the search input). Captured before the
+  // visible-list bail-out so search works on an empty queue too.
+  if (e.key === '/' && !isMeta) {
+    e.preventDefault();
+    const inp = document.getElementById('tg-search-input');
+    if (inp) inp.focus();
+    return;
+  }
+
+  // 3 = edit-then-approve, H = snooze. Both placeholder until next
+  // chunk; toast informs the operator the feature is en route.
+  if ((e.key === '3' || e.key === 'h' || e.key === 'H') && !isMeta) {
+    const which = e.key === '3' ? 'Edit + approve' : 'Snooze';
+    e.preventDefault();
+    tgShowToast(`${which} ships in next chunk`, 'err');
+    return;
+  }
+
+  // Phase UI-2 edit: navigation + selection use items_visible (the
+  // filtered subset under the current sub-view + forecast + search),
+  // not the raw items[]. focusedIndex indexes into items_visible.
+  const visible = state.review.items_visible || [];
+  if (!visible.length) return;
 
   const cur = state.review.focusedIndex;
-  const last = state.review.items.length - 1;
+  const last = visible.length - 1;
 
   // Movement: J/K + arrows
   if (e.key === 'j' || e.key === 'J' || e.key === 'ArrowDown') {
     e.preventDefault();
     const next = cur === null ? 0 : Math.min(cur + 1, last);
     if (e.shiftKey && cur !== null) {
-      // Extend selection: include both old + new.
-      const oldItem = state.review.items[cur];
-      const newItem = state.review.items[next];
+      const oldItem = visible[cur];
+      const newItem = visible[next];
       if (oldItem) state.review.selectedIds.add(oldItem.id);
       if (newItem) state.review.selectedIds.add(newItem.id);
     }
-    _ui1FocusRow(next);
+    state.review.focusedIndex = next;
     render();
+    requestAnimationFrame(() => {
+      const el = document.querySelector('.tg-row.focused');
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+    });
     return;
   }
   if (e.key === 'k' || e.key === 'K' || e.key === 'ArrowUp') {
     e.preventDefault();
     const next = cur === null ? 0 : Math.max(cur - 1, 0);
     if (e.shiftKey && cur !== null) {
-      const oldItem = state.review.items[cur];
-      const newItem = state.review.items[next];
+      const oldItem = visible[cur];
+      const newItem = visible[next];
       if (oldItem) state.review.selectedIds.add(oldItem.id);
       if (newItem) state.review.selectedIds.add(newItem.id);
     }
-    _ui1FocusRow(next);
+    state.review.focusedIndex = next;
     render();
+    requestAnimationFrame(() => {
+      const el = document.querySelector('.tg-row.focused');
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+    });
     return;
   }
 
   // X: toggle selection on focused row
   if ((e.key === 'x' || e.key === 'X') && !isMeta && cur !== null) {
     e.preventDefault();
-    _ui1ToggleSelectionAtIndex(cur);
+    const item = visible[cur];
+    if (item) {
+      if (state.review.selectedIds.has(item.id)) state.review.selectedIds.delete(item.id);
+      else state.review.selectedIds.add(item.id);
+    }
     render();
     return;
   }
 
-  // Enter: expand focused row
+  // Enter: open detail (it's the right-side pane in Triage so this
+  // toggles the detail-pane visibility on narrow viewports).
   if (e.key === 'Enter' && cur !== null) {
     e.preventDefault();
-    const item = state.review.items[cur];
-    if (item) {
-      // Re-use the existing expand-handler logic by simulating a click
-      // on the row header. Cleaner than duplicating the load path.
-      const headerEl = document.querySelector(
-        `.rv-item[data-review-id="${item.id}"] .rv-item-header`
-      );
-      if (headerEl) headerEl.click();
-    }
+    state.review.detailOpen = true;
+    render();
     return;
   }
 
@@ -3808,6 +4401,139 @@ function _ui1HandleKey(e) {
 }
 
 function _ui1HandleClick(e) {
+  // ---- Phase UI-2: Triage surfaces -----------------------------------
+
+  // Sub-tab switch
+  const subtab = e.target.closest('[data-tg-subtab]');
+  if (subtab) {
+    state.review.subview = subtab.dataset.tgSubtab;
+    state.review.focusedIndex = null;  // reset focus on sub-view change
+    state.review.forecastFilter = null;  // reset forecast on sub-view change
+    render();
+    return;
+  }
+
+  // Forecast card toggle
+  const fc = e.target.closest('[data-tg-forecast]');
+  if (fc) {
+    const k = fc.dataset.tgForecast;
+    state.review.forecastFilter = state.review.forecastFilter === k ? null : k;
+    render();
+    return;
+  }
+
+  // Triage row checkbox toggles selection without focus jump
+  const tgcb = e.target.closest('.tg-checkmark');
+  if (tgcb) {
+    const row = tgcb.closest('.tg-row[data-tg-index]');
+    if (row) {
+      const idx = parseInt(row.dataset.tgIndex, 10);
+      const visible = state.review.items_visible || [];
+      const item = visible[idx];
+      if (item) {
+        if (state.review.selectedIds.has(item.id)) state.review.selectedIds.delete(item.id);
+        else state.review.selectedIds.add(item.id);
+        e.stopPropagation();
+        render();
+      }
+    }
+    return;
+  }
+
+  // Triage row click → focus that row + open detail
+  const tgrow = e.target.closest('.tg-row[data-tg-index]');
+  if (tgrow) {
+    const idx = parseInt(tgrow.dataset.tgIndex, 10);
+    if (!Number.isNaN(idx)) {
+      state.review.focusedIndex = idx;
+      state.review.detailOpen = true;
+      render();
+    }
+    return;
+  }
+
+  // Triage detail-pane buttons (single-item action on focused)
+  if (e.target.closest('[data-tg-detail-approve]')) {
+    const ids = _ui1ActionTargets();
+    if (ids.length === 0) return;
+    if (ids.length > 1) {
+      const ok = window.confirm(`Approve ${ids.length} items?`);
+      if (!ok) return;
+    }
+    _ui1RunApproveOnTargets(ids);
+    return;
+  }
+  if (e.target.closest('[data-tg-detail-reject]')) {
+    const ids = _ui1ActionTargets();
+    if (ids.length === 0) return;
+    state.review.rejectModal = { ids, preset: null, reasonText: '' };
+    render();
+    return;
+  }
+  if (e.target.closest('[data-tg-detail-edit]')) {
+    tgShowToast('Edit + approve ships in next chunk', 'err');
+    return;
+  }
+  if (e.target.closest('[data-tg-detail-snooze]')) {
+    tgShowToast('Snooze ships in next chunk', 'err');
+    return;
+  }
+
+  // Triage bulk-bar buttons
+  if (e.target.closest('[data-tg-bulk-approve]')) {
+    const ids = Array.from(state.review.selectedIds);
+    if (ids.length > 1) {
+      const ok = window.confirm(`Approve ${ids.length} items?`);
+      if (!ok) return;
+    }
+    _ui1RunApproveOnTargets(ids);
+    return;
+  }
+  if (e.target.closest('[data-tg-bulk-reject]')) {
+    const ids = Array.from(state.review.selectedIds);
+    if (ids.length === 0) return;
+    state.review.rejectModal = { ids, preset: null, reasonText: '' };
+    render();
+    return;
+  }
+  if (e.target.closest('[data-tg-bulk-snooze]')) {
+    tgShowToast('Snooze ships in next chunk', 'err');
+    return;
+  }
+  if (e.target.closest('[data-tg-bulk-clear]')) {
+    state.review.selectedIds = new Set();
+    render();
+    return;
+  }
+
+  // Reject modal interactions
+  if (e.target.closest('[data-tg-modal-cancel]')
+      || (e.target.matches('[data-tg-modal-backdrop]') && state.review.rejectModal)) {
+    state.review.rejectModal = null;
+    render();
+    return;
+  }
+  const reason = e.target.closest('[data-tg-reason]');
+  if (reason && state.review.rejectModal) {
+    state.review.rejectModal.preset = reason.dataset.tgReason;
+    if (!state.review.rejectModal.reasonText) {
+      state.review.rejectModal.reasonText = reason.dataset.tgReason;
+    }
+    render();
+    return;
+  }
+  if (e.target.closest('[data-tg-modal-submit]') && state.review.rejectModal) {
+    const m = state.review.rejectModal;
+    const ta = document.getElementById('tg-reject-textarea');
+    const reason = (ta ? ta.value : (m.reasonText || m.preset || '')).trim();
+    const ids = m.ids;
+    state.review.rejectModal = null;
+    render();
+    _ui1RunRejectOnTargetsWithReason(ids, reason);
+    return;
+  }
+
+  // ---- Phase UI-1 legacy review-tab list ----------------------------
   // Checkbox click on a row toggles selection without opening detail.
   const cb = e.target.closest('.rv-checkbox');
   if (cb) {
@@ -3822,7 +4548,7 @@ function _ui1HandleClick(e) {
     }
     return;
   }
-  // Bulk bar buttons
+  // Bulk bar buttons (legacy class)
   if (e.target.classList.contains('rv-bulk-approve')) {
     const ids = Array.from(state.review.selectedIds);
     if (ids.length > 1) {
@@ -3844,8 +4570,63 @@ function _ui1HandleClick(e) {
   }
 }
 
+// Bypass the prompt() and apply a pre-collected reason. Used by the
+// Triage reject modal which gathers reason via reason chips + textarea.
+async function _ui1RunRejectOnTargetsWithReason(ids, reason) {
+  if (!ids.length || state.review.bulkInProgress) return;
+  state.review.bulkInProgress = true;
+  state.review.actionError = null;
+  render();
+  let okCount = 0;
+  const errors = [];
+  for (const id of ids) {
+    try {
+      await rejectReview(id, reason);
+      okCount++;
+    } catch (err) {
+      errors.push({ id, message: err.message || 'reject failed' });
+    }
+  }
+  state.review.bulkInProgress = false;
+  state.review.selectedIds = new Set();
+  state.review.actionError = errors.length
+    ? `Rejected ${okCount}/${ids.length}; ${errors.length} failed.`
+    : null;
+  try {
+    const result = await loadReviewItems(state.review.statusFilter);
+    state.review.items = result.items;
+    state.review.total = result.total;
+  } catch (_e) { /* leave stale list */ }
+  render();
+  if (errors.length === 0) {
+    tgShowToast(`Rejected ${okCount}`, 'ok');
+  } else {
+    tgShowToast(`Rejected ${okCount}/${ids.length}; ${errors.length} failed`, 'err');
+  }
+}
+
 document.addEventListener('keydown', _ui1HandleKey);
 document.addEventListener('click', _ui1HandleClick);
+
+// Search input on the Triage subtabs row updates state.review.searchQuery
+// without re-rendering on every keystroke (debounce by re-render only
+// on input event; the input keeps focus across renders since React
+// does not own this DOM and the input value is bound from state).
+document.addEventListener('input', function (e) {
+  if (e.target && e.target.id === 'tg-search-input') {
+    state.review.searchQuery = e.target.value;
+    state.review.focusedIndex = null;  // reset focus on new filter
+    render();
+    // Restore focus to the input after re-render.
+    requestAnimationFrame(() => {
+      const el = document.getElementById('tg-search-input');
+      if (el && el !== document.activeElement) {
+        el.focus();
+        el.setSelectionRange(el.value.length, el.value.length);
+      }
+    });
+  }
+});
 
 (async function () {
   // Boot with offline tolerance. /whoami and /v1/businesses fall back
@@ -3875,7 +4656,21 @@ document.addEventListener('click', _ui1HandleClick);
       await refreshTasks();
       await _autoExpandDeepLinkedTask(deepLinkTaskId);
     } else {
-      await refreshTasks();
+      // Phase UI-2 (2026-05-09): Triage is the default landing tab
+      // for admins. Owner-only principals don't see Triage in the
+      // top nav, so they keep the Tasks landing.
+      const isAdmin = state.principal && state.principal.role === 'admin';
+      if (isAdmin) {
+        state.view = 'review';
+        try {
+          const result = await loadReviewItems(state.review.statusFilter);
+          state.review.items = result.items;
+          state.review.total = result.total;
+          render();
+        } catch (_e) { /* fall through to refreshTasks default */ }
+      } else {
+        await refreshTasks();
+      }
     }
     replayOutbox().catch(function () {});
     setInterval(function () {
