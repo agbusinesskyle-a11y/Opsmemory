@@ -536,7 +536,7 @@ async def create_task(
                 VALUES
                   ('manual_quick_add', $1,
                    $2, $3, $4::jsonb,
-                   'processed', now(), now(),
+                   'completed', now(), now(),
                    'user', $5::uuid,
                    $6)
                 RETURNING id::text AS id
