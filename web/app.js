@@ -1223,6 +1223,54 @@ async function _tgUnsnooze(id) {
 // Slack-style ad-hoc task / event capture from any view.
 // ---------------------------------------------------------------------------
 
+let _tgQuickAddHostKey = null;
+
+function _tgQuickAddStructuralKey() {
+  const q = state.quickAdd;
+  if (!q || !q.open) return 'closed';
+  const dedup = q.dedup
+    ? (q.dedup.candidates || []).map(c => [
+        c.id || '',
+        c.summary || '',
+        c.status || '',
+        c.due_at || '',
+        c.last_activity_at || '',
+      ].join('|')).join('~')
+    : '';
+  return [
+    'open',
+    q.submitting ? 'submitting' : 'idle',
+    q.error || '',
+    q.dedup ? 'dedup' : 'form',
+    q.dedup && q.dedup.previewToken ? q.dedup.previewToken : '',
+    dedup,
+  ].join('\u001f');
+}
+
+function _tgEnsureQuickAddHost() {
+  let host = document.getElementById('tg-quickadd-host');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'tg-quickadd-host';
+    document.body.appendChild(host);
+  }
+  return host;
+}
+
+function _tgInvalidateQuickAddHost() {
+  _tgQuickAddHostKey = null;
+}
+
+function _tgRenderQuickAddHost() {
+  const host = _tgEnsureQuickAddHost();
+  const key = _tgQuickAddStructuralKey();
+  if (key === _tgQuickAddHostKey) return;
+  host.innerHTML = (state.quickAdd && state.quickAdd.open)
+    ? tgRenderQuickAddModal()
+    : '';
+  _tgQuickAddHostKey = key;
+}
+
 function tgOpenQuickAdd() {
   const p = state.principal || {};
   // Default the business to the principal's first visible business.
@@ -1249,6 +1297,7 @@ function tgOpenQuickAdd() {
     membersLoading: false,
     dedup: null,
   };
+  _tgInvalidateQuickAddHost();
   render();
   // Focus the title input on next tick so the operator can start
   // typing immediately. requestAnimationFrame is safer than setTimeout
@@ -2401,8 +2450,9 @@ function renderTopbar() {
 function renderAppShell(viewContent) {
   // Codex B3-3 blocker: when the Quick Add dedup confirm is open,
   // mark .tg-app inert so Tab cannot escape into the underlying
-  // app chrome (rail, topbar, FAB). Quick Add + dedup live as
-  // siblings to .tg-app so they're reachable when .tg-app is inert.
+  // app chrome (rail, topbar, FAB). Quick Add + dedup are rendered
+  // into #tg-quickadd-host outside #root, so root re-renders do not
+  // destroy the active compose input.
   const dedupOpen = !!(state.quickAdd && state.quickAdd.open
                        && state.quickAdd.dedup);
   const appInert = dedupOpen ? 'inert aria-hidden="true"' : '';
@@ -2415,8 +2465,7 @@ function renderAppShell(viewContent) {
       </div>
       ${renderBottomNav()}
       <button class="tg-fab" id="tg-fab" aria-label="Quick add (Q)" title="Quick add (Q)">+</button>
-    </div>
-    ${typeof tgRenderQuickAddModal === 'function' ? tgRenderQuickAddModal() : ''}`;
+    </div>`;
 }
 
 function render() {
@@ -2454,6 +2503,7 @@ function render() {
   }
   root.innerHTML = renderAppShell(viewContent);
   attachEventHandlers();
+  _tgRenderQuickAddHost();
 }
 
 function renderError(err) {
@@ -5729,9 +5779,10 @@ document.addEventListener('change', function (e) {
 // without re-rendering on every keystroke (debounce by re-render only
 // on input event; the input keeps focus across renders since React
 // does not own this DOM and the input value is bound from state).
-// Live sync for Quick Add fields. Without this, an async render
-// (e.g. _tgLoadMembers' .finally) rebuilds the modal from stale
-// state and wipes whatever the operator typed in the meantime.
+// Live sync for Quick Add fields. Without this, an intentional
+// structural Quick Add re-render (submit validation, dedup confirm)
+// rebuilds the modal from stale state and wipes whatever the operator
+// typed in the meantime.
 // We do NOT call render() on these — typing into an input shouldn't
 // cause a rerender that loses the cursor position.
 const _QA_FIELD_KEYS = {
