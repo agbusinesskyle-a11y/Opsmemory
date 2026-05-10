@@ -45,7 +45,13 @@ log = logging.getLogger("opsmemory.main")
 CSP_HEADER = (
     "default-src 'self'; "
     "script-src 'self'; "
-    "style-src 'self'; "
+    # 'unsafe-inline' for style-src: the PWA renders inline width/
+    # color hints in dynamic templates (confidence bars, validation
+    # error chips, etc.) and uses element.style.X = Y for surgical
+    # updates that bypass full re-render. Inline scripts remain
+    # blocked. Codex/Kyle B3-6 console-noise cleanup so [opsmemory
+    # diag] logs aren't lost in CSP-violation spam.
+    "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data:; "
     "connect-src 'self'; "
     "manifest-src 'self'; "
