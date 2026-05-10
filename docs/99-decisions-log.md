@@ -58,3 +58,20 @@ See `01-design.md`.
 - /readyz returns 200 with `backup_check: enabled`, recent backup_age_hours and restore_age_hours
 - Daily backup timer enabled, next firing 02:17 America/Phoenix
 - All other tenants (n8n / openbrain / family_*) untouched and still serving
+
+
+## 2026-05-10 — Multi-tenant role split (MT-2)
+**Decided**: `users.role` split into `platform_admin` (Kyle only) and `owner` (everyone else). `business_memberships.role` keeps `admin`/`owner` for per-business authority.
+**Decider**: Kyle, after MT-1 surfaced that Joanna (users.role=admin) saw Conway Feed despite no membership row.
+**Why**: Single-platform-admin model + per-business-admin via memberships. Adds a real authz boundary without parent/child business hierarchy. Migrations 0022 (enum) + 0023 (CHECK + UPDATE).
+
+## 2026-05-10 — Tenant model: peer businesses, no parent/child
+**Decided**: Conway Feed and Family Room added as peer businesses to redhot/borderline. Selah Financial NOT modeled as a parent — kept off-platform.
+**Decider**: Kyle.
+**Why**: Schema is flat (one business slug per task). Parent/child hierarchy would be a multi-week refactor for marginal value at current scale. Peer-businesses pattern matches what new clients onboarding would use.
+
+## 2026-05-10 — Quick Add path: sync hybrid (Codex Option D)
+**Decided**: POST /v1/tasks endpoint runs deterministic retrieve sync (no LLM) before commit. Operator sees dedup candidates and decides "Use existing" / "Add anyway." Auto-approved review_item stamped for audit chain symmetry with pipeline-derived tasks.
+**Decider**: Kyle, after planning session with Codex pushback.
+**Why**: Direct-write (Option A) bypassed reconciliation. Async pipeline (Option C) had bad UX. Sync hybrid keeps <300ms latency, $0 LLM cost in common case, and audit chain consistency.
+

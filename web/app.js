@@ -598,8 +598,8 @@ function renderTaskList() {
 // with `0`.
 //
 // Triage detail pane mirrors the renderReviewItem detail content
-// but in the sidebar layout. Edit-then-approve and Snooze buttons
-// are placeholders (toast on click) until the next chunk.
+// but in the sidebar layout. Edit-then-approve (B4) and Snooze (B1)
+// are wired live; this comment used to flag them as placeholders.
 // =====================================================================
 
 const TG = {
@@ -1099,7 +1099,7 @@ function tgRenderBulkBar() {
       <button class="tg-btn danger" data-tg-bulk-reject ${state.review.bulkInProgress ? 'disabled' : ''}>
         Reject <span class="tg-pill-kbd">2</span>
       </button>
-      <button class="tg-btn" data-tg-bulk-snooze title="Snooze (coming next chunk)">
+      <button class="tg-btn" data-tg-bulk-snooze title="Snooze selected items">
         Snooze <span class="tg-pill-kbd">H</span>
       </button>
       <button class="tg-btn" data-tg-bulk-clear>Clear <span class="tg-pill-kbd">Esc</span></button>
