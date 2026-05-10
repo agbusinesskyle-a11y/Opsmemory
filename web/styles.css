@@ -31,7 +31,9 @@ body {
   background: var(--bg);
   color: var(--fg);
 }
-header {
+/* Legacy header rule kept for any non-shell page that still emits a
+   <header> element. The shell uses .tg-topbar instead. */
+body > header {
   padding: 16px 20px;
   border-bottom: 1px solid var(--border);
   display: flex;
@@ -52,7 +54,7 @@ h2 {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
-main {
+body > main {
   padding: 20px;
   max-width: 720px;
   margin: 0 auto;
@@ -1171,20 +1173,13 @@ ul.businesses li {
   }
 }
 
-/* Triage view shell */
+/* Triage view content (now lives inside the shell .tg-main) */
 .triage-view {
-  background: var(--tg-bg);
-  color: var(--tg-fg);
-  font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-  font-feature-settings: "cv11","ss01","ss03";
   display: flex;
   flex-direction: column;
-  min-height: calc(100vh - 60px);
-  margin: -8px -12px 0;
+  min-height: 0;
+  flex: 1;
 }
-.triage-view ::selection { background: var(--tg-acc-soft); color: var(--tg-fg); }
 
 /* Header — title + sub-tabs */
 .tg-head { padding: 14px 16px 0; }
@@ -1762,4 +1757,320 @@ ul.businesses li {
   min-width: 50px;
   display: inline-block;
   text-align: center;
+}
+
+/* =====================================================================
+   Phase UI-2A (2026-05-09) — Full app shell.
+   Left rail + topbar wraps every view (Triage, Tasks, SOPs, Settings).
+   Tokens are the --tg-* set defined above.
+   ===================================================================== */
+
+html, body {
+  background: var(--tg-bg);
+  color: var(--tg-fg);
+  font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "cv11","ss01","ss03";
+  margin: 0;
+  height: 100%;
+}
+::selection { background: var(--tg-acc-soft); color: var(--tg-fg); }
+
+/* Reset any legacy main wrapper inside the shell to zero, in case
+   future pages inject one. */
+.tg-content > main, .tg-content > header { all: revert; max-width: none; padding: 0; margin: 0; border: 0; }
+
+/* The shell takes over the viewport entirely. */
+#root.has-shell {
+  display: block;
+}
+.tg-app {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--tg-bg);
+  color: var(--tg-fg);
+}
+
+/* Left rail */
+.tg-rail {
+  background: var(--tg-bg-rail);
+  border-right: 1px solid var(--tg-bd-soft);
+  display: flex; flex-direction: column;
+  padding: 12px 10px;
+  overflow-y: auto;
+}
+.tg-rail-brand {
+  display: flex; align-items: center; gap: 9px;
+  padding: 4px 8px 16px;
+  color: var(--tg-fg);
+  font-weight: 600; font-size: 13.5px; letter-spacing: -0.005em;
+}
+.tg-rail-brand .dot {
+  width: 16px; height: 16px; border-radius: 4px;
+  background: linear-gradient(135deg, var(--tg-acc), oklch(0.6 0.18 calc(var(--tg-acc-h) + 40)));
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
+  flex: 0 0 16px;
+}
+.tg-rail-sec {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--tg-fg-dim);
+  padding: 14px 10px 6px;
+  font-weight: 500;
+}
+.tg-rail-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; border-radius: 6px;
+  color: var(--tg-fg-mut); font-size: 12.5px;
+  cursor: pointer; user-select: none;
+  height: 28px; border: 0; background: transparent; width: 100%;
+  text-align: left;
+}
+.tg-rail-item:hover { background: var(--tg-bg-row-h); color: var(--tg-fg); }
+.tg-rail-item.active { background: var(--tg-bg-elev2); color: var(--tg-fg); }
+.tg-rail-item .badge {
+  margin-left: auto; font-size: 10.5px; color: var(--tg-fg-dim);
+  background: transparent; font-variant-numeric: tabular-nums;
+}
+.tg-rail-item.active .badge { color: var(--tg-fg-mut); }
+.tg-rail-icon {
+  width: 14px; height: 14px; flex: 0 0 14px;
+  color: var(--tg-fg-dim); opacity: .95;
+}
+.tg-rail-item:hover .tg-rail-icon, .tg-rail-item.active .tg-rail-icon { color: var(--tg-fg-mut); }
+.tg-rail-foot {
+  margin-top: auto; padding: 10px;
+  display: flex; align-items: center; gap: 10px;
+  color: var(--tg-fg-mut); font-size: 11.5px;
+  border-top: 1px solid var(--tg-bd-soft);
+}
+.tg-avatar {
+  width: 24px; height: 24px; border-radius: 50%;
+  background: oklch(0.62 0.13 30);
+  display: inline-flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 11px; font-weight: 600;
+  flex: 0 0 24px;
+}
+.tg-rail-foot .who-name {
+  color: var(--tg-fg); font-weight: 500; font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tg-rail-foot .who-meta {
+  font-size: 10.5px; color: var(--tg-fg-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tg-rail-foot .who-block { min-width: 0; flex: 1; }
+
+/* Main area */
+.tg-main {
+  display: flex; flex-direction: column;
+  min-width: 0; min-height: 0;
+  overflow: hidden;
+}
+.tg-topbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--tg-bd-soft);
+  background: var(--tg-bg);
+  flex: 0 0 auto;
+}
+.tg-breadcrumb {
+  font-size: 12px; color: var(--tg-fg-dim);
+  display: flex; gap: 6px; align-items: center;
+}
+.tg-breadcrumb b { color: var(--tg-fg); font-weight: 500; }
+.tg-breadcrumb .sep { color: var(--tg-fg-faint); }
+.tg-topbar .grow { flex: 1; }
+.tg-iconbtn {
+  appearance: none; border: 1px solid var(--tg-bd-soft);
+  background: transparent; color: var(--tg-fg-mut);
+  width: 28px; height: 28px; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
+}
+.tg-iconbtn:hover { background: var(--tg-bg-row-h); color: var(--tg-fg); }
+.tg-pill-kbd {
+  font: 600 10.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--tg-fg-mut); background: var(--tg-bg-elev2);
+  border: 1px solid var(--tg-bd);
+  padding: 2px 5px; border-radius: 4px; letter-spacing: .02em;
+}
+.tg-biz-pill {
+  display: inline-block; font-size: 11px; padding: 2px 8px;
+  border-radius: 9px; border: 1px solid var(--tg-bd-soft);
+  background: var(--tg-bg-elev); color: var(--tg-fg-mut);
+  margin-right: 4px;
+}
+
+/* Content area inside main */
+.tg-content {
+  flex: 1; min-height: 0; min-width: 0;
+  overflow: auto;
+  display: flex; flex-direction: column;
+}
+.tg-page {
+  padding: 18px 24px 80px;
+  max-width: 1280px; width: 100%;
+  margin: 0 auto;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.tg-page-h1 {
+  font-size: 18px; font-weight: 600; letter-spacing: -0.01em;
+  margin: 0 0 4px;
+}
+
+/* Mobile bottom nav (rail collapses) */
+.tg-bottomnav {
+  display: none;
+  position: fixed; left: 0; right: 0; bottom: 0;
+  background: var(--tg-bg-rail);
+  border-top: 1px solid var(--tg-bd-soft);
+  padding: 6px 4px env(safe-area-inset-bottom, 6px);
+  z-index: 30;
+}
+.tg-bottomnav-inner {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px;
+}
+.tg-bn-item {
+  background: transparent; border: 0; color: var(--tg-fg-mut);
+  display: flex; flex-direction: column; align-items: center;
+  gap: 2px; padding: 6px 4px; font-size: 10.5px;
+  border-radius: 6px; cursor: pointer;
+}
+.tg-bn-item .tg-rail-icon { width: 18px; height: 18px; flex: 0 0 18px; }
+.tg-bn-item.active { color: var(--tg-fg); }
+.tg-bn-item.active .tg-rail-icon { color: var(--tg-acc); }
+.tg-bn-item .badge {
+  position: absolute; transform: translate(8px, -2px);
+  font-size: 9px; padding: 1px 4px; border-radius: 7px;
+  background: var(--tg-c-redhot); color: #fff;
+}
+
+/* Reskin existing legacy components inside .tg-page only.
+   Triage uses .triage-view (not .tg-page) so these cascades do not
+   leak into Triage internals. */
+.tg-page .filters,
+.tg-page .status-tabs,
+.tg-page .business-filter,
+.tg-page .biz-pill,
+.tg-page ul.tasks,
+.tg-page .task-card,
+.tg-page .sops-area,
+.tg-page .sop-card,
+.tg-page #settings-area {
+  color: var(--tg-fg);
+}
+.tg-page .filters {
+  background: transparent; padding: 0;
+  display: flex; gap: 12px; flex-wrap: wrap;
+  border: 0;
+}
+.tg-page .status-tabs {
+  display: flex; gap: 1px; align-items: center;
+  border-bottom: 1px solid var(--tg-bd-soft);
+}
+.tg-page .status-tabs .tab {
+  background: transparent; border: 0;
+  color: var(--tg-fg-mut); padding: 8px 12px;
+  font-size: 12.5px; cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tg-page .status-tabs .tab:hover { color: var(--tg-fg); }
+.tg-page .status-tabs .tab.active {
+  color: var(--tg-fg); border-bottom-color: var(--tg-fg);
+}
+/* Form-control + button reskin scoped to .tg-page only.
+   Triage internals use .triage-view, NOT .tg-page, so this cascade
+   does not touch .tg-subtab / .tg-btn / .tg-reason / etc. */
+.tg-page select,
+.tg-page input[type="text"],
+.tg-page input[type="search"],
+.tg-page input[type="email"],
+.tg-page input[type="datetime-local"],
+.tg-page input[type="date"] {
+  appearance: none;
+  background: var(--tg-bg-elev);
+  border: 1px solid var(--tg-bd-soft);
+  color: var(--tg-fg); font-size: 12.5px;
+  padding: 6px 10px; border-radius: 6px; outline: none;
+}
+.tg-page select:focus,
+.tg-page input:focus,
+.tg-page textarea:focus {
+  border-color: var(--tg-acc);
+  box-shadow: 0 0 0 3px var(--tg-acc-soft);
+}
+.tg-page button {
+  background: var(--tg-bg-elev2);
+  border: 1px solid var(--tg-bd);
+  color: var(--tg-fg); font-size: 12.5px;
+  padding: 6px 12px; border-radius: 6px; cursor: pointer;
+}
+.tg-page button:hover { background: var(--tg-bg-row-foc); border-color: var(--tg-fg-faint); }
+.tg-page button.primary, .tg-page .btn.primary {
+  background: var(--tg-acc); border-color: var(--tg-acc); color: #fff;
+}
+.tg-page button.primary:hover, .tg-page .btn.primary:hover {
+  background: oklch(0.6 0.16 var(--tg-acc-h));
+  border-color: oklch(0.6 0.16 var(--tg-acc-h));
+}
+
+/* Task list re-skin (scoped to .tg-page) */
+.tg-page ul.tasks {
+  list-style: none; padding: 0; margin: 0;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.tg-page li.task-card,
+.tg-page .task-card {
+  background: var(--tg-bg-elev);
+  border: 1px solid var(--tg-bd-soft);
+  border-radius: 8px;
+  padding: 12px 14px;
+  color: var(--tg-fg);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.tg-page li.task-card:hover { border-color: var(--tg-bd); }
+.tg-page .task-card.expanded { border-color: var(--tg-acc-bd); }
+.tg-page .task-title { font-size: 13px; font-weight: 500; }
+.tg-page .task-meta {
+  font-size: 11.5px; color: var(--tg-fg-mut);
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
+.tg-page .task-meta .pill,
+.tg-page .biz-pill,
+.tg-page .role-pill {
+  background: var(--tg-bg-elev2);
+  border: 1px solid var(--tg-bd-soft);
+  color: var(--tg-fg-mut);
+  font-size: 11px; padding: 1px 8px; border-radius: 9px;
+}
+.tg-page .empty-state {
+  color: var(--tg-fg-dim); padding: 32px 12px;
+}
+.tg-page .error {
+  background: var(--tg-c-redhot-bg);
+  border-color: oklch(0.72 0.16 27 / 0.4);
+  color: var(--tg-c-redhot);
+}
+.tg-page h2 {
+  font-size: 11px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .06em;
+  color: var(--tg-fg-dim);
+  margin: 12px 0 6px;
+}
+
+/* Mobile: rail hides, bottom nav appears */
+@media (max-width: 900px) {
+  .tg-app { grid-template-columns: 1fr; }
+  .tg-rail { display: none; }
+  .tg-bottomnav { display: block; }
+  .tg-content { padding-bottom: 70px; }
+  .tg-page { padding: 14px 14px 90px; }
+  .tg-topbar { padding: 8px 12px; }
+  .tg-breadcrumb { font-size: 11.5px; }
+  .tg-biz-pill { display: none; }  /* save horizontal room on small screens */
 }

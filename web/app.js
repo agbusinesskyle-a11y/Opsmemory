@@ -1581,34 +1581,165 @@ function renderScheduleAnchorForm() {
   `;
 }
 
+// ---------------------------------------------------------------------------
+// Phase UI-2A app shell — left rail + topbar wraps every view.
+// ---------------------------------------------------------------------------
+
+function renderRail() {
+  const p = state.principal || {};
+  const isAdmin = p.role === 'admin';
+  const isUserPrincipal = p.principal_type === 'user';
+  const v = state.view || 'tasks';
+  const inboxCount = (function () {
+    try {
+      const items = (state.review && state.review.items) || [];
+      return items.filter(i => i.status === 'pending').length || 0;
+    } catch (_e) { return 0; }
+  })();
+  const initial = (p.display_name || p.email || '?').slice(0, 1).toUpperCase();
+
+  // Inline SVG icons — kept tiny on purpose; design-system polish later.
+  const ico = {
+    triage: '<svg class="tg-rail-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h12M3 18h18"/></svg>',
+    tasks:  '<svg class="tg-rail-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
+    sops:   '<svg class="tg-rail-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M9 14h6"/><path d="M9 18h6"/></svg>',
+    set:    '<svg class="tg-rail-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+  };
+  const item = (view, label, icon, badge) => `
+    <button class="view-tab tg-rail-item${v === view ? ' active' : ''}" data-view="${view}">
+      ${icon}
+      <span>${escapeHtml(label)}</span>
+      ${badge ? `<span class="badge">${badge}</span>` : ''}
+    </button>`;
+  return `
+    <aside class="tg-rail">
+      <div class="tg-rail-brand"><span class="dot"></span><span>OpsMemory</span></div>
+      <div class="tg-rail-sec">Workspace</div>
+      ${isAdmin ? item('review', 'Triage', ico.triage, inboxCount > 0 ? inboxCount : '') : ''}
+      ${item('tasks', 'Tasks', ico.tasks)}
+      ${isAdmin ? item('sops', 'SOPs', ico.sops) : ''}
+      <div class="tg-rail-sec">Account</div>
+      ${isUserPrincipal ? item('settings', 'Settings', ico.set) : ''}
+      <div class="tg-rail-foot">
+        <span class="tg-avatar">${escapeHtml(initial)}</span>
+        <div class="who-block">
+          <div class="who-name">${escapeHtml(p.display_name || 'Signed in')}</div>
+          <div class="who-meta">${escapeHtml(p.email || '')}</div>
+        </div>
+      </div>
+    </aside>`;
+}
+
+function renderBottomNav() {
+  const p = state.principal || {};
+  const isAdmin = p.role === 'admin';
+  const isUserPrincipal = p.principal_type === 'user';
+  const v = state.view || 'tasks';
+  const inboxCount = (function () {
+    try {
+      const items = (state.review && state.review.items) || [];
+      return items.filter(i => i.status === 'pending').length || 0;
+    } catch (_e) { return 0; }
+  })();
+  const ico = {
+    triage: '<svg class="tg-rail-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h12M3 18h18"/></svg>',
+    tasks:  '<svg class="tg-rail-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
+    sops:   '<svg class="tg-rail-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
+    set:    '<svg class="tg-rail-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>',
+  };
+  const bn = (view, label, icon, badge) => `
+    <button class="view-tab tg-bn-item${v === view ? ' active' : ''}" data-view="${view}">
+      <span style="position:relative">${icon}${badge ? `<span class="badge">${badge}</span>` : ''}</span>
+      <span>${escapeHtml(label)}</span>
+    </button>`;
+  return `
+    <nav class="tg-bottomnav">
+      <div class="tg-bottomnav-inner">
+        ${isAdmin ? bn('review', 'Triage', ico.triage, inboxCount > 0 ? inboxCount : '') : ''}
+        ${bn('tasks', 'Tasks', ico.tasks)}
+        ${isAdmin ? bn('sops', 'SOPs', ico.sops) : ''}
+        ${isUserPrincipal ? bn('settings', 'Settings', ico.set) : ''}
+      </div>
+    </nav>`;
+}
+
+function renderTopbar() {
+  const p = state.principal || {};
+  const v = state.view || 'tasks';
+  const labels = { review: 'Triage', tasks: 'Tasks', sops: 'SOPs', settings: 'Settings' };
+  const allBiz = (p.businesses || []);
+  const businesses = allBiz
+    .slice(0, 3)
+    .map(b => `<span class="tg-biz-pill">${escapeHtml(b.name)}</span>`)
+    .join('');
+  const moreBiz = allBiz.length > 3
+    ? `<span class="tg-biz-pill" title="${escapeHtml(allBiz.slice(3).map(b => b.name).join(', '))}">+${allBiz.length - 3}</span>`
+    : '';
+  const rolePill = p.role
+    ? `<span class="tg-biz-pill" title="Role">${escapeHtml(p.role)}</span>`
+    : '';
+  const syncBadge = (typeof renderSyncBadge === 'function') ? renderSyncBadge() : '';
+  return `
+    <header class="tg-topbar">
+      <div class="tg-breadcrumb">
+        <span>Workspace</span>
+        <span class="sep">›</span>
+        <b>${escapeHtml(labels[v] || 'Workspace')}</b>
+      </div>
+      <div class="grow"></div>
+      <span class="sync-slot">${syncBadge}</span>
+      ${rolePill}
+      ${businesses}${moreBiz}
+      <button class="tg-iconbtn" id="tg-help-btn" title="Keyboard shortcuts (?)" aria-label="Shortcuts">?</button>
+    </header>`;
+}
+
+function renderAppShell(viewContent) {
+  return `
+    <div class="tg-app">
+      ${renderRail()}
+      <div class="tg-main">
+        ${renderTopbar()}
+        <div class="tg-content">${viewContent}</div>
+      </div>
+      ${renderBottomNav()}
+    </div>`;
+}
+
 function render() {
   const root = document.getElementById('root');
   if (!root) return;
+  // The shell takes over the viewport — root needs to give up its
+  // legacy max-width / centering. Adding the class flips that.
+  root.classList.add('has-shell');
+
+  let viewContent;
   if (state.view === 'review') {
-    root.innerHTML = `
-      ${renderHeader()}
-      <div id="review-area">${renderTriageView()}</div>
-    `;
+    viewContent = `<div id="review-area">${renderTriageView()}</div>`;
   } else if (state.view === 'sops') {
-    root.innerHTML = `
-      ${renderHeader()}
-      ${renderSopFilters()}
-      ${renderCreateSopForm()}
-      <div id="sops-area">${renderSopList()}</div>
-      ${renderAnchorsSection()}
-    `;
+    viewContent = `
+      <div class="tg-page">
+        <h1 class="tg-page-h1">SOPs</h1>
+        ${renderSopFilters()}
+        ${renderCreateSopForm()}
+        <div id="sops-area">${renderSopList()}</div>
+        ${renderAnchorsSection()}
+      </div>`;
   } else if (state.view === 'settings') {
-    root.innerHTML = `
-      ${renderHeader()}
-      <div id="settings-area">${renderSettings()}</div>
-    `;
+    viewContent = `
+      <div class="tg-page">
+        <h1 class="tg-page-h1">Settings</h1>
+        <div id="settings-area">${renderSettings()}</div>
+      </div>`;
   } else {
-    root.innerHTML = `
-      ${renderHeader()}
-      ${renderFilters()}
-      <div id="task-area">${renderTaskList()}</div>
-    `;
+    viewContent = `
+      <div class="tg-page">
+        <h1 class="tg-page-h1">Tasks</h1>
+        ${renderFilters()}
+        <div id="task-area">${renderTaskList()}</div>
+      </div>`;
   }
+  root.innerHTML = renderAppShell(viewContent);
   attachEventHandlers();
 }
 
@@ -4607,6 +4738,15 @@ async function _ui1RunRejectOnTargetsWithReason(ids, reason) {
 
 document.addEventListener('keydown', _ui1HandleKey);
 document.addEventListener('click', _ui1HandleClick);
+
+// Topbar ? button -> reuse the existing UI-1 shortcuts overlay.
+document.addEventListener('click', function (e) {
+  const btn = e.target && e.target.closest && e.target.closest('#tg-help-btn');
+  if (btn) {
+    e.preventDefault();
+    if (typeof _ui1ToggleShortcutsOverlay === 'function') _ui1ToggleShortcutsOverlay();
+  }
+});
 
 // Search input on the Triage subtabs row updates state.review.searchQuery
 // without re-rendering on every keystroke (debounce by re-render only
