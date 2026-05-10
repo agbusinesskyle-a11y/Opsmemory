@@ -59,6 +59,10 @@ DEFAULT_BUSINESS_IDS = {
     # .local/owners.json — slug must match the businesses.id seeded
     # by 0021_conway_feed_business.sql.
     "conway-feed": "00000000-0000-0000-0000-000000000203",
+    # Phase MT-3 (2026-05-10): Family Room — Kyle + Sarah's
+    # personal/family coordination space. Seeded by
+    # 0024_family_room_business.sql.
+    "family": "00000000-0000-0000-0000-000000000204",
 }
 
 
