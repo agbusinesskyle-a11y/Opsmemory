@@ -45,6 +45,7 @@ const state = {
     searchQuery: '',                         // current /-search filter text
     detailOpen: true,                        // detail pane visible at desktop widths
     rejectModal: null,                       // null | { ids, preset, reasonText }
+    snoozeModal: null,                       // null | { ids, selectedKey, customIso, reasonText }
     toast: null,                             // null | { msg, kind }
     items_visible: [],                       // computed at render time; filtered subset focused/selected indexes into
   },
@@ -220,7 +221,12 @@ async function loadTaskDetail(taskId) {
 async function loadReviewItems(statusFilter) {
   const params = new URLSearchParams();
   if (statusFilter) params.set('status', statusFilter);
-  params.set('limit', '50');
+  // Phase UI-2B1: PWA does sub-tab filtering client-side
+  // (Inbox / Stale / Snoozed are all subsets of pending). The API
+  // default is `snoozed=exclude`; ask for `all` so the Snoozed
+  // sub-tab has data without a second request.
+  params.set('snoozed', 'all');
+  params.set('limit', '100');
   const data = await api('/v1/review?' + params.toString());
   return { items: data.items || [], total: data.total || 0 };
 }
@@ -616,21 +622,33 @@ function tgActionLabel(action) {
   return 'IGNORE';
 }
 
+// "Currently snoozed" predicate. snoozed_until comes from the API
+// as an ISO string OR null. A past timestamp means the snooze has
+// expired and the item should re-enter Inbox without server help.
+function tgIsSnoozed(item) {
+  if (!item || !item.snoozed_until) return false;
+  const t = Date.parse(item.snoozed_until);
+  if (Number.isNaN(t)) return false;
+  return t > Date.now();
+}
+
 function tgSubviewItems() {
   const items = state.review.items || [];
   const sv = state.review.subview || 'inbox';
+  const open = i => (i.status === 'pending' || i.status === 'needs_changes');
   if (sv === 'inbox') {
-    return items.filter(i => i.status === 'pending' || i.status === 'needs_changes');
+    return items.filter(i => open(i) && !tgIsSnoozed(i));
   }
   if (sv === 'stale') {
     return items.filter(i => {
-      if (i.status !== 'pending' && i.status !== 'needs_changes') return false;
+      if (!open(i)) return false;
+      if (tgIsSnoozed(i)) return false;
       const ageDays = tgAgeMinutes(i) / (60 * 24);
       return ageDays >= TG.staleDays;
     });
   }
   if (sv === 'snoozed') {
-    return items.filter(i => i.status === 'snoozed');
+    return items.filter(i => open(i) && tgIsSnoozed(i));
   }
   if (sv === 'completed') {
     return items.filter(i => i.status === 'approved' || i.status === 'rejected');
@@ -640,13 +658,15 @@ function tgSubviewItems() {
 
 function tgSubviewCounts() {
   const items = state.review.items || [];
-  const inbox = items.filter(i => i.status === 'pending' || i.status === 'needs_changes').length;
+  const open = i => (i.status === 'pending' || i.status === 'needs_changes');
+  const inbox = items.filter(i => open(i) && !tgIsSnoozed(i)).length;
   const stale = items.filter(i => {
-    if (i.status !== 'pending' && i.status !== 'needs_changes') return false;
+    if (!open(i)) return false;
+    if (tgIsSnoozed(i)) return false;
     const ageDays = tgAgeMinutes(i) / (60 * 24);
     return ageDays >= TG.staleDays;
   }).length;
-  const snoozed = items.filter(i => i.status === 'snoozed').length;
+  const snoozed = items.filter(i => open(i) && tgIsSnoozed(i)).length;
   const completed = items.filter(i => i.status === 'approved' || i.status === 'rejected').length;
   return { inbox, stale, snoozed, completed };
 }
@@ -717,6 +737,22 @@ function tgFlags(item) {
   // Approved status
   if (item.status === 'approved') {
     flags.push({ class: 'approved', label: 'approved' });
+  }
+  // Snoozed (only renders when item is currently snoozed; the inbox
+  // view filters these out so the chip only ever shows in the
+  // Snoozed sub-tab — informational, not redundant).
+  if (tgIsSnoozed(item)) {
+    let when = '';
+    try {
+      const d = new Date(item.snoozed_until);
+      const todayMidnight = new Date(); todayMidnight.setHours(0, 0, 0, 0);
+      const tomMidnight = new Date(todayMidnight); tomMidnight.setDate(tomMidnight.getDate() + 1);
+      const dayAfterTom = new Date(todayMidnight); dayAfterTom.setDate(dayAfterTom.getDate() + 2);
+      if (d < tomMidnight) when = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+      else if (d < dayAfterTom) when = 'tomorrow';
+      else when = d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+    } catch (_e) {}
+    flags.push({ class: 'snoozed', label: `snoozed ${when}` });
   }
   return flags;
 }
@@ -913,9 +949,12 @@ function tgRenderDetail(item) {
           <button class="tg-btn danger" data-tg-detail-reject>
             Reject <span class="tg-pill-kbd">2</span>
           </button>
-          <button class="tg-btn" data-tg-detail-snooze title="Snooze (next chunk)">
-            Snooze <span class="tg-pill-kbd">H</span>
-          </button>
+          ${tgIsSnoozed(item)
+            ? `<button class="tg-btn" data-tg-detail-unsnooze title="Clear snooze">Un-snooze</button>`
+            : `<button class="tg-btn" data-tg-detail-snooze title="Snooze">
+                 Snooze <span class="tg-pill-kbd">H</span>
+               </button>`
+          }
         </div>
       ` : ''}
     </aside>
@@ -1001,6 +1040,166 @@ function tgRenderToast() {
   return `<div class="tg-toast"><span class="${cls}">●</span> ${escapeHtml(t.msg)}</div>`;
 }
 
+// ---------------------------------------------------------------------------
+// Phase UI-2B1: Snooze modal.
+// ---------------------------------------------------------------------------
+
+// Compute the four quick-snooze tile presets, anchored at "now" in
+// the local timezone. Returns label + ISO UTC timestamp.
+function tgSnoozePresets() {
+  const now = new Date();
+  function nextAt(hour, minute, dayOffset) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + dayOffset);
+    d.setHours(hour, minute, 0, 0);
+    return d;
+  }
+  // 1. Plus 1 hour
+  const oneHour = new Date(now.getTime() + 60 * 60 * 1000);
+  // 2. Tomorrow 9am (local)
+  const tomorrow9 = nextAt(9, 0, 1);
+  // 3. Next Monday 9am (local). 0 = Sun.
+  const dow = now.getDay();
+  // days until next Monday: if today is Mon, jump to NEXT Mon (7).
+  const daysToMon = ((1 - dow + 7) % 7) || 7;
+  const nextMon = nextAt(9, 0, daysToMon);
+  return [
+    { key: '1h',     label: '+1 hour',       sub: oneHour.toLocaleString(undefined, { hour: 'numeric', minute: '2-digit' }), iso: oneHour.toISOString() },
+    { key: 'tom9',   label: 'Tomorrow 9am',  sub: tomorrow9.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }), iso: tomorrow9.toISOString() },
+    { key: 'mon9',   label: 'Mon 9am',       sub: nextMon.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }), iso: nextMon.toISOString() },
+    { key: 'custom', label: 'Pick a date…',  sub: 'datetime', iso: null },
+  ];
+}
+
+function tgOpenSnoozeModal(ids) {
+  state.review.snoozeModal = {
+    ids: Array.isArray(ids) ? ids.slice() : [ids],
+    selectedKey: 'tom9',     // sensible default
+    customIso: '',
+    reasonText: '',
+  };
+  render();
+}
+
+function tgRenderSnoozeModal() {
+  const m = state.review.snoozeModal;
+  if (!m) return '';
+  const ids = m.ids || [];
+  const presets = tgSnoozePresets();
+  const tiles = presets.map(p => `
+    <div class="qd ${m.selectedKey === p.key ? 'on' : ''}" data-tg-snooze-tile="${p.key}">
+      ${escapeHtml(p.label)}
+      <small>${escapeHtml(p.sub)}</small>
+    </div>
+  `).join('');
+  // Show the custom-date input only when "Pick a date…" is selected.
+  const customBlock = m.selectedKey === 'custom' ? `
+    <div>
+      <div class="tg-field-lbl">Custom date and time (your local timezone)</div>
+      <input type="datetime-local" id="tg-snooze-custom" value="${escapeHtml(m.customIso || '')}">
+    </div>
+  ` : '';
+  return `
+    <div class="tg-modal-wrap" data-tg-modal-backdrop>
+      <div class="tg-modal" role="dialog" aria-label="Snooze">
+        <div class="tg-modal-h">
+          Snooze ${ids.length} item${ids.length === 1 ? '' : 's'}
+          <span class="small">re-surfaces automatically</span>
+        </div>
+        <div class="tg-modal-b">
+          <div>
+            <div class="tg-field-lbl">Snooze until</div>
+            <div class="quickdates">${tiles}</div>
+          </div>
+          ${customBlock}
+          <div>
+            <div class="tg-field-lbl">Note (optional)</div>
+            <textarea id="tg-snooze-textarea" placeholder="Why are you setting this aside?">${escapeHtml(m.reasonText || '')}</textarea>
+          </div>
+        </div>
+        <div class="tg-modal-f">
+          <button class="tg-btn" data-tg-snooze-cancel>Cancel</button>
+          <button class="tg-btn primary" data-tg-snooze-submit>Snooze ${ids.length}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// Resolve the modal selection into a concrete ISO string, or null if
+// the operator picked Custom but didn't fill in a value.
+function tgResolveSnoozeIso(m) {
+  if (!m) return null;
+  if (m.selectedKey === 'custom') {
+    const raw = (m.customIso || '').trim();
+    if (!raw) return null;
+    // datetime-local gives "2026-05-09T18:00" with no timezone. Treat
+    // as local time and convert to ISO UTC for the API.
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toISOString();
+  }
+  const presets = tgSnoozePresets();
+  const p = presets.find(x => x.key === m.selectedKey);
+  return p ? p.iso : null;
+}
+
+async function _tgApplySnooze() {
+  const m = state.review.snoozeModal;
+  if (!m) return;
+  const iso = tgResolveSnoozeIso(m);
+  if (!iso) {
+    tgShowToast('Pick a snooze deadline', 'err');
+    return;
+  }
+  const ids = m.ids || [];
+  if (ids.length === 0) { state.review.snoozeModal = null; render(); return; }
+  let okCount = 0;
+  const errors = [];
+  for (const id of ids) {
+    try {
+      await apiFetch(`/v1/review/${encodeURIComponent(id)}/snooze`, {
+        method: 'POST',
+        body: JSON.stringify({ snoozed_until: iso, reason: m.reasonText || null }),
+      });
+      okCount += 1;
+    } catch (e) {
+      errors.push({ id, err: e && e.message || String(e) });
+    }
+  }
+  // Clear modal + selection, refetch list so the snoozed rows
+  // disappear from Inbox.
+  state.review.snoozeModal = null;
+  state.review.selectedIds = new Set();
+  try {
+    const result = await loadReviewItems(state.review.statusFilter);
+    state.review.items = result.items;
+    state.review.total = result.total;
+  } catch (_e) { /* leave stale list */ }
+  render();
+  if (errors.length === 0) {
+    tgShowToast(`Snoozed ${okCount}`, 'ok');
+  } else {
+    tgShowToast(`Snoozed ${okCount}/${ids.length}; ${errors.length} failed`, 'err');
+  }
+}
+
+async function _tgUnsnooze(id) {
+  try {
+    await apiFetch(`/v1/review/${encodeURIComponent(id)}/unsnooze`, { method: 'POST' });
+  } catch (e) {
+    tgShowToast(`Un-snooze failed: ${e && e.message || e}`, 'err');
+    return;
+  }
+  try {
+    const result = await loadReviewItems(state.review.statusFilter);
+    state.review.items = result.items;
+    state.review.total = result.total;
+  } catch (_e) {}
+  render();
+  tgShowToast('Un-snoozed', 'ok');
+}
+
 function renderTriageView() {
   const items = state.review.items || [];
   const counts = tgSubviewCounts();
@@ -1067,6 +1266,7 @@ function renderTriageView() {
       </div>
       ${tgRenderBulkBar()}
       ${tgRenderRejectModal()}
+      ${tgRenderSnoozeModal()}
       ${tgRenderToast()}
     </div>
   `;
@@ -4359,8 +4559,12 @@ function _ui1HandleKey(e) {
     if (_UI1.paletteOpen) { _ui1TogglePalette(); e.preventDefault(); return; }
     if (state.view === 'review') {
       let changed = false;
-      // Reject modal first
-      if (state.review.rejectModal) {
+      // Modals first (any open one), in priority order
+      if (state.review.snoozeModal) {
+        state.review.snoozeModal = null;
+        changed = true;
+      }
+      else if (state.review.rejectModal) {
         state.review.rejectModal = null;
         changed = true;
       }
@@ -4433,12 +4637,28 @@ function _ui1HandleKey(e) {
     return;
   }
 
-  // 3 = edit-then-approve, H = snooze. Both placeholder until next
-  // chunk; toast informs the operator the feature is en route.
-  if ((e.key === '3' || e.key === 'h' || e.key === 'H') && !isMeta) {
-    const which = e.key === '3' ? 'Edit + approve' : 'Snooze';
+  // 3 = edit-then-approve (still placeholder for B2 chunk).
+  if (e.key === '3' && !isMeta) {
     e.preventDefault();
-    tgShowToast(`${which} ships in next chunk`, 'err');
+    tgShowToast('Edit + approve ships in B2', 'err');
+    return;
+  }
+  // H = snooze. Targets selected ids if >=1, else focused single.
+  if ((e.key === 'h' || e.key === 'H') && !isMeta) {
+    e.preventDefault();
+    const sel = state.review.selectedIds;
+    const visible = state.review.items_visible || [];
+    let ids = [];
+    if (sel && sel.size > 0) {
+      ids = Array.from(sel);
+    } else if (state.review.focusedIndex != null && visible[state.review.focusedIndex]) {
+      ids = [visible[state.review.focusedIndex].id];
+    }
+    if (ids.length === 0) {
+      tgShowToast('No row to snooze — focus or select first', 'err');
+      return;
+    }
+    tgOpenSnoozeModal(ids);
     return;
   }
 
@@ -4606,7 +4826,16 @@ function _ui1HandleClick(e) {
     return;
   }
   if (e.target.closest('[data-tg-detail-snooze]')) {
-    tgShowToast('Snooze ships in next chunk', 'err');
+    const ids = _ui1ActionTargets();
+    if (ids.length === 0) return;
+    tgOpenSnoozeModal(ids);
+    return;
+  }
+  // Detail-pane unsnooze (only present when item is currently snoozed)
+  if (e.target.closest('[data-tg-detail-unsnooze]')) {
+    const focused = state.review.items_visible
+      && state.review.items_visible[state.review.focusedIndex];
+    if (focused) _tgUnsnooze(focused.id);
     return;
   }
 
@@ -4628,7 +4857,9 @@ function _ui1HandleClick(e) {
     return;
   }
   if (e.target.closest('[data-tg-bulk-snooze]')) {
-    tgShowToast('Snooze ships in next chunk', 'err');
+    const ids = Array.from(state.review.selectedIds);
+    if (ids.length === 0) return;
+    tgOpenSnoozeModal(ids);
     return;
   }
   if (e.target.closest('[data-tg-bulk-clear]')) {
@@ -4661,6 +4892,30 @@ function _ui1HandleClick(e) {
     state.review.rejectModal = null;
     render();
     _ui1RunRejectOnTargetsWithReason(ids, reason);
+    return;
+  }
+
+  // Snooze modal interactions
+  if (e.target.closest('[data-tg-snooze-cancel]')
+      || (e.target.matches('[data-tg-modal-backdrop]') && state.review.snoozeModal)) {
+    state.review.snoozeModal = null;
+    render();
+    return;
+  }
+  const tile = e.target.closest('[data-tg-snooze-tile]');
+  if (tile && state.review.snoozeModal) {
+    state.review.snoozeModal.selectedKey = tile.dataset.tgSnoozeTile;
+    render();
+    return;
+  }
+  if (e.target.closest('[data-tg-snooze-submit]') && state.review.snoozeModal) {
+    // Capture current textarea + datetime-local values into state
+    // before _tgApplySnooze reads them (modal will close mid-flight).
+    const ta = document.getElementById('tg-snooze-textarea');
+    const cu = document.getElementById('tg-snooze-custom');
+    if (ta) state.review.snoozeModal.reasonText = ta.value;
+    if (cu) state.review.snoozeModal.customIso = cu.value;
+    _tgApplySnooze();
     return;
   }
 

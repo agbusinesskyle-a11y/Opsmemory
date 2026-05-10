@@ -99,7 +99,27 @@ def _serialize_review_row(row: Any) -> dict:
         "applied_task_id": row.get("applied_task_id"),
         "apply_mutation_id": row.get("apply_mutation_id"),
         "last_apply_error": row.get("last_apply_error"),
+        "snoozed_until": row.get("snoozed_until"),
+        "snooze_reason": row.get("snooze_reason"),
     }
+
+
+class SnoozeBody(BaseModel):
+    """Phase UI-2B1 snooze payload.
+
+    snoozed_until — required ISO-8601 timestamp. Must be > now() at
+                    apply time (server re-checks). Past timestamps
+                    return 400 rather than silently un-snoozing —
+                    callers asking "snooze for 0 minutes" are most
+                    likely buggy.
+    reason        — optional free text (max 2048).
+
+    No new lifecycle state. The row stays status='pending' and
+    re-enters Inbox the moment snoozed_until <= now(). No scheduler
+    needs to wake it up.
+    """
+    snoozed_until: str = Field(..., max_length=64)
+    reason: str | None = Field(default=None, max_length=2048)
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +135,18 @@ async def list_review_items(
         alias="status",
         description="Comma-separated list of review_lifecycle_state values",
     ),
+    snoozed: str = Query(
+        default="exclude",
+        description="Snooze filter: 'exclude' (default — hide currently-snoozed), "
+                    "'only' (only currently-snoozed), 'all' (no filter)",
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> dict:
-    """Admin-only. Default returns pending + needs_changes."""
+    """Admin-only. Default returns pending + needs_changes, excluding
+    items whose snoozed_until is in the future (they re-surface in
+    the Snoozed sub-tab via ?snoozed=only).
+    """
     require_admin(principal)
 
     requested = [s.strip() for s in status_filter.split(",") if s.strip()]
@@ -131,11 +159,44 @@ async def list_review_items(
         )
     if not requested:
         requested = list(_LIST_STATUSES_DEFAULT)
+    if snoozed not in ("exclude", "only", "all"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid snoozed filter: {snoozed!r}",
+        )
+
+    # Build the snooze WHERE clause. Snooze is a visibility filter
+    # for the actionable queue only (pending / needs_changes). Items
+    # in terminal states (approved / rejected / superseded) are
+    # always returned regardless of any leftover snoozed_until — a
+    # row can be approved before its snooze expires, and we don't
+    # want it to disappear from GET ?status=approved.
+    #
+    # Codex UI-2B1 review note: the previous snippet applied to all
+    # statuses, so a snoozed-then-approved row was hidden from the
+    # Completed sub-tab unless callers explicitly passed snoozed=all.
+    #
+    # The partial index review_items_snoozed_until_idx covers the
+    # IS NOT NULL branch.
+    _ACTIONABLE = "ri.status IN ('pending', 'needs_changes')"
+    snooze_where = {
+        "exclude": (
+            f"AND (NOT ({_ACTIONABLE}) "
+            f"     OR ri.snoozed_until IS NULL "
+            f"     OR ri.snoozed_until <= now())"
+        ),
+        "only":    (
+            f"AND {_ACTIONABLE} "
+            f"AND ri.snoozed_until IS NOT NULL "
+            f"AND ri.snoozed_until > now()"
+        ),
+        "all":     "",
+    }[snoozed]
 
     pool = request.app.state.db
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT
               ri.id::text                  AS id,
               ri.ingest_event_id::text     AS ingest_event_id,
@@ -148,9 +209,12 @@ async def list_review_items(
               ri.updated_at::text          AS updated_at,
               ri.applied_task_id::text     AS applied_task_id,
               ri.apply_mutation_id         AS apply_mutation_id,
-              ri.last_apply_error          AS last_apply_error
+              ri.last_apply_error          AS last_apply_error,
+              ri.snoozed_until::text       AS snoozed_until,
+              ri.snooze_reason             AS snooze_reason
             FROM review_items ri
             WHERE ri.status = ANY($1::review_lifecycle_state[])
+              {snooze_where}
             ORDER BY ri.created_at DESC
             LIMIT $2 OFFSET $3
             """,
@@ -159,8 +223,9 @@ async def list_review_items(
             offset,
         )
         count_row = await conn.fetchrow(
-            "SELECT count(*) AS c FROM review_items "
-            "WHERE status = ANY($1::review_lifecycle_state[])",
+            f"SELECT count(*) AS c FROM review_items ri "
+            f"WHERE ri.status = ANY($1::review_lifecycle_state[]) "
+            f"  {snooze_where}",
             requested,
         )
 
@@ -211,6 +276,8 @@ async def get_review_item(
               ri.apply_mutation_id         AS apply_mutation_id,
               ri.last_apply_error          AS last_apply_error,
               ri.rejection_reason          AS rejection_reason,
+              ri.snoozed_until::text       AS snoozed_until,
+              ri.snooze_reason             AS snooze_reason,
               ri.created_at::text          AS created_at,
               ri.updated_at::text          AS updated_at,
               ie.source                    AS source,
@@ -420,6 +487,140 @@ async def reject_review_item(
         "rejection_reason": body.reason,
         "deduped": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/review/{id}/snooze    Phase UI-2B1
+# ---------------------------------------------------------------------------
+
+@router.post("/{review_item_id}/snooze")
+async def snooze_review_item(
+    review_item_id: uuid.UUID,
+    body: SnoozeBody,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Admin-only. Hide the review item from Inbox until snoozed_until.
+
+    Snooze does NOT introduce a new lifecycle state — the row stays
+    'pending'. The list endpoint's ?snoozed=exclude filter (default)
+    drops items where snoozed_until > now() out of Inbox/Stale; the
+    Snoozed sub-tab uses ?snoozed=only to fetch them.
+
+    Idempotent: re-snoozing a snoozed item just overwrites the
+    deadline + reason. Snoozing a terminal-state item (approved /
+    rejected / superseded) returns 409.
+
+    Snooze deadline must be > now() server-side. Client-supplied
+    timestamps are validated post-parse, so a clock-skewed client
+    can't accidentally un-snooze.
+    """
+    require_admin(principal)
+
+    # Parse the timestamp early so we can return 400 with a sensible
+    # error before we touch the DB.
+    from datetime import datetime, timezone
+    try:
+        # asyncpg accepts an ISO string OR a datetime; we parse to a
+        # tz-aware datetime so the comparison in the WHERE clause is
+        # unambiguous and the future-check is server-clock-anchored.
+        raw = body.snoozed_until.strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        deadline = datetime.fromisoformat(raw)
+        if deadline.tzinfo is None:
+            # No timezone — assume UTC. This matches the rest of the
+            # code (review_apply._coerce_due_at also defaults to UTC).
+            deadline = deadline.replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "bad_snoozed_until", "detail": str(exc)},
+        )
+    if deadline <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "snooze_in_past",
+                    "detail": "snoozed_until must be in the future"},
+        )
+
+    rid = str(review_item_id)
+    pool = request.app.state.db
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT id::text AS id, status::text AS status
+                FROM review_items
+                WHERE id = $1::uuid
+                FOR UPDATE
+                """,
+                rid,
+            )
+            if not row:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="review_item not found",
+                )
+            current = row["status"]
+            if current not in ("pending", "needs_changes"):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"code": "non_actionable_state",
+                            "detail": f"cannot snooze from status {current!r}"},
+                )
+
+            await conn.execute(
+                """
+                UPDATE review_items
+                   SET snoozed_until = $2,
+                       snooze_reason = $3
+                 WHERE id = $1::uuid
+                """,
+                rid,
+                deadline,
+                body.reason,
+            )
+
+    log.info("review_item_snoozed", extra={
+        "review_item_id": rid,
+        "reviewer_id": principal.id,
+        "snoozed_until": deadline.isoformat(),
+    })
+    return {
+        "review_item_id": rid,
+        "status": current,
+        "snoozed_until": deadline.isoformat(),
+        "snooze_reason": body.reason,
+    }
+
+
+# POST /v1/review/{id}/unsnooze — clear the snooze.
+@router.post("/{review_item_id}/unsnooze")
+async def unsnooze_review_item(
+    review_item_id: uuid.UUID,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Admin-only. Clear snooze fields. Idempotent (no-op on un-snoozed)."""
+    require_admin(principal)
+    rid = str(review_item_id)
+    pool = request.app.state.db
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE review_items
+               SET snoozed_until = NULL,
+                   snooze_reason = NULL
+             WHERE id = $1::uuid
+            """,
+            rid,
+        )
+    log.info("review_item_unsnoozed", extra={
+        "review_item_id": rid,
+        "reviewer_id": principal.id,
+    })
+    return {"review_item_id": rid, "snoozed_until": None}
 
 
 # ---------------------------------------------------------------------------
