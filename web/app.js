@@ -49,6 +49,19 @@ const state = {
     toast: null,                             // null | { msg, kind }
     items_visible: [],                       // computed at render time; filtered subset focused/selected indexes into
   },
+  // Phase UI-2B2: Quick Add compose modal — Slack-style ad-hoc task
+  // capture. Lives at the top level (not under review.) so Q can
+  // open it from any view, including Tasks / SOPs / Settings.
+  quickAdd: {
+    open: false,
+    summary: '',
+    businessSlug: '',
+    dueAtLocal: '',
+    description: '',
+    kind: 'task',                            // 'task' | 'event'
+    submitting: false,
+    error: null,
+  },
   // SOPs view (chunk 7 step 4 — admin-only).
   sops: {
     items: [],
@@ -1158,9 +1171,9 @@ async function _tgApplySnooze() {
   const errors = [];
   for (const id of ids) {
     try {
-      await apiFetch(`/v1/review/${encodeURIComponent(id)}/snooze`, {
+      await api(`/v1/review/${encodeURIComponent(id)}/snooze`, {
         method: 'POST',
-        body: JSON.stringify({ snoozed_until: iso, reason: m.reasonText || null }),
+        body: { snoozed_until: iso, reason: m.reasonText || null },
       });
       okCount += 1;
     } catch (e) {
@@ -1186,7 +1199,7 @@ async function _tgApplySnooze() {
 
 async function _tgUnsnooze(id) {
   try {
-    await apiFetch(`/v1/review/${encodeURIComponent(id)}/unsnooze`, { method: 'POST' });
+    await api(`/v1/review/${encodeURIComponent(id)}/unsnooze`, { method: 'POST', body: {} });
   } catch (e) {
     tgShowToast(`Un-snooze failed: ${e && e.message || e}`, 'err');
     return;
@@ -1198,6 +1211,188 @@ async function _tgUnsnooze(id) {
   } catch (_e) {}
   render();
   tgShowToast('Un-snoozed', 'ok');
+}
+
+// ---------------------------------------------------------------------------
+// Phase UI-2B2: Quick Add compose modal.
+// Slack-style ad-hoc task / event capture from any view.
+// ---------------------------------------------------------------------------
+
+function tgOpenQuickAdd() {
+  const p = state.principal || {};
+  // Default the business to the principal's first visible business.
+  // Admins (visibility = all) get the global businesses[] list's
+  // first slug. Reset other fields each time the modal opens.
+  let defaultSlug = '';
+  if (p.businesses && p.businesses.length > 0) {
+    defaultSlug = p.businesses[0].slug || '';
+  }
+  if (!defaultSlug && state.businesses && state.businesses.length > 0) {
+    defaultSlug = state.businesses[0].slug || '';
+  }
+  state.quickAdd = {
+    open: true,
+    summary: '',
+    businessSlug: defaultSlug,
+    dueAtLocal: '',
+    description: '',
+    kind: 'task',
+    submitting: false,
+    error: null,
+  };
+  render();
+  // Focus the title input on next tick so the operator can start
+  // typing immediately. requestAnimationFrame is safer than setTimeout
+  // because it fires after the render commits to the DOM.
+  requestAnimationFrame(() => {
+    const el = document.getElementById('tg-qa-summary');
+    if (el) el.focus();
+  });
+}
+
+function tgRenderQuickAddModal() {
+  const q = state.quickAdd;
+  if (!q || !q.open) return '';
+  const p = state.principal || {};
+  // Build business options: prefer the principal's visible
+  // businesses (membership-scoped). Admins see them all.
+  const sourceBiz = (p.businesses && p.businesses.length > 0)
+    ? p.businesses
+    : (state.businesses || []);
+  const bizOptions = sourceBiz.map(b => `
+    <option value="${escapeHtml(b.slug)}" ${q.businessSlug === b.slug ? 'selected' : ''}>
+      ${escapeHtml(b.name || b.slug)}
+    </option>
+  `).join('');
+  const errorBlock = q.error
+    ? `<div class="tg-qa-error">${escapeHtml(q.error)}</div>`
+    : '';
+  const submitDisabled = q.submitting ? 'disabled' : '';
+  return `
+    <div class="tg-modal-wrap" data-tg-qa-backdrop>
+      <div class="tg-modal" role="dialog" aria-label="Quick Add">
+        <div class="tg-modal-h">
+          Quick add
+          <span class="small">⌨ Q anywhere · Esc to close</span>
+        </div>
+        <div class="tg-modal-b">
+          ${errorBlock}
+          <div>
+            <div class="tg-field-lbl">What needs doing?</div>
+            <input type="text" id="tg-qa-summary"
+                   placeholder="e.g. Call vendor about delayed shipment"
+                   maxlength="4096"
+                   value="${escapeHtml(q.summary || '')}">
+          </div>
+          <div class="tg-qa-row">
+            <div class="tg-qa-field">
+              <div class="tg-field-lbl">Kind</div>
+              <select id="tg-qa-kind">
+                <option value="task" ${q.kind === 'task' ? 'selected' : ''}>Task</option>
+                <option value="event" ${q.kind === 'event' ? 'selected' : ''}>Event</option>
+              </select>
+            </div>
+            <div class="tg-qa-field">
+              <div class="tg-field-lbl">Business</div>
+              <select id="tg-qa-business">${bizOptions}</select>
+            </div>
+            <div class="tg-qa-field">
+              <div class="tg-field-lbl">Due / when</div>
+              <input type="datetime-local" id="tg-qa-due"
+                     value="${escapeHtml(q.dueAtLocal || '')}">
+            </div>
+          </div>
+          <div>
+            <div class="tg-field-lbl">Notes (optional)</div>
+            <textarea id="tg-qa-description" maxlength="8192"
+                      placeholder="Anything else useful here…">${escapeHtml(q.description || '')}</textarea>
+          </div>
+        </div>
+        <div class="tg-modal-f">
+          <button class="tg-btn" data-tg-qa-cancel ${submitDisabled}>Cancel</button>
+          <button class="tg-btn primary" data-tg-qa-submit ${submitDisabled}>
+            ${q.submitting ? 'Adding…' : 'Add'}
+            <span class="tg-pill-kbd">↵</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function _tgSubmitQuickAdd() {
+  const q = state.quickAdd;
+  if (!q || !q.open || q.submitting) return;
+  // Snapshot values from the live DOM (in case the operator edited
+  // a field but the input handler hasn't fired yet — Submit happens
+  // at the same tick on Enter).
+  const sumEl = document.getElementById('tg-qa-summary');
+  const bizEl = document.getElementById('tg-qa-business');
+  const dueEl = document.getElementById('tg-qa-due');
+  const descEl = document.getElementById('tg-qa-description');
+  const kindEl = document.getElementById('tg-qa-kind');
+  const summary = (sumEl ? sumEl.value : q.summary).trim();
+  const businessSlug = (bizEl ? bizEl.value : q.businessSlug);
+  const dueAtLocal = dueEl ? dueEl.value : q.dueAtLocal;
+  const description = (descEl ? descEl.value : q.description).trim();
+  const kind = kindEl ? kindEl.value : q.kind;
+  if (!summary) {
+    state.quickAdd.error = 'Title is required';
+    state.quickAdd.summary = summary;
+    render();
+    return;
+  }
+  if (!businessSlug) {
+    state.quickAdd.error = 'Pick a business';
+    render();
+    return;
+  }
+  // datetime-local gives a naive local string; convert to ISO UTC.
+  let dueAtIso = null;
+  if (dueAtLocal) {
+    const d = new Date(dueAtLocal);
+    if (!Number.isNaN(d.getTime())) dueAtIso = d.toISOString();
+  }
+  state.quickAdd.submitting = true;
+  state.quickAdd.error = null;
+  state.quickAdd.summary = summary;
+  state.quickAdd.businessSlug = businessSlug;
+  state.quickAdd.dueAtLocal = dueAtLocal;
+  state.quickAdd.description = description;
+  state.quickAdd.kind = kind;
+  render();
+  let result;
+  try {
+    result = await api('/v1/quick_tasks', {
+      method: 'POST',
+      body: {
+        summary,
+        business_slug: businessSlug,
+        due_at: dueAtIso,
+        description: description || null,
+        kind,
+      },
+    });
+  } catch (e) {
+    state.quickAdd.submitting = false;
+    state.quickAdd.error = (e && e.message) || 'Quick add failed';
+    render();
+    return;
+  }
+  // Close modal and surface a toast. If the operator is on Tasks,
+  // refresh so the new row appears.
+  state.quickAdd = {
+    open: false, summary: '', businessSlug: '', dueAtLocal: '',
+    description: '', kind: 'task', submitting: false, error: null,
+  };
+  render();
+  if (typeof tgShowToast === 'function') {
+    tgShowToast(`Added "${summary.slice(0, 60)}"`, 'ok');
+  }
+  if (state.view === 'tasks' && typeof refreshTasks === 'function') {
+    try { await refreshTasks(); } catch (_e) {}
+  }
+  return result;
 }
 
 function renderTriageView() {
@@ -1890,6 +2085,7 @@ function renderTopbar() {
       <span class="sync-slot">${syncBadge}</span>
       ${rolePill}
       ${businesses}${moreBiz}
+      <button class="tg-iconbtn tg-iconbtn-add" id="tg-add-btn" title="Quick add (Q)" aria-label="Quick add">+</button>
       <button class="tg-iconbtn" id="tg-help-btn" title="Keyboard shortcuts (?)" aria-label="Shortcuts">?</button>
     </header>`;
 }
@@ -1903,6 +2099,8 @@ function renderAppShell(viewContent) {
         <div class="tg-content">${viewContent}</div>
       </div>
       ${renderBottomNav()}
+      ${typeof tgRenderQuickAddModal === 'function' ? tgRenderQuickAddModal() : ''}
+      <button class="tg-fab" id="tg-fab" aria-label="Quick add (Q)" title="Quick add (Q)">+</button>
     </div>`;
 }
 
@@ -4526,11 +4724,30 @@ function _ui1TogglePalette() {
 
 function _ui1HandleKey(e) {
   // Bail on typing targets.
-  if (_ui1IsTypingTarget(e.target)) return;
+  if (_ui1IsTypingTarget(e.target)) {
+    // Special-case: Enter inside the Quick Add modal submits.
+    if (e.key === 'Enter'
+        && state.quickAdd && state.quickAdd.open
+        && e.target && e.target.id !== 'tg-qa-description') {
+      e.preventDefault();
+      _tgSubmitQuickAdd();
+    }
+    return;
+  }
   // Don't intercept browser shortcuts that include modifiers we
   // don't own (Alt, Meta+X for cut, etc.) unless we explicitly want
   // them.
   const isMeta = e.ctrlKey || e.metaKey;
+
+  // Q opens Quick Add from any view (works on Tasks, SOPs, Settings,
+  // Triage). Skipped if a modal is already open.
+  if ((e.key === 'q' || e.key === 'Q') && !isMeta) {
+    if (state.quickAdd && state.quickAdd.open) return;
+    if (state.review && (state.review.rejectModal || state.review.snoozeModal)) return;
+    e.preventDefault();
+    tgOpenQuickAdd();
+    return;
+  }
 
   // Handle the 'g <next>' two-key sequence first.
   if (_UI1.gPending) {
@@ -4557,6 +4774,13 @@ function _ui1HandleKey(e) {
   if (e.key === 'Escape') {
     if (_UI1.shortcutsOpen) { _ui1ToggleShortcutsOverlay(); e.preventDefault(); return; }
     if (_UI1.paletteOpen) { _ui1TogglePalette(); e.preventDefault(); return; }
+    if (state.quickAdd && state.quickAdd.open && !state.quickAdd.submitting) {
+      state.quickAdd.open = false;
+      state.quickAdd.error = null;
+      e.preventDefault();
+      render();
+      return;
+    }
     if (state.view === 'review') {
       let changed = false;
       // Modals first (any open one), in priority order
@@ -5000,6 +5224,31 @@ document.addEventListener('click', function (e) {
   if (btn) {
     e.preventDefault();
     if (typeof _ui1ToggleShortcutsOverlay === 'function') _ui1ToggleShortcutsOverlay();
+    return;
+  }
+  // Topbar + button or floating action button -> open Quick Add.
+  const addBtn = e.target && e.target.closest
+    && (e.target.closest('#tg-add-btn') || e.target.closest('#tg-fab'));
+  if (addBtn) {
+    e.preventDefault();
+    tgOpenQuickAdd();
+    return;
+  }
+  // Quick Add modal interactions
+  if (state.quickAdd && state.quickAdd.open) {
+    if (e.target.closest('[data-tg-qa-cancel]')
+        || (e.target.matches && e.target.matches('[data-tg-qa-backdrop]'))) {
+      if (state.quickAdd.submitting) return;
+      state.quickAdd.open = false;
+      state.quickAdd.error = null;
+      render();
+      return;
+    }
+    if (e.target.closest('[data-tg-qa-submit]')) {
+      e.preventDefault();
+      _tgSubmitQuickAdd();
+      return;
+    }
   }
 });
 
