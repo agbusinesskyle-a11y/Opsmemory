@@ -44,7 +44,11 @@ log = logging.getLogger("opsmemory.main")
 
 CSP_HEADER = (
     "default-src 'self'; "
-    "script-src 'self'; "
+    # Cloudflare auto-injects /cdn-cgi/zaraz/* and beacon.min.js from
+    # static.cloudflareinsights.com (Web Analytics). Allowed at the
+    # CSP layer so Chrome stops complaining; the actual analytics
+    # are toggled in the CF dashboard.
+    "script-src 'self' https://static.cloudflareinsights.com; "
     # 'unsafe-inline' for style-src: the PWA renders inline width/
     # color hints in dynamic templates (confidence bars, validation
     # error chips, etc.) and uses element.style.X = Y for surgical
