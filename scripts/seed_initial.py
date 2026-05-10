@@ -54,6 +54,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BUSINESS_IDS = {
     "redhot": "00000000-0000-0000-0000-000000000201",
     "borderline": "00000000-0000-0000-0000-000000000202",
+    # Phase MT-1 (2026-05-10): Conway Feed onboarded as a peer
+    # tenant. Caleb Noriega's business_membership row is in
+    # .local/owners.json — slug must match the businesses.id seeded
+    # by 0021_conway_feed_business.sql.
+    "conway-feed": "00000000-0000-0000-0000-000000000203",
 }
 
 
