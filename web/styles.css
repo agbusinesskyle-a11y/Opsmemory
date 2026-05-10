@@ -2063,13 +2063,19 @@ html, body {
   margin: 12px 0 6px;
 }
 
-/* Phase UI-2B3-2: Dedup confirm modal stacked on Quick Add */
+/* Phase UI-2B3-2 + B3-3: Dedup confirm modal stacked on Quick Add */
 .tg-dedup-wrap { z-index: 70; background: rgba(0,0,0,.72); }
-.tg-dedup-modal { width: 520px; max-width: calc(100vw - 32px); }
+.tg-dedup-modal { width: 560px; max-width: calc(100vw - 32px); }
 .tg-dedup-intro { color: var(--tg-fg-mut); font-size: 12.5px; margin: 0 0 8px; }
 .tg-dedup-list { display: flex; flex-direction: column; gap: 6px; }
+
+/* B3-3: candidate row is a flex grid (number badge | summary+meta | open CTA)
+   so the click affordance reads as obvious. */
 .tg-dedup-row {
-  display: flex; flex-direction: column; gap: 4px;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
   text-align: left;
   background: var(--tg-bg);
   border: 1px solid var(--tg-bd-soft);
@@ -2077,16 +2083,86 @@ html, body {
   padding: 10px 12px;
   border-radius: 6px;
   cursor: pointer;
+  font: inherit;
+  width: 100%;
 }
-.tg-dedup-row:hover {
+.tg-dedup-row:hover, .tg-dedup-row:focus-visible {
   background: var(--tg-bg-row-foc);
-  border-color: var(--tg-fg-faint);
+  border-color: var(--tg-acc-bd);
+  outline: 0;
 }
-.tg-dedup-summary { font-size: 13px; font-weight: 500; color: var(--tg-fg); }
-.tg-dedup-meta { font-size: 11px; color: var(--tg-fg-mut); }
+.tg-dedup-num {
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  background: var(--tg-bg-elev2);
+  border: 1px solid var(--tg-bd-soft);
+  display: inline-flex;
+  align-items: center; justify-content: center;
+  font-weight: 600; font-size: 12px;
+  color: var(--tg-fg-mut);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 24px;
+}
+.tg-dedup-row:hover .tg-dedup-num { color: var(--tg-fg); border-color: var(--tg-acc-bd); background: var(--tg-acc-soft); }
+.tg-dedup-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tg-dedup-summary {
+  font-size: 13.5px; font-weight: 500; color: var(--tg-fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tg-dedup-meta {
+  font-size: 11px; color: var(--tg-fg-mut);
+  display: flex; gap: 8px; align-items: center;
+  flex-wrap: wrap;
+}
+.tg-dedup-status {
+  text-transform: uppercase; letter-spacing: .04em;
+  font-size: 10px; padding: 1px 6px; border-radius: 8px;
+  background: var(--tg-bg-elev2); color: var(--tg-fg-mut);
+}
+.tg-dedup-due {
+  font-size: 10.5px; padding: 1px 6px; border-radius: 8px;
+  background: var(--tg-c-amb-bg); color: var(--tg-c-amb);
+}
+.tg-dedup-activity { font-size: 11px; color: var(--tg-fg-dim); }
+.tg-dedup-cta {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 10px; border-radius: 6px;
+  background: var(--tg-bg-elev2);
+  border: 1px solid var(--tg-bd-soft);
+  color: var(--tg-fg-mut);
+  font-size: 12px; font-weight: 500;
+  flex: 0 0 auto;
+}
+.tg-dedup-row:hover .tg-dedup-cta {
+  color: #fff; background: var(--tg-acc); border-color: var(--tg-acc);
+}
+.tg-dedup-row:hover .tg-dedup-cta .tg-pill-kbd {
+  background: rgba(255,255,255,.18); border-color: transparent; color: #fff;
+}
+
 .tg-qa-hint {
   font-size: 11px; color: var(--tg-fg-dim); font-weight: 400;
   margin-left: 6px;
+}
+
+/* B3-3: due/when quick-pick chips */
+.tg-qa-due-chips {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 6px;
+}
+.tg-qa-chip {
+  font: inherit; font-size: 11.5px;
+  padding: 4px 10px; border-radius: 13px;
+  background: var(--tg-bg-elev2);
+  border: 1px solid var(--tg-bd-soft);
+  color: var(--tg-fg-mut);
+  cursor: pointer; line-height: 1.2;
+}
+.tg-qa-chip:hover { color: var(--tg-fg); border-color: var(--tg-fg-faint); }
+.tg-qa-chip.on {
+  background: var(--tg-acc-soft);
+  border-color: var(--tg-acc-bd);
+  color: var(--tg-fg);
 }
 
 /* Phase UI-2B2: Quick Add modal layout + FAB */

@@ -1262,14 +1262,56 @@ function tgOpenQuickAdd() {
   if (defaultSlug) _tgLoadMembers(defaultSlug);
 }
 
+// Surgical update of the assignee dropdown WITHOUT re-rendering
+// the whole modal. Codex/Kyle B3-2-fix blocker: a full render()
+// destroys the active <input> element, dropping focus and (on
+// mobile) dismissing the soft keyboard while the operator is mid-
+// type. By rebuilding only #tg-qa-owner and the hint span we keep
+// the summary/notes/due inputs alive across the async member load.
+function _tgUpdateOwnerDropdown() {
+  const q = state.quickAdd;
+  if (!q || !q.open) return;
+  const sel = document.getElementById('tg-qa-owner');
+  if (!sel) return;
+  const p = state.principal || {};
+  const principalId = p.id;
+  const meRow = q.members.find(m => m.id === principalId);
+  const others = q.members.filter(m => m.id !== principalId);
+  const meLabel = meRow ? `${meRow.display_name} (me)` : 'Me';
+  sel.innerHTML = `
+    <option value="" ${q.ownerUserId === '' ? 'selected' : ''}>— Unassigned —</option>
+    ${meRow ? `<option value="${escapeHtml(principalId)}" ${q.ownerUserId === principalId ? 'selected' : ''}>${escapeHtml(meLabel)}</option>` : ''}
+    ${others.map(m => `
+      <option value="${escapeHtml(m.id)}" ${q.ownerUserId === m.id ? 'selected' : ''}>
+        ${escapeHtml(m.display_name)}
+      </option>
+    `).join('')}
+  `;
+  // Hint span next to the field label.
+  const hintSpan = document.querySelector('.tg-qa-hint');
+  if (hintSpan) {
+    if (q.membersLoading) {
+      hintSpan.textContent = 'loading members…';
+      hintSpan.style.display = '';
+    } else if (q.members.length === 0 && q.businessSlug) {
+      hintSpan.textContent = 'no members in this business yet';
+      hintSpan.style.display = '';
+    } else {
+      hintSpan.textContent = '';
+      hintSpan.style.display = 'none';
+    }
+  }
+}
+
 async function _tgLoadMembers(slug) {
   if (!slug) {
     state.quickAdd.members = [];
+    _tgUpdateOwnerDropdown();
     return;
   }
   state.quickAdd.membersLoading = true;
   state.quickAdd.members = [];
-  render();
+  _tgUpdateOwnerDropdown();   // surgical update; preserves focus.
   try {
     const data = await api(`/v1/businesses/${encodeURIComponent(slug)}/members`);
     // Only apply if the modal is still on the same business — the
@@ -1285,16 +1327,50 @@ async function _tgLoadMembers(slug) {
     }
   } catch (e) {
     if (state.quickAdd.businessSlug === slug) {
-      // Surface as a non-fatal warning — operator can still submit
-      // without picking an assignee (server defaults to creator).
       console.warn('failed to load business members:', e);
     }
   } finally {
     if (state.quickAdd.businessSlug === slug) {
       state.quickAdd.membersLoading = false;
-      render();
+      _tgUpdateOwnerDropdown();   // surgical update; preserves focus.
     }
   }
+}
+
+// Compute datetime-local string for "today at hour:minute" / "+N days
+// at hour:minute" anchored to the operator's local timezone.
+function _tgDueChipPresets() {
+  const now = new Date();
+  function localISO(d) {
+    // datetime-local wants "YYYY-MM-DDTHH:MM" in LOCAL time, no Z.
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+         + `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  function nextAt(hour, minute, dayOffset) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + dayOffset);
+    d.setHours(hour, minute, 0, 0);
+    return d;
+  }
+  // Today 5pm — but if it's already past 5pm, hop to tomorrow 9am.
+  const today5 = nextAt(17, 0, 0);
+  const todayLabel = today5 > now ? 'Today 5pm' : 'Tomorrow 9am';
+  const todayValue = today5 > now ? today5 : nextAt(9, 0, 1);
+  // Next Mon 9am — if today IS Monday, jump 7 days.
+  const dow = now.getDay();
+  const daysToMon = ((1 - dow + 7) % 7) || 7;
+  const nextMon = nextAt(9, 0, daysToMon);
+  // +1 hour from now, rounded to the next 5-min mark for tidiness.
+  const oneHour = new Date(now.getTime() + 60 * 60 * 1000);
+  oneHour.setMinutes(Math.ceil(oneHour.getMinutes() / 5) * 5, 0, 0);
+  return [
+    { key: '1h',   label: '+1 hour',     value: localISO(oneHour) },
+    { key: 'tod',  label: todayLabel,    value: localISO(todayValue) },
+    { key: 'tom',  label: 'Tomorrow 9am', value: localISO(nextAt(9, 0, 1)) },
+    { key: 'mon',  label: 'Mon 9am',     value: localISO(nextMon) },
+    { key: 'none', label: 'No due',      value: '' },
+  ];
 }
 
 function tgRenderQuickAddModal() {
@@ -1338,9 +1414,13 @@ function tgRenderQuickAddModal() {
   // The primary modal is hidden behind the dedup confirm (when
   // present) so the dedup decision feels modal-on-modal — operator
   // resolves dedup before they can edit the form again.
+  // When dedup is showing, mark the underlying form `inert` so Tab
+  // doesn't reach focusable elements behind the overlay (Codex B3-3
+  // blocker).
   const dedupBlock = q.dedup ? tgRenderDedupConfirm(q.dedup) : '';
+  const inertAttr = q.dedup ? 'inert aria-hidden="true"' : '';
   return `
-    <div class="tg-modal-wrap" data-tg-qa-backdrop>
+    <div class="tg-modal-wrap" data-tg-qa-backdrop ${inertAttr}>
       <div class="tg-modal" role="dialog" aria-label="Quick Add">
         <div class="tg-modal-h">
           Quick add
@@ -1373,6 +1453,15 @@ function tgRenderQuickAddModal() {
                      value="${escapeHtml(q.dueAtLocal || '')}">
             </div>
           </div>
+          <div class="tg-qa-due-chips">
+            ${_tgDueChipPresets().map(p => `
+              <button type="button" class="tg-qa-chip"
+                      data-tg-qa-due-chip="${escapeHtml(p.value)}"
+                      title="${escapeHtml(p.label)}">
+                ${escapeHtml(p.label)}
+              </button>
+            `).join('')}
+          </div>
           <div>
             <div class="tg-field-lbl">Assigned to ${ownerHint}</div>
             <select id="tg-qa-owner">${ownerOptions}</select>
@@ -1401,17 +1490,34 @@ function tgRenderDedupConfirm(dedup) {
   // candidates that look like duplicates and decides whether to
   // navigate to one (Use existing), commit anyway (Add anyway), or
   // cancel back to the Quick Add form.
+  //
+  // UX (B3-3): each row is a flex grid with a clear summary, meta
+  // line, and an explicit "Open" pill on the right so the click
+  // affordance reads as obvious. Number keys 1-5 also pick rows.
   const candidates = dedup.candidates || [];
-  const rows = candidates.map(c => {
+  const rows = candidates.map((c, i) => {
     const ts = c.last_activity_at
       ? fmtDate(c.last_activity_at).split(',')[0]
       : '';
+    const dueChip = c.due_at
+      ? `<span class="tg-dedup-due">due ${escapeHtml(fmtDate(c.due_at).split(',')[0])}</span>`
+      : '';
     return `
-      <button class="tg-dedup-row" data-tg-dedup-pick="${escapeHtml(c.id)}">
-        <div class="tg-dedup-summary">${escapeHtml(c.summary || '')}</div>
-        <div class="tg-dedup-meta">
-          ${escapeHtml(c.status || '')} · last activity ${escapeHtml(ts)}
-        </div>
+      <button class="tg-dedup-row" data-tg-dedup-pick="${escapeHtml(c.id)}"
+              aria-label="Open ${escapeHtml(c.summary || '')}">
+        <span class="tg-dedup-num">${i + 1}</span>
+        <span class="tg-dedup-body">
+          <span class="tg-dedup-summary">${escapeHtml(c.summary || '')}</span>
+          <span class="tg-dedup-meta">
+            <span class="tg-dedup-status">${escapeHtml(c.status || '')}</span>
+            ${dueChip}
+            <span class="tg-dedup-activity">last activity ${escapeHtml(ts)}</span>
+          </span>
+        </span>
+        <span class="tg-dedup-cta">
+          Open
+          <span class="tg-pill-kbd">${i + 1}</span>
+        </span>
       </button>
     `;
   }).join('');
@@ -1423,12 +1529,12 @@ function tgRenderDedupConfirm(dedup) {
           <span class="small">${candidates.length} match${candidates.length === 1 ? '' : 'es'}</span>
         </div>
         <div class="tg-modal-b">
-          <p class="tg-dedup-intro">Pick one to navigate to it, or add a new task anyway.</p>
+          <p class="tg-dedup-intro">Pick a row (or press its number) to open it, or add a new task anyway.</p>
           <div class="tg-dedup-list">${rows}</div>
         </div>
         <div class="tg-modal-f">
-          <button class="tg-btn" data-tg-dedup-cancel>Back</button>
-          <button class="tg-btn primary" data-tg-dedup-force>Add anyway</button>
+          <button class="tg-btn" data-tg-dedup-cancel>Back <span class="tg-pill-kbd">Esc</span></button>
+          <button class="tg-btn primary" data-tg-dedup-force>Add anyway <span class="tg-pill-kbd">N</span></button>
         </div>
       </div>
     </div>
@@ -1506,6 +1612,14 @@ async function _tgSubmitQuickAdd() {
       };
       state.quickAdd.submitting = false;
       render();
+      // Focus the first dedup row so Tab/Shift-Tab cycles candidates
+      // and number keys 1-5 fire from a body-focused element (the
+      // typing-target bail does not eat them either way — handler is
+      // above the bail — but explicit focus is the right UX).
+      requestAnimationFrame(() => {
+        const first = document.querySelector('.tg-dedup-row');
+        if (first) first.focus();
+      });
       return;
     }
     previewToken = preview && preview.preview_token;
@@ -1559,6 +1673,12 @@ async function _tgCommitQuickAdd({ snap, dueAtIso, previewToken,
         previewToken: null,  // force operator decision; no token replay
       };
       render();
+      // Match the preview-success path: focus the first row so
+      // 1-5 / Tab / Enter all work.
+      requestAnimationFrame(() => {
+        const first = document.querySelector('.tg-dedup-row');
+        if (first) first.focus();
+      });
       return;
     }
     state.quickAdd.error = (e && e.message) || 'Quick add failed';
@@ -2279,17 +2399,24 @@ function renderTopbar() {
 }
 
 function renderAppShell(viewContent) {
+  // Codex B3-3 blocker: when the Quick Add dedup confirm is open,
+  // mark .tg-app inert so Tab cannot escape into the underlying
+  // app chrome (rail, topbar, FAB). Quick Add + dedup live as
+  // siblings to .tg-app so they're reachable when .tg-app is inert.
+  const dedupOpen = !!(state.quickAdd && state.quickAdd.open
+                       && state.quickAdd.dedup);
+  const appInert = dedupOpen ? 'inert aria-hidden="true"' : '';
   return `
-    <div class="tg-app">
+    <div class="tg-app" ${appInert}>
       ${renderRail()}
       <div class="tg-main">
         ${renderTopbar()}
         <div class="tg-content">${viewContent}</div>
       </div>
       ${renderBottomNav()}
-      ${typeof tgRenderQuickAddModal === 'function' ? tgRenderQuickAddModal() : ''}
       <button class="tg-fab" id="tg-fab" aria-label="Quick add (Q)" title="Quick add (Q)">+</button>
-    </div>`;
+    </div>
+    ${typeof tgRenderQuickAddModal === 'function' ? tgRenderQuickAddModal() : ''}`;
 }
 
 function render() {
@@ -4911,11 +5038,76 @@ function _ui1TogglePalette() {
 }
 
 function _ui1HandleKey(e) {
+  const isMeta = e.ctrlKey || e.metaKey;
+
+  // Codex B3-3 blocker: dedup modal keys (1-5 pick row, N add anyway,
+  // Esc back) must fire ABOVE the typing-target bail. Otherwise an
+  // operator who left focus on the underlying summary input gets
+  // their keystrokes eaten by the input. preventDefault() prevents
+  // the digit/letter from also inserting into the focused input.
+  if (state.quickAdd && state.quickAdd.open && state.quickAdd.dedup
+      && !isMeta) {
+    const dedup = state.quickAdd.dedup;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      state.quickAdd.dedup = null;
+      render();
+      return;
+    }
+    if (e.key >= '1' && e.key <= '5') {
+      const idx = parseInt(e.key, 10) - 1;
+      const cand = (dedup.candidates || [])[idx];
+      if (cand) {
+        e.preventDefault();
+        e.stopPropagation();
+        const taskId = cand.id;
+        state.quickAdd = {
+          open: false, summary: '', businessSlug: '', dueAtLocal: '',
+          description: '', kind: 'task', submitting: false, error: null,
+          ownerUserId: '', members: [], membersLoading: false, dedup: null,
+        };
+        state.view = 'tasks';
+        try { window.history.replaceState(null, '',
+                                          `/?task=${encodeURIComponent(taskId)}`); }
+        catch (_e) {}
+        render();
+        if (typeof refreshTasks === 'function') {
+          refreshTasks().then(() => {
+            if (typeof _autoExpandDeepLinkedTask === 'function') {
+              _autoExpandDeepLinkedTask(taskId).catch(() => {});
+            }
+          }).catch(() => {});
+        }
+        if (typeof tgShowToast === 'function') {
+          tgShowToast('Opened existing task', 'ok');
+        }
+        return;
+      }
+    }
+    if (e.key === 'n' || e.key === 'N') {
+      e.preventDefault();
+      e.stopPropagation();
+      const previewToken = dedup.previewToken;
+      state.quickAdd.dedup = null;
+      const snap = _tgSnapshotQuickAddForm();
+      let dueAtIso = null;
+      if (snap.dueAtLocal) {
+        const d = new Date(snap.dueAtLocal);
+        if (!Number.isNaN(d.getTime())) dueAtIso = d.toISOString();
+      }
+      _tgCommitQuickAdd({ snap, dueAtIso, previewToken,
+                          forceCreate: true });
+      return;
+    }
+  }
+
   // Bail on typing targets.
   if (_ui1IsTypingTarget(e.target)) {
     // Special-case: Enter inside the Quick Add modal submits.
     if (e.key === 'Enter'
         && state.quickAdd && state.quickAdd.open
+        && !state.quickAdd.dedup
         && e.target && e.target.id !== 'tg-qa-description') {
       e.preventDefault();
       _tgSubmitQuickAdd();
@@ -4925,7 +5117,6 @@ function _ui1HandleKey(e) {
   // Don't intercept browser shortcuts that include modifiers we
   // don't own (Alt, Meta+X for cut, etc.) unless we explicitly want
   // them.
-  const isMeta = e.ctrlKey || e.metaKey;
 
   // Q opens Quick Add from any view (works on Tasks, SOPs, Settings,
   // Triage). Skipped if a modal is already open.
@@ -4936,6 +5127,9 @@ function _ui1HandleKey(e) {
     tgOpenQuickAdd();
     return;
   }
+
+  // (Dedup modal keys handled at top of this function above the
+  // typing-target bail.)
 
   // Handle the 'g <next>' two-key sequence first.
   if (_UI1.gPending) {
@@ -5422,6 +5616,22 @@ document.addEventListener('click', function (e) {
     tgOpenQuickAdd();
     return;
   }
+  // Due/when quick-pick chips — clicking sets datetime-local input
+  // value AND state.quickAdd.dueAtLocal without re-rendering (focus
+  // stays where the operator put it).
+  const dueChip = e.target.closest && e.target.closest('[data-tg-qa-due-chip]');
+  if (dueChip && state.quickAdd && state.quickAdd.open) {
+    e.preventDefault();
+    const value = dueChip.dataset.tgQaDueChip || '';
+    state.quickAdd.dueAtLocal = value;
+    const inp = document.getElementById('tg-qa-due');
+    if (inp) inp.value = value;
+    // Visual: mark active chip.
+    document.querySelectorAll('.tg-qa-chip').forEach(el => el.classList.remove('on'));
+    dueChip.classList.add('on');
+    return;
+  }
+
   // Quick Add modal interactions
   if (state.quickAdd && state.quickAdd.open) {
     // Dedup confirm modal — handled FIRST because it sits on top.
