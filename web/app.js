@@ -5154,8 +5154,14 @@ function _ui1HandleKey(e) {
 
   // Bail on typing targets.
   if (_ui1IsTypingTarget(e.target)) {
-    // Special-case: Enter inside the Quick Add modal submits.
-    if (e.key === 'Enter'
+    // Quick Add submit shortcut: Cmd/Ctrl+Enter only. Plain Enter
+    // is intentionally NOT a submit — iOS keyboard's "return" key
+    // fires Enter, which used to auto-submit the form. The submit
+    // would take ~5s on a slow link and then close the modal,
+    // which to the operator looked like "I typed something and
+    // after 5 seconds it just disappeared." Operators tap the
+    // explicit Add button (or use Cmd/Ctrl+Enter on desktop).
+    if (e.key === 'Enter' && isMeta
         && state.quickAdd && state.quickAdd.open
         && !state.quickAdd.dedup
         && e.target && e.target.id !== 'tg-qa-description') {
