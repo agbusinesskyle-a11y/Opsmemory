@@ -61,6 +61,11 @@ const state = {
     kind: 'task',                            // 'task' | 'event'
     submitting: false,
     error: null,
+    // B3-2 additions
+    ownerUserId: '',                         // '' = unassigned (default to creator at submit)
+    members: [],                             // [{id, display_name, role}]
+    membersLoading: false,
+    dedup: null,                             // null | { candidates: [...], previewToken: "..." }
   },
   // SOPs view (chunk 7 step 4 — admin-only).
   sops: {
@@ -1239,6 +1244,10 @@ function tgOpenQuickAdd() {
     kind: 'task',
     submitting: false,
     error: null,
+    ownerUserId: '',
+    members: [],
+    membersLoading: false,
+    dedup: null,
   };
   render();
   // Focus the title input on next tick so the operator can start
@@ -1248,6 +1257,44 @@ function tgOpenQuickAdd() {
     const el = document.getElementById('tg-qa-summary');
     if (el) el.focus();
   });
+  // Kick off member load for the default business so the assignee
+  // dropdown is populated by the time the operator tabs to it.
+  if (defaultSlug) _tgLoadMembers(defaultSlug);
+}
+
+async function _tgLoadMembers(slug) {
+  if (!slug) {
+    state.quickAdd.members = [];
+    return;
+  }
+  state.quickAdd.membersLoading = true;
+  state.quickAdd.members = [];
+  render();
+  try {
+    const data = await api(`/v1/businesses/${encodeURIComponent(slug)}/members`);
+    // Only apply if the modal is still on the same business — the
+    // operator may have switched while the request was in flight.
+    if (state.quickAdd.businessSlug === slug) {
+      state.quickAdd.members = data.members || [];
+      // Default ownerUserId = creator if creator is a member.
+      const principalId = state.principal && state.principal.id;
+      if (!state.quickAdd.ownerUserId
+          && state.quickAdd.members.some(m => m.id === principalId)) {
+        state.quickAdd.ownerUserId = principalId;
+      }
+    }
+  } catch (e) {
+    if (state.quickAdd.businessSlug === slug) {
+      // Surface as a non-fatal warning — operator can still submit
+      // without picking an assignee (server defaults to creator).
+      console.warn('failed to load business members:', e);
+    }
+  } finally {
+    if (state.quickAdd.businessSlug === slug) {
+      state.quickAdd.membersLoading = false;
+      render();
+    }
+  }
 }
 
 function tgRenderQuickAddModal() {
@@ -1264,10 +1311,34 @@ function tgRenderQuickAddModal() {
       ${escapeHtml(b.name || b.slug)}
     </option>
   `).join('');
+  // Assignee options: principal's display name as "Me" first, then
+  // other business members. Empty string == unassigned.
+  const principalId = p.id;
+  const meRow = q.members.find(m => m.id === principalId);
+  const others = q.members.filter(m => m.id !== principalId);
+  const meLabel = meRow ? `${meRow.display_name} (me)` : 'Me';
+  const ownerOptions = `
+    <option value="" ${q.ownerUserId === '' ? 'selected' : ''}>— Unassigned —</option>
+    ${meRow ? `<option value="${escapeHtml(principalId)}" ${q.ownerUserId === principalId ? 'selected' : ''}>${escapeHtml(meLabel)}</option>` : ''}
+    ${others.map(m => `
+      <option value="${escapeHtml(m.id)}" ${q.ownerUserId === m.id ? 'selected' : ''}>
+        ${escapeHtml(m.display_name)}
+      </option>
+    `).join('')}
+  `;
+  const ownerHint = q.membersLoading
+    ? '<span class="tg-qa-hint">loading members…</span>'
+    : (q.members.length === 0 && q.businessSlug
+       ? '<span class="tg-qa-hint">no members in this business yet</span>'
+       : '');
   const errorBlock = q.error
     ? `<div class="tg-qa-error">${escapeHtml(q.error)}</div>`
     : '';
   const submitDisabled = q.submitting ? 'disabled' : '';
+  // The primary modal is hidden behind the dedup confirm (when
+  // present) so the dedup decision feels modal-on-modal — operator
+  // resolves dedup before they can edit the form again.
+  const dedupBlock = q.dedup ? tgRenderDedupConfirm(q.dedup) : '';
   return `
     <div class="tg-modal-wrap" data-tg-qa-backdrop>
       <div class="tg-modal" role="dialog" aria-label="Quick Add">
@@ -1303,6 +1374,10 @@ function tgRenderQuickAddModal() {
             </div>
           </div>
           <div>
+            <div class="tg-field-lbl">Assigned to ${ownerHint}</div>
+            <select id="tg-qa-owner">${ownerOptions}</select>
+          </div>
+          <div>
             <div class="tg-field-lbl">Notes (optional)</div>
             <textarea id="tg-qa-description" maxlength="8192"
                       placeholder="Anything else useful here…">${escapeHtml(q.description || '')}</textarea>
@@ -1311,97 +1386,196 @@ function tgRenderQuickAddModal() {
         <div class="tg-modal-f">
           <button class="tg-btn" data-tg-qa-cancel ${submitDisabled}>Cancel</button>
           <button class="tg-btn primary" data-tg-qa-submit ${submitDisabled}>
-            ${q.submitting ? 'Adding…' : 'Add'}
+            ${q.submitting ? 'Checking…' : 'Add'}
             <span class="tg-pill-kbd">↵</span>
           </button>
+        </div>
+      </div>
+    </div>
+    ${dedupBlock}
+  `;
+}
+
+function tgRenderDedupConfirm(dedup) {
+  // Secondary modal stacked over Quick Add. Operator sees up to 5
+  // candidates that look like duplicates and decides whether to
+  // navigate to one (Use existing), commit anyway (Add anyway), or
+  // cancel back to the Quick Add form.
+  const candidates = dedup.candidates || [];
+  const rows = candidates.map(c => {
+    const ts = c.last_activity_at
+      ? fmtDate(c.last_activity_at).split(',')[0]
+      : '';
+    return `
+      <button class="tg-dedup-row" data-tg-dedup-pick="${escapeHtml(c.id)}">
+        <div class="tg-dedup-summary">${escapeHtml(c.summary || '')}</div>
+        <div class="tg-dedup-meta">
+          ${escapeHtml(c.status || '')} · last activity ${escapeHtml(ts)}
+        </div>
+      </button>
+    `;
+  }).join('');
+  return `
+    <div class="tg-modal-wrap tg-dedup-wrap" data-tg-dedup-backdrop>
+      <div class="tg-modal tg-dedup-modal" role="dialog" aria-label="Possible duplicate">
+        <div class="tg-modal-h">
+          Looks like an existing task
+          <span class="small">${candidates.length} match${candidates.length === 1 ? '' : 'es'}</span>
+        </div>
+        <div class="tg-modal-b">
+          <p class="tg-dedup-intro">Pick one to navigate to it, or add a new task anyway.</p>
+          <div class="tg-dedup-list">${rows}</div>
+        </div>
+        <div class="tg-modal-f">
+          <button class="tg-btn" data-tg-dedup-cancel>Back</button>
+          <button class="tg-btn primary" data-tg-dedup-force>Add anyway</button>
         </div>
       </div>
     </div>
   `;
 }
 
-async function _tgSubmitQuickAdd() {
+function _tgSnapshotQuickAddForm() {
+  // Snapshot DOM values into state. Returns the snapshotted shape
+  // (so callers don't have to re-read state right after).
   const q = state.quickAdd;
-  if (!q || !q.open || q.submitting) return;
-  // Snapshot values from the live DOM (in case the operator edited
-  // a field but the input handler hasn't fired yet — Submit happens
-  // at the same tick on Enter).
   const sumEl = document.getElementById('tg-qa-summary');
   const bizEl = document.getElementById('tg-qa-business');
   const dueEl = document.getElementById('tg-qa-due');
   const descEl = document.getElementById('tg-qa-description');
   const kindEl = document.getElementById('tg-qa-kind');
+  const ownerEl = document.getElementById('tg-qa-owner');
   const summary = (sumEl ? sumEl.value : q.summary).trim();
   const businessSlug = (bizEl ? bizEl.value : q.businessSlug);
   const dueAtLocal = dueEl ? dueEl.value : q.dueAtLocal;
   const description = (descEl ? descEl.value : q.description).trim();
   const kind = kindEl ? kindEl.value : q.kind;
-  if (!summary) {
-    state.quickAdd.error = 'Title is required';
-    state.quickAdd.summary = summary;
-    render();
-    return;
-  }
-  if (!businessSlug) {
-    state.quickAdd.error = 'Pick a business';
-    render();
-    return;
-  }
-  // datetime-local gives a naive local string; convert to ISO UTC.
-  let dueAtIso = null;
-  if (dueAtLocal) {
-    const d = new Date(dueAtLocal);
-    if (!Number.isNaN(d.getTime())) dueAtIso = d.toISOString();
-  }
-  state.quickAdd.submitting = true;
-  state.quickAdd.error = null;
+  const ownerUserId = ownerEl ? ownerEl.value : q.ownerUserId;
   state.quickAdd.summary = summary;
   state.quickAdd.businessSlug = businessSlug;
   state.quickAdd.dueAtLocal = dueAtLocal;
   state.quickAdd.description = description;
   state.quickAdd.kind = kind;
+  state.quickAdd.ownerUserId = ownerUserId;
+  return { summary, businessSlug, dueAtLocal, description, kind, ownerUserId };
+}
+
+async function _tgSubmitQuickAdd() {
+  const q = state.quickAdd;
+  if (!q || !q.open || q.submitting) return;
+  const snap = _tgSnapshotQuickAddForm();
+  if (!snap.summary) {
+    state.quickAdd.error = 'Title is required';
+    render();
+    return;
+  }
+  if (!snap.businessSlug) {
+    state.quickAdd.error = 'Pick a business';
+    render();
+    return;
+  }
+  let dueAtIso = null;
+  if (snap.dueAtLocal) {
+    const d = new Date(snap.dueAtLocal);
+    if (!Number.isNaN(d.getTime())) dueAtIso = d.toISOString();
+  }
+  state.quickAdd.submitting = true;
+  state.quickAdd.error = null;
+  render();
+
+  // ----- Step 1: preview (deterministic, no LLM, sub-second) -----
+  let previewToken = null;
+  try {
+    const preview = await api('/v1/tasks/preview', {
+      method: 'POST',
+      body: {
+        summary: snap.summary,
+        business_slug: snap.businessSlug,
+        due_at: dueAtIso,
+      },
+    });
+    if (preview && Array.isArray(preview.candidates)
+        && preview.candidates.length > 0) {
+      // Surface the dedup modal. submitting=false so the form is
+      // editable again after the operator backs out. The actual
+      // create POST happens after they pick "Add anyway" or
+      // "Use existing".
+      state.quickAdd.dedup = {
+        candidates: preview.candidates,
+        previewToken: preview.preview_token,
+      };
+      state.quickAdd.submitting = false;
+      render();
+      return;
+    }
+    previewToken = preview && preview.preview_token;
+  } catch (e) {
+    // Preview failure is non-fatal — fall through to commit. The
+    // server will still re-run retrieve at commit time if we send
+    // the token, so dedup safety isn't compromised by a flaky
+    // preview round-trip.
+    console.warn('preview failed, proceeding to direct create:', e);
+  }
+
+  // ----- Step 2: commit -----
+  await _tgCommitQuickAdd({
+    snap, dueAtIso, previewToken, forceCreate: false,
+  });
+}
+
+async function _tgCommitQuickAdd({ snap, dueAtIso, previewToken,
+                                   forceCreate }) {
+  state.quickAdd.submitting = true;
+  state.quickAdd.error = null;
   render();
   let result;
   try {
-    // Phase UI-2B3-1: idempotency_key per submit so retries are safe.
-    // crypto.randomUUID is available in modern browsers and the PWA
-    // service worker; if missing (very old WebView), fall back to a
-    // composite of timestamp + Math.random.
     const idempotencyKey = (typeof crypto !== 'undefined' && crypto.randomUUID)
       ? crypto.randomUUID()
       : `pwa-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     result = await api('/v1/tasks', {
       method: 'POST',
       body: {
-        summary,
-        business_slug: businessSlug,
+        summary: snap.summary,
+        business_slug: snap.businessSlug,
         due_at: dueAtIso,
-        description: description || null,
-        kind,
+        description: snap.description || null,
+        kind: snap.kind,
+        owner_user_id: snap.ownerUserId || null,
         idempotency_key: idempotencyKey,
-        // B3-1 ships without the dedup confirm modal — the PWA
-        // always force_creates so there's no behavior regression
-        // from the B2 direct-write path. The dedup modal lights up
-        // in B3-2 when this flag flips false and preview_token
-        // gets carried.
-        force_create: true,
+        force_create: !!forceCreate,
+        preview_token: previewToken || null,
       },
     });
   } catch (e) {
     state.quickAdd.submitting = false;
+    // Server returned 409 duplicate_candidates_changed — re-show
+    // dedup with the fresh list. The 'body' in api()'s thrown error
+    // shape carries detail.candidates.
+    if (e && e.status === 409 && e.body && e.body.detail
+        && e.body.detail.code === 'duplicate_candidates_changed') {
+      state.quickAdd.dedup = {
+        candidates: e.body.detail.candidates || [],
+        previewToken: null,  // force operator decision; no token replay
+      };
+      render();
+      return;
+    }
     state.quickAdd.error = (e && e.message) || 'Quick add failed';
     render();
     return;
   }
   // Close modal and surface a toast. If the operator is on Tasks,
   // refresh so the new row appears.
+  const addedSummary = (snap && snap.summary) || '';
   state.quickAdd = {
     open: false, summary: '', businessSlug: '', dueAtLocal: '',
     description: '', kind: 'task', submitting: false, error: null,
+    ownerUserId: '', members: [], membersLoading: false, dedup: null,
   };
   render();
   if (typeof tgShowToast === 'function') {
-    tgShowToast(`Added "${summary.slice(0, 60)}"`, 'ok');
+    tgShowToast(`Added "${addedSummary.slice(0, 60)}"`, 'ok');
   }
   if (state.view === 'tasks' && typeof refreshTasks === 'function') {
     try { await refreshTasks(); } catch (_e) {}
@@ -5250,6 +5424,64 @@ document.addEventListener('click', function (e) {
   }
   // Quick Add modal interactions
   if (state.quickAdd && state.quickAdd.open) {
+    // Dedup confirm modal — handled FIRST because it sits on top.
+    const dedup = state.quickAdd.dedup;
+    if (dedup) {
+      if (e.target.closest('[data-tg-dedup-cancel]')
+          || (e.target.matches
+              && e.target.matches('[data-tg-dedup-backdrop]'))) {
+        // Back to the form, keep typed values.
+        state.quickAdd.dedup = null;
+        render();
+        return;
+      }
+      if (e.target.closest('[data-tg-dedup-force]')) {
+        e.preventDefault();
+        const previewToken = dedup.previewToken;
+        state.quickAdd.dedup = null;
+        const snap = _tgSnapshotQuickAddForm();
+        let dueAtIso = null;
+        if (snap.dueAtLocal) {
+          const d = new Date(snap.dueAtLocal);
+          if (!Number.isNaN(d.getTime())) dueAtIso = d.toISOString();
+        }
+        _tgCommitQuickAdd({ snap, dueAtIso, previewToken,
+                            forceCreate: true });
+        return;
+      }
+      const pickBtn = e.target.closest('[data-tg-dedup-pick]');
+      if (pickBtn) {
+        e.preventDefault();
+        const taskId = pickBtn.dataset.tgDedupPick;
+        // Close Quick Add and deep-link into Tasks. The PWA's Tasks
+        // view supports ?task=<id> auto-expand (chunk 6).
+        state.quickAdd = {
+          open: false, summary: '', businessSlug: '', dueAtLocal: '',
+          description: '', kind: 'task', submitting: false, error: null,
+          ownerUserId: '', members: [], membersLoading: false, dedup: null,
+        };
+        state.view = 'tasks';
+        try { window.history.replaceState(null, '',
+                                          `/?task=${encodeURIComponent(taskId)}`); }
+        catch (_e) {}
+        render();
+        if (typeof refreshTasks === 'function') {
+          refreshTasks().then(() => {
+            if (typeof _autoExpandDeepLinkedTask === 'function') {
+              _autoExpandDeepLinkedTask(taskId).catch(() => {});
+            }
+          }).catch(() => {});
+        }
+        if (typeof tgShowToast === 'function') {
+          tgShowToast('Opened existing task', 'ok');
+        }
+        return;
+      }
+      // Dedup modal swallows other clicks so the underlying form
+      // can't be edited until the operator decides.
+      return;
+    }
+
     if (e.target.closest('[data-tg-qa-cancel]')
         || (e.target.matches && e.target.matches('[data-tg-qa-backdrop]'))) {
       if (state.quickAdd.submitting) return;
@@ -5266,10 +5498,56 @@ document.addEventListener('click', function (e) {
   }
 });
 
+// When the operator changes the business in Quick Add, reload the
+// member list so the assignee dropdown reflects the new business.
+// Codex B3-2 blocker: snapshot live form fields BEFORE we re-render,
+// otherwise render() rebuilds the modal from stale state and wipes
+// title/due/notes the operator already typed.
+document.addEventListener('change', function (e) {
+  if (e.target && e.target.id === 'tg-qa-business'
+      && state.quickAdd && state.quickAdd.open) {
+    _tgSnapshotQuickAddForm();   // capture title/due/notes/etc.
+    const newSlug = e.target.value;
+    state.quickAdd.businessSlug = newSlug;
+    state.quickAdd.ownerUserId = '';   // prior pick may not be a
+                                        // member of the new business.
+    _tgLoadMembers(newSlug);
+  }
+});
+
 // Search input on the Triage subtabs row updates state.review.searchQuery
 // without re-rendering on every keystroke (debounce by re-render only
 // on input event; the input keeps focus across renders since React
 // does not own this DOM and the input value is bound from state).
+// Live sync for Quick Add fields. Without this, an async render
+// (e.g. _tgLoadMembers' .finally) rebuilds the modal from stale
+// state and wipes whatever the operator typed in the meantime.
+// We do NOT call render() on these — typing into an input shouldn't
+// cause a rerender that loses the cursor position.
+const _QA_FIELD_KEYS = {
+  'tg-qa-summary': 'summary',
+  'tg-qa-due': 'dueAtLocal',
+  'tg-qa-description': 'description',
+  'tg-qa-kind': 'kind',
+  'tg-qa-owner': 'ownerUserId',
+};
+document.addEventListener('input', function (e) {
+  if (!e.target || !e.target.id) return;
+  if (state.quickAdd && state.quickAdd.open
+      && _QA_FIELD_KEYS[e.target.id]) {
+    state.quickAdd[_QA_FIELD_KEYS[e.target.id]] = e.target.value;
+    return;
+  }
+});
+// 'change' fires for selects and the datetime-local picker on commit.
+document.addEventListener('change', function (e) {
+  if (!e.target || !e.target.id) return;
+  if (state.quickAdd && state.quickAdd.open
+      && _QA_FIELD_KEYS[e.target.id]) {
+    state.quickAdd[_QA_FIELD_KEYS[e.target.id]] = e.target.value;
+  }
+});
+
 document.addEventListener('input', function (e) {
   if (e.target && e.target.id === 'tg-search-input') {
     state.review.searchQuery = e.target.value;

@@ -139,6 +139,66 @@ async def list_businesses(
     return {"businesses": [dict(r) for r in rows]}
 
 
+@router.get("/businesses/{slug}/members")
+async def list_business_members(
+    slug: str,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Return active members of a business — used for the Quick Add
+    assignee dropdown.
+
+    Authz: any authenticated principal whose visible_business_ids
+    includes this business slug. Owners scoped to their memberships;
+    admins unrestricted; services 403 (Quick Add is human-only).
+    """
+    if principal.principal_type == "service":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="business members listing is human-only",
+        )
+    pool = request.app.state.db
+    visible = visible_business_ids(principal)
+    async with pool.acquire() as conn:
+        biz = await conn.fetchrow(
+            "SELECT id::text AS id, slug::text AS slug, name "
+            "FROM businesses "
+            "WHERE slug::text = $1 AND deletion_state = 'active'",
+            slug,
+        )
+        if not biz:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "business_not_found", "slug": slug},
+            )
+        if visible is not None and biz["id"] not in visible:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "business_not_visible"},
+            )
+        # Codex B3-2 review: do NOT return u.email here. The endpoint
+        # is callable by any business member (not just admin) and the
+        # assignee dropdown only needs id + display_name + role.
+        # Email is exposed via /v1/users (admin-only).
+        rows = await conn.fetch(
+            """
+            SELECT u.id::text AS id, u.display_name,
+                   bm.role::text AS role
+              FROM users u
+              JOIN business_memberships bm ON bm.user_id = u.id
+             WHERE bm.business_id = $1::uuid
+               AND bm.status = 'active'
+               AND u.status = 'active'
+             ORDER BY u.display_name
+            """,
+            biz["id"],
+        )
+    return {
+        "business": {"slug": biz["slug"], "name": biz["name"]},
+        "members": [dict(r) for r in rows],
+    }
+
+
 @router.get("/users")
 async def list_users(
     request: Request,

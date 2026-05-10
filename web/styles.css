@@ -2063,6 +2063,32 @@ html, body {
   margin: 12px 0 6px;
 }
 
+/* Phase UI-2B3-2: Dedup confirm modal stacked on Quick Add */
+.tg-dedup-wrap { z-index: 70; background: rgba(0,0,0,.72); }
+.tg-dedup-modal { width: 520px; max-width: calc(100vw - 32px); }
+.tg-dedup-intro { color: var(--tg-fg-mut); font-size: 12.5px; margin: 0 0 8px; }
+.tg-dedup-list { display: flex; flex-direction: column; gap: 6px; }
+.tg-dedup-row {
+  display: flex; flex-direction: column; gap: 4px;
+  text-align: left;
+  background: var(--tg-bg);
+  border: 1px solid var(--tg-bd-soft);
+  color: var(--tg-fg);
+  padding: 10px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.tg-dedup-row:hover {
+  background: var(--tg-bg-row-foc);
+  border-color: var(--tg-fg-faint);
+}
+.tg-dedup-summary { font-size: 13px; font-weight: 500; color: var(--tg-fg); }
+.tg-dedup-meta { font-size: 11px; color: var(--tg-fg-mut); }
+.tg-qa-hint {
+  font-size: 11px; color: var(--tg-fg-dim); font-weight: 400;
+  margin-left: 6px;
+}
+
 /* Phase UI-2B2: Quick Add modal layout + FAB */
 .tg-qa-row {
   display: grid;
