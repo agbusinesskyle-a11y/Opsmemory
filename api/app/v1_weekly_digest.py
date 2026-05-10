@@ -45,10 +45,11 @@ def _require_admin(principal: Principal) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="weekly digest admin requires a user principal",
         )
-    if principal.role != "admin":
+    # MT-2: platform_admin only. No 'admin' alias.
+    if principal.role != "platform_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="weekly digest admin requires admin role",
+            detail="weekly digest admin requires platform admin role",
         )
 
 

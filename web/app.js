@@ -383,6 +383,15 @@ function fmtDate(iso) {
   } catch { return iso; }
 }
 
+// MT-2 (2026-05-10): platform admin gate. NO legacy 'admin' alias —
+// migration 0023 must apply before this binary deploys, otherwise
+// pre-migration rows still tagged 'admin' would leak platform-wide
+// visibility (Codex MT-2 blocker).
+function _isPlatformAdmin(p) {
+  if (!p) return false;
+  return p.role === 'platform_admin';
+}
+
 function fmtRelative(iso) {
   if (!iso) return '';
   try {
@@ -423,7 +432,7 @@ function renderHeader() {
   const businesses = (p.businesses || [])
     .map(b => `<span class="biz-pill">${escapeHtml(b.name)}</span>`)
     .join(' ');
-  const isAdmin = p.role === 'admin';
+  const isAdmin = _isPlatformAdmin(p);
   // Codex chunk-10-step3a: Settings is per-user, gated on
   // principal_type==='user' (the backend's _require_user). Don't
   // reuse the admin role check.
@@ -2339,7 +2348,7 @@ function renderScheduleAnchorForm() {
 
 function renderRail() {
   const p = state.principal || {};
-  const isAdmin = p.role === 'admin';
+  const isAdmin = _isPlatformAdmin(p);
   const isUserPrincipal = p.principal_type === 'user';
   const v = state.view || 'tasks';
   const inboxCount = (function () {
@@ -2384,7 +2393,7 @@ function renderRail() {
 
 function renderBottomNav() {
   const p = state.principal || {};
-  const isAdmin = p.role === 'admin';
+  const isAdmin = _isPlatformAdmin(p);
   const isUserPrincipal = p.principal_type === 'user';
   const v = state.view || 'tasks';
   const inboxCount = (function () {
@@ -5200,7 +5209,7 @@ function _ui1HandleKey(e) {
     if (e.key === 's' || e.key === 'S') {
       e.preventDefault();
       // Only admins see the SOPs tab in the existing nav; honor that.
-      if (state.principal && state.principal.role === 'admin') {
+      if (_isPlatformAdmin(state.principal)) {
         state.view = 'sops'; render();
       }
       return;
@@ -5862,7 +5871,7 @@ document.addEventListener('input', function (e) {
       // Phase UI-2 (2026-05-09): Triage is the default landing tab
       // for admins. Owner-only principals don't see Triage in the
       // top nav, so they keep the Tasks landing.
-      const isAdmin = state.principal && state.principal.role === 'admin';
+      const isAdmin = _isPlatformAdmin(state.principal);
       if (isAdmin) {
         state.view = 'review';
         try {

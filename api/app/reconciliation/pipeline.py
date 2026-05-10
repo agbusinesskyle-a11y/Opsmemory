@@ -133,7 +133,9 @@ async def _resolve_actor_business_ids(conn, event) -> list[str] | None:
             "SELECT role::text AS role FROM users WHERE id = $1::uuid",
             event["actor_user_id"],
         )
-        if row and row["role"] == "admin":
+        # MT-2: platform_admin = unrestricted. No 'admin' alias —
+        # 0023 must apply first or pre-migration rows are scoped.
+        if row and row["role"] == "platform_admin":
             return None
         # Owner: scope to their business_memberships.
         biz_rows = await conn.fetch(

@@ -85,8 +85,16 @@ def validate(owner: dict[str, Any]) -> None:
     for k in ("id", "email", "display_name", "role"):
         if not owner.get(k):
             raise SystemExit(f"ERROR: owner missing required field {k!r}: {owner!r}")
-    if owner["role"] not in ("admin", "owner"):
-        raise SystemExit(f"ERROR: invalid role {owner['role']!r}: must be admin|owner")
+    # MT-2: users.role is platform_admin | owner. 'admin' is no
+    # longer a user-level role (it's a per-business role only).
+    # owners.json must update 'admin' -> 'platform_admin' for Kyle
+    # and 'admin' -> 'owner' for Joanna before re-running this seed.
+    if owner["role"] not in ("platform_admin", "owner"):
+        raise SystemExit(
+            f"ERROR: invalid role {owner['role']!r}: "
+            "must be platform_admin|owner. 'admin' is no longer a "
+            "user-level role (MT-2). Use business_roles[<slug>] for "
+            "per-business admin authority.")
     if "@" not in owner["email"]:
         raise SystemExit(f"ERROR: invalid email {owner['email']!r}")
     for slug in owner.get("businesses", []):
@@ -145,8 +153,26 @@ ON CONFLICT (provider, email) DO UPDATE SET
         sql,
     )
 
+    # MT-2: business_memberships.role is constrained to
+    # ('admin', 'owner') by 0001's CHECK. Map the user-level role to
+    # a valid membership role so 'platform_admin' on the user side
+    # writes 'admin' on the membership side. The owner's `businesses`
+    # list grants membership; per-business override role can be
+    # supplied via owners.json `business_roles[slug]` if the operator
+    # wants per-membership granularity.
+    user_role = owner["role"]
+    default_membership_role = "admin" if user_role == "platform_admin" else (
+        "admin" if user_role == "admin" else "owner"
+    )
+    biz_role_overrides = owner.get("business_roles") or {}
     for slug in owner.get("businesses", []):
         biz_id = DEFAULT_BUSINESS_IDS[slug]
+        membership_role = biz_role_overrides.get(slug, default_membership_role)
+        if membership_role not in ("admin", "owner"):
+            raise SystemExit(
+                f"ERROR: invalid business_roles[{slug!r}]={membership_role!r}; "
+                f"must be admin|owner"
+            )
         membership_sql = """
 INSERT INTO business_memberships (business_id, user_id, role) VALUES
   (:'biz_id'::uuid, :'user_id'::uuid, :'role')
@@ -158,7 +184,7 @@ ON CONFLICT (business_id, user_id) DO UPDATE SET
             [
                 "-v", f"biz_id={biz_id}",
                 "-v", f"user_id={owner['id']}",
-                "-v", f"role={owner['role']}",
+                "-v", f"role={membership_role}",
             ],
             membership_sql,
         )

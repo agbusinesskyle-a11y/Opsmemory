@@ -243,10 +243,12 @@ async def list_tasks(
     """List tasks visible to the caller, with optional filters."""
     # Admin-gate include_deleted (Codex chunk-2-close fix). Owners must not
     # see soft-deleted tasks even within their own businesses.
-    if include_deleted and not (principal.principal_type == "user" and principal.role == "admin"):
+    # MT-2: include_deleted is platform-admin-only. No 'admin' alias.
+    if include_deleted and not (principal.principal_type == "user"
+                                and principal.role == "platform_admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="include_deleted requires admin role",
+            detail="include_deleted requires platform admin role",
         )
 
     pool = request.app.state.db
@@ -343,10 +345,12 @@ async def get_task(
     include_deleted: bool = Query(default=False),
 ) -> dict:
     # Admin-gate include_deleted on detail too (Codex chunk-2-close fix).
-    if include_deleted and not (principal.principal_type == "user" and principal.role == "admin"):
+    # MT-2: include_deleted is platform-admin-only. No 'admin' alias.
+    if include_deleted and not (principal.principal_type == "user"
+                                and principal.role == "platform_admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="include_deleted requires admin role",
+            detail="include_deleted requires platform admin role",
         )
 
     task_id_str = str(task_id)

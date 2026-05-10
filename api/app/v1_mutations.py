@@ -327,7 +327,34 @@ async def toggle_done(
                 # principals are rejected here because no toggle-mutation
                 # scope is defined yet (per Codex chunk-6-close blocker).
                 if outcome is None:
-                    if principal.principal_type == "user" and principal.role == "admin":
+                    # MT-2: platform_admin = unrestricted toggle authority.
+                    # Per-business admin (business_memberships.role='admin'
+                    # for any business this task belongs to) ALSO bypasses
+                    # the assignee gate — preserves Joanna's pre-MT-2
+                    # behavior where she can toggle any task in
+                    # borderline/redhot. Codex MT-2 round-2 caught the
+                    # behavior regression that motivated this branch.
+                    biz_admin_bypass = False
+                    if (principal.principal_type == "user"
+                            and principal.role == "owner"
+                            and principal.businesses):
+                        # Pull this task's business_ids; intersect with the
+                        # principal's per-business admin memberships.
+                        task_biz_rows = await conn.fetch(
+                            "SELECT business_id::text AS id "
+                            "FROM task_businesses WHERE task_id = $1::uuid",
+                            rid,
+                        )
+                        task_biz_ids = {r["id"] for r in task_biz_rows}
+                        biz_admin_bypass = any(
+                            (b.get("role") == "admin")
+                            and (b.get("id") in task_biz_ids)
+                            for b in principal.businesses
+                        )
+
+                    if principal.principal_type == "user" and principal.role == "platform_admin":
+                        pass
+                    elif biz_admin_bypass:
                         pass
                     elif principal.principal_type == "user" and principal.role == "owner":
                         is_assignee = await conn.fetchrow(

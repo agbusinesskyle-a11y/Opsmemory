@@ -197,7 +197,8 @@ async def apply_review_item(
     # admin-only first pass uses require_admin upstream so this is
     # currently a tautology; left in place for the next commit when
     # owner reviewers are admitted.
-    if reviewer.principal_type == "user" and reviewer.role == "admin":
+    # MT-2: platform_admin gets unrestricted reviewer authz.
+    if reviewer.principal_type == "user" and reviewer.role == "platform_admin":
         actor_business_slugs = None
     else:
         actor_business_slugs = [b["slug"] for b in reviewer.businesses]

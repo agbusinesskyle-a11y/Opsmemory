@@ -193,9 +193,11 @@ async def _resolve_caller(conn, team_id: str, slack_user_id: str) -> dict | None
 
 def _visible_business_ids(caller: dict) -> list[str] | None:
     """Mirror authz.visible_business_ids semantics for our caller dict.
-    None = admin (unrestricted); list = owner-scoped business ids.
+    None = platform_admin (unrestricted); list = owner-scoped business ids.
+    MT-2: 'admin' alias removed — pre-migration rows would leak Conway
+    Feed visibility through Slack /tasks otherwise.
     """
-    if caller["role"] == "admin":
+    if caller["role"] == "platform_admin":
         return None
     return [b["id"] for b in caller["businesses"]]
 

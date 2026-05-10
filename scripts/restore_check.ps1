@@ -319,9 +319,11 @@ try {
     if ($userCount -lt 1) { throw "active users expected >=1, got $userCount" }
     $smokeChecks["users_active_count"] = $userCount
 
-    $adminCount = [int](Run-Sql "SELECT count(*) FROM users WHERE status = 'active' AND role = 'admin'")
-    if ($adminCount -lt 1) { throw "active admin users expected >=1, got $adminCount" }
-    $smokeChecks["admin_count"] = $adminCount
+    # MT-2: platform_admin is the new platform-owner role. At least
+    # one active platform_admin must exist or restore is broken.
+    $adminCount = [int](Run-Sql "SELECT count(*) FROM users WHERE status = 'active' AND role = 'platform_admin'")
+    if ($adminCount -lt 1) { throw "active platform_admin users expected >=1, got $adminCount" }
+    $smokeChecks["platform_admin_count"] = $adminCount
 
     $identityCount = [int](Run-Sql "SELECT count(*) FROM user_identities WHERE provider = 'cloudflare_access'")
     if ($identityCount -lt $userCount) { throw "cloudflare_access identities ($identityCount) < users ($userCount)" }

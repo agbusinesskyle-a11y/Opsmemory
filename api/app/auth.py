@@ -66,7 +66,12 @@ def _jwks() -> PyJWKClient:
 
 def _permissions(role: str, scopes: list[str] | None = None) -> dict[str, bool]:
     scopes = scopes or []
-    if role == "admin":
+    # MT-2 (2026-05-10): 'platform_admin' is the platform-wide cap.
+    # Legacy 'admin' is intentionally NOT accepted as alias —
+    # Codex MT-2 blocker: alias would re-leak Joanna's pre-
+    # migration row to platform-wide visibility. Migration 0023
+    # MUST run before this binary deploys.
+    if role == "platform_admin":
         return {
             "can_view_all_businesses": True,
             "can_manage_users": True,

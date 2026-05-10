@@ -816,9 +816,9 @@ async def patch_review_item(
                     r["field_name"]: r["version"] for r in fv
                 }
 
-            # Reviewer authz scope (admin -> None for pure unscoped).
+            # MT-2: platform_admin -> None (unscoped reviewer).
             actor_business_slugs = (
-                None if principal.role == "admin"
+                None if principal.role == "platform_admin"
                 else [b["slug"] for b in principal.businesses]
             )
 

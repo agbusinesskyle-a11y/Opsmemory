@@ -3,27 +3,30 @@
 Cleanly-separated from auth.py (which decides WHO is making the request).
 authz decides WHAT they can see/do.
 
-Chunk 2 ruleset (read-only):
+Phase MT-2 (2026-05-10): users.role split into 'platform_admin' and
+'owner'. 'admin' value still exists in the app_role enum because it
+denotes per-business admin in business_memberships.role, which is
+separate from platform-wide admin authority.
 
-  Admin (role='admin'):
-    - May read all tasks across all businesses
-    - May read /v1/users
-    - May read /v1/businesses (full list)
+Ruleset:
 
-  Owner (role='owner'):
+  Platform admin (users.role='platform_admin'):
+    - Kyle only (single-platform-owner deploy). May read all tasks,
+      all businesses, all users.
+
+  Owner (users.role='owner'):
     - May read tasks visible to any business they're a member of
       (via business_memberships.business_id ∈ task_businesses.business_id).
-      Assignment is a stronger signal but visibility is by business.
-    - May read /v1/businesses scoped to their memberships
-    - May NOT read /v1/users (403)
+    - May read /v1/businesses scoped to their memberships.
+    - May NOT read /v1/users (403).
+    - business_memberships.role='admin' grants per-business admin
+      authority but does NOT grant platform-wide visibility — that's
+      the point of the MT-2 split. Joanna (owner of borderline +
+      redhot, admin in those memberships) cannot see Conway Feed.
 
-  Service (role='service'):
-    - Default-deny on task visibility — visible_business_ids returns []
-      so /v1/tasks and /v1/tasks/{id} are empty/404 for all service
-      principals. Per-account scopes (e.g. `tasks:read:all`,
-      `ingest:write`, `businesses:read`) widen this in Chunk 3+ when
-      the bootstrap CLI starts issuing keys with explicit scope lists.
-    - /v1/users is admin-only regardless of scope.
+  Service (users.role='service'):
+    - Default-deny on task visibility. Per-account scopes widen.
+    - /v1/users is platform-admin-only regardless of scope.
 """
 
 from __future__ import annotations
@@ -34,12 +37,17 @@ from .auth import Principal
 
 
 def require_admin(principal: Principal) -> None:
-    """Raise 403 unless the principal is an admin user."""
-    if principal.principal_type == "user" and principal.role == "admin":
+    """Raise 403 unless the principal is a platform admin.
+
+    MT-2: 'platform_admin' is the new value. Existing call sites kept
+    the require_admin name for diff minimisation. Per-business admin
+    via business_memberships.role does NOT satisfy this gate.
+    """
+    if principal.principal_type == "user" and principal.role == "platform_admin":
         return
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="admin role required",
+        detail="platform admin required",
     )
 
 
@@ -81,7 +89,7 @@ def require_scope(principal: Principal, scope: str) -> None:
     that don't call this helper. require_scope is the gate for endpoints
     that admit machine callers (e.g. ingest endpoints called by n8n).
     """
-    if principal.principal_type == "user" and principal.role == "admin":
+    if principal.principal_type == "user" and principal.role == "platform_admin":
         return
     if scope in (principal.scopes or []):
         return
@@ -105,7 +113,7 @@ def visible_business_ids(principal: Principal) -> list[str] | None:
         the /v1 read path so a future audit query from the
         worker doesn't silently see nothing.
     """
-    if principal.principal_type == "user" and principal.role == "admin":
+    if principal.principal_type == "user" and principal.role == "platform_admin":
         return None
     if principal.principal_type == "user" and principal.role == "owner":
         return [b["id"] for b in principal.businesses]
