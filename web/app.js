@@ -1265,6 +1265,15 @@ function _tgRenderQuickAddHost() {
   const host = _tgEnsureQuickAddHost();
   const key = _tgQuickAddStructuralKey();
   if (key === _tgQuickAddHostKey) return;
+  // DIAG B3-6: log every host rebuild so we can see what's wiping
+  // the input. Remove once Kyle's typing-vanish bug is found.
+  try {
+    console.warn('[opsmemory diag] QuickAdd host REBUILD',
+                 'old=', _tgQuickAddHostKey,
+                 'new=', key,
+                 'state.summary=', state.quickAdd && state.quickAdd.summary,
+                 'time=', new Date().toISOString());
+  } catch (_e) {}
   host.innerHTML = (state.quickAdd && state.quickAdd.open)
     ? tgRenderQuickAddModal()
     : '';
@@ -2471,6 +2480,16 @@ function renderAppShell(viewContent) {
 function render() {
   const root = document.getElementById('root');
   if (!root) return;
+  // DIAG B3-6
+  try {
+    if (state.quickAdd && state.quickAdd.open) {
+      const stack = (new Error()).stack || '';
+      const caller = stack.split('\n').slice(2, 4).join(' | ');
+      console.warn('[opsmemory diag] render() called while QA open',
+                   'summary=', JSON.stringify(state.quickAdd.summary || ''),
+                   'caller=', caller);
+    }
+  } catch (_e) {}
   // The shell takes over the viewport — root needs to give up its
   // legacy max-width / centering. Adding the class flips that.
   root.classList.add('has-shell');
@@ -5803,6 +5822,12 @@ document.addEventListener('input', function (e) {
   if (state.quickAdd && state.quickAdd.open
       && _QA_FIELD_KEYS[e.target.id]) {
     state.quickAdd[_QA_FIELD_KEYS[e.target.id]] = e.target.value;
+    // DIAG B3-6
+    try {
+      console.warn('[opsmemory diag] QA input sync',
+                   'id=', e.target.id,
+                   'value=', JSON.stringify(e.target.value));
+    } catch (_e) {}
     return;
   }
 });
