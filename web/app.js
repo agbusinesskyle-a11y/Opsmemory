@@ -1363,7 +1363,14 @@ async function _tgSubmitQuickAdd() {
   render();
   let result;
   try {
-    result = await api('/v1/quick_tasks', {
+    // Phase UI-2B3-1: idempotency_key per submit so retries are safe.
+    // crypto.randomUUID is available in modern browsers and the PWA
+    // service worker; if missing (very old WebView), fall back to a
+    // composite of timestamp + Math.random.
+    const idempotencyKey = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : `pwa-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    result = await api('/v1/tasks', {
       method: 'POST',
       body: {
         summary,
@@ -1371,6 +1378,13 @@ async function _tgSubmitQuickAdd() {
         due_at: dueAtIso,
         description: description || null,
         kind,
+        idempotency_key: idempotencyKey,
+        // B3-1 ships without the dedup confirm modal — the PWA
+        // always force_creates so there's no behavior regression
+        // from the B2 direct-write path. The dedup modal lights up
+        // in B3-2 when this flag flips false and preview_token
+        // gets carried.
+        force_create: true,
       },
     });
   } catch (e) {

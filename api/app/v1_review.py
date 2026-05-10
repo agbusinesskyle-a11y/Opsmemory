@@ -140,6 +140,13 @@ async def list_review_items(
         description="Snooze filter: 'exclude' (default — hide currently-snoozed), "
                     "'only' (only currently-snoozed), 'all' (no filter)",
     ),
+    include_auto: bool = Query(
+        default=False,
+        description="Include auto-approved review_items (manual /v1/tasks "
+                    "submissions). Default false hides them from operator-"
+                    "facing Triage so the Completed sub-tab doesn't fill "
+                    "with the operator's own typed entries.",
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> dict:
@@ -164,6 +171,17 @@ async def list_review_items(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"invalid snoozed filter: {snoozed!r}",
         )
+
+    # Phase UI-2B3-1: exclude auto-approved review_items by default.
+    # These rows are stamped by /v1/tasks for audit chain consistency
+    # (every task has a review_item_id provenance pointer) and would
+    # otherwise pollute the Completed sub-tab seconds after the
+    # operator submits a Quick Add. Pass include_auto=true to surface
+    # them in audit views (admin debug, weekly digest reports).
+    if include_auto:
+        auto_where = ""
+    else:
+        auto_where = "AND ri.was_auto_approved = false"
 
     # Build the snooze WHERE clause. Snooze is a visibility filter
     # for the actionable queue only (pending / needs_changes). Items
@@ -215,6 +233,7 @@ async def list_review_items(
             FROM review_items ri
             WHERE ri.status = ANY($1::review_lifecycle_state[])
               {snooze_where}
+              {auto_where}
             ORDER BY ri.created_at DESC
             LIMIT $2 OFFSET $3
             """,
@@ -225,7 +244,8 @@ async def list_review_items(
         count_row = await conn.fetchrow(
             f"SELECT count(*) AS c FROM review_items ri "
             f"WHERE ri.status = ANY($1::review_lifecycle_state[]) "
-            f"  {snooze_where}",
+            f"  {snooze_where} "
+            f"  {auto_where}",
             requested,
         )
 

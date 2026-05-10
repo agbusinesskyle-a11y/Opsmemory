@@ -320,7 +320,17 @@ async def _apply_create_task(
     confidence: float | None,
     reviewer: Principal,
 ) -> str:
-    """Apply a CREATE_TASK proposal. Returns the new task id."""
+    """Apply a CREATE_TASK proposal. Returns the new task id.
+
+    Phase UI-2B3-1: write logic was extracted into core_apply so the
+    new POST /v1/tasks endpoint can share the same primitive. This
+    function now does pipeline-specific glue (validation errors,
+    business slug resolution, owner_user_id from proposed_patch,
+    SOP linkage backfill) and delegates the on-disk writes to
+    core_apply.create_task_inner.
+    """
+    from .core_apply import create_task_inner, CoreApplyError
+
     create = proposed_patch.get("create") or {}
     summary = (create.get("summary") or "").strip()
     if not summary:
@@ -344,156 +354,69 @@ async def _apply_create_task(
                             {"missing_slugs": missing})
 
     reviewer_id = reviewer.id if reviewer.principal_type == "user" else None
+    actor_type = "user" if reviewer.principal_type == "user" else "service"
+    actor_user_id = reviewer.id if actor_type == "user" else None
+    actor_service_id = reviewer.id if actor_type == "service" else None
 
-    # ----- Insert tasks -----
-    # Codex chunk-7-step3 close-fix: description + priority were in the
-    # SOP authoring schema + read API but the apply path dropped them.
-    # Pass through whenever the patch carries them; non-SOP review_items
-    # (meeting_recap / slack_message) populate via .get() returning None.
-    task_row = await conn.fetchrow(
-        """
-        INSERT INTO tasks
-          (summary, description, due_at, category, priority,
-           dependency_text,
-           source_event_id, version, last_activity_at,
-           created_at, updated_at)
-        VALUES
-          ($1, $2, $3::timestamptz, $4, $5,
-           $6,
-           $7::uuid, 1, now(),
-           now(), now())
-        RETURNING id::text AS id
-        """,
-        summary,
-        create.get("description"),
-        _coerce_due_at(create.get("due_at")),
-        create.get("category"),
-        create.get("priority"),
-        create.get("dependency_text"),
-        ingest_event_id,
-    )
-    task_id = task_row["id"]
-
-    # ----- Insert task_businesses -----
-    for biz in biz_rows:
-        await conn.execute(
-            "INSERT INTO task_businesses (task_id, business_id, added_by) "
-            "VALUES ($1::uuid, $2::uuid, $3::uuid)",
-            task_id,
-            biz["id"],
-            reviewer_id,
-        )
-
-    # ----- Insert task_assignees (when slack_resolve gave us an owner) -----
-    # Closes Codex chunk-5-close blocker: pipeline now carries
-    # owner_user_id in proposed_patch.create; the apply path materializes
-    # the assignment so the canonical user appears as the task's
-    # assignee on the dashboard. None means "no resolved owner" — the
-    # task is created with no assignee and the reviewer can add one
-    # via PATCH later.
+    # Validate owner_user_id (when slack_resolve / pipeline supplied
+    # one) survives at apply time. A stale review_item could
+    # reference a removed user — confirm before assignment.
     owner_user_id = create.get("owner_user_id")
     if owner_user_id:
-        # Verify the user still exists and is active before assigning;
-        # a stale review_item could reference a removed user.
         user_row = await conn.fetchrow(
             "SELECT id::text AS id FROM users "
             "WHERE id = $1::uuid AND status = 'active'",
             owner_user_id,
         )
-        if user_row:
-            await conn.execute(
-                """
-                INSERT INTO task_assignees
-                  (task_id, user_id, role, assigned_by)
-                VALUES
-                  ($1::uuid, $2::uuid, 'assignee', $3::uuid)
-                ON CONFLICT (task_id, user_id) DO NOTHING
-                """,
-                task_id,
-                user_row["id"],
-                reviewer_id,
-            )
+        owner_user_id = user_row["id"] if user_row else None
 
-    # ----- Insert task_field_versions baseline -----
-    for field_name in _CREATE_FIELD_NAMES:
-        await conn.execute(
-            """
-            INSERT INTO task_field_versions
-              (task_id, field_name, version, updated_by, source_event_id)
-            VALUES
-              ($1::uuid, $2, 1, $3::uuid, $4::uuid)
-            """,
-            task_id,
-            field_name,
-            reviewer_id,
-            ingest_event_id,
+    # Delegate the on-disk INSERT pattern to core_apply so that
+    # POST /v1/tasks (manual create path) writes the same shape.
+    try:
+        task_id = await create_task_inner(
+            conn,
+            ingest_event_id=ingest_event_id,
+            summary=summary,
+            business_ids=list(biz_rows),
+            due_at=_coerce_due_at(create.get("due_at")),
+            # Preserve prior task_history.new_value shape: pipeline
+            # path stored the raw proposed_patch string verbatim.
+            due_at_for_history=create.get("due_at"),
+            description=create.get("description"),
+            category=create.get("category"),
+            priority=create.get("priority"),
+            dependency_text=create.get("dependency_text"),
+            owner_user_id=owner_user_id,
+            actor_user_id=actor_user_id,
+            actor_service_id=actor_service_id,
+            actor_type=actor_type,
+            mutation_id=f"review:{review_item_id}",
+            history_reason=f"approved review_item {review_item_id}",
+            history_confidence=confidence,
+            # Distinct strings — preserves the prior audit semantics
+            # where task_history.reason and task_state_transitions.
+            # reason carried different verbs.
+            transition_reason=f"create from review_item {review_item_id}",
+            transition_metadata={"review_item_id": review_item_id,
+                                 "ingest_event_id": ingest_event_id},
+            # Preserve caller-supplied slug order for audit.
+            history_business_slugs=business_slugs,
         )
-
-    # ----- Insert task_history (single create row) -----
-    actor_type = "user" if reviewer.principal_type == "user" else "service"
-    actor_user_id = reviewer.id if actor_type == "user" else None
-    actor_service_id = reviewer.id if actor_type == "service" else None
-    new_value = {
-        "summary": summary,
-        "due_at": create.get("due_at"),
-        "category": create.get("category"),
-        "dependency_text": create.get("dependency_text"),
-        "businesses": business_slugs,
-    }
-    await conn.execute(
-        """
-        INSERT INTO task_history
-          (task_id, mutation_id, field_name, change_type,
-           old_value, new_value,
-           actor_user_id, actor_service_account_id, actor_type,
-           source_event_id, reason, confidence)
-        VALUES
-          ($1::uuid, $2, NULL, 'create',
-           NULL, $3::jsonb,
-           $4::uuid, $5::uuid, $6,
-           $7::uuid, $8, $9)
-        """,
-        task_id,
-        f"review:{review_item_id}",
-        new_value,
-        actor_user_id,
-        actor_service_id,
-        actor_type,
-        ingest_event_id,
-        f"approved review_item {review_item_id}",
-        confidence,
-    )
-
-    # ----- Insert task_state_transitions: one per business -----
-    for biz in biz_rows:
-        await conn.execute(
-            """
-            INSERT INTO task_state_transitions
-              (task_id, business_id, from_state, to_state,
-               actor_kind, actor_user_id, actor_service_account_id,
-               reason, metadata)
-            VALUES
-              ($1::uuid, $2::uuid, NULL, 'open',
-               $3, $4::uuid, $5::uuid,
-               $6, $7::jsonb)
-            """,
-            task_id,
-            biz["id"],
-            actor_type,
-            actor_user_id,
-            actor_service_id,
-            f"create from review_item {review_item_id}",
-            {"review_item_id": review_item_id,
-             "ingest_event_id": ingest_event_id},
-        )
+    except CoreApplyError as exc:
+        # core_apply raises only on argument errors that pipeline
+        # validation should have caught — surface as 5xx-equivalent.
+        raise ApplyValidationError([{"code": "core_apply_error",
+                                     "message": str(exc)}])
 
     # ----- SOP linkage backfill (Chunk 7 step 3c) -----
     # If this review_item came from an SOP anchor fire, the
     # sop_generated_tasks junction has a row pointing at it with
     # task_id=NULL. Set task_id now so subsequent date-shift
-    # propagation (chunk 7 follow-up) and audit pane queries can
-    # find the materialized task. WHERE task_id IS NULL ensures we
-    # don't clobber a backfill from a reapply / future re-bind path.
+    # propagation and audit pane queries can find the materialized
+    # task. WHERE task_id IS NULL ensures we don't clobber a backfill
+    # from a re-apply / future re-bind path. Manual /v1/tasks creates
+    # don't have an sop_generated_tasks row pointing at their
+    # synthetic review_item, so this UPDATE no-ops there.
     await conn.execute(
         """
         UPDATE sop_generated_tasks
