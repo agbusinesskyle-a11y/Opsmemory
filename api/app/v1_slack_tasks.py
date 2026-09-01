@@ -326,6 +326,7 @@ async def _query_stale_tasks(
             f"        WHERE tb.task_id = t.id "
             f"          AND tb.business_id::text = ANY(${len(params)}::text[]))"
         )
+    params.append(limit)
     sql = f"""
         SELECT t.id::text                AS id,
                t.summary                 AS summary,
@@ -339,7 +340,7 @@ async def _query_stale_tasks(
         WHERE {' AND '.join(where)}
         GROUP BY t.id
         ORDER BY t.last_activity_at ASC, t.id
-        LIMIT {limit}
+        LIMIT ${len(params)}
     """
     rows = await conn.fetch(sql, *params)
     return [dict(r) for r in rows]
@@ -380,6 +381,7 @@ async def _query_category_tasks(
             f"        WHERE tb.task_id = t.id "
             f"          AND tb.business_id::text = ANY(${len(params)}::text[]))"
         )
+    params.append(limit)
     sql = f"""
         SELECT t.id::text                AS id,
                t.summary                 AS summary,
@@ -393,7 +395,7 @@ async def _query_category_tasks(
         WHERE {' AND '.join(where)}
         GROUP BY t.id
         ORDER BY t.due_at NULLS LAST, t.last_activity_at DESC, t.id
-        LIMIT {limit}
+        LIMIT ${len(params)}
     """
     rows = await conn.fetch(sql, *params)
     return [dict(r) for r in rows]
@@ -450,6 +452,7 @@ async def _query_owner_tasks(
             f"        WHERE tb.task_id = t.id "
             f"          AND tb.business_id::text = ANY(${len(params)}::text[]))"
         )
+    params.append(limit)
     sql = f"""
         SELECT t.id::text                AS id,
                t.summary                 AS summary,
@@ -464,7 +467,7 @@ async def _query_owner_tasks(
         WHERE {' AND '.join(where)}
         GROUP BY t.id
         ORDER BY t.due_at NULLS LAST, t.last_activity_at DESC, t.id
-        LIMIT {limit}
+        LIMIT ${len(params)}
     """
     rows = await conn.fetch(sql, *params)
     return [dict(r) for r in rows]
